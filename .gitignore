@@ -2,7 +2,8 @@
 __pycache__/
 *.py[codz]
 *$py.class
-
+opencode.json
+.mcp.json
 # C extensions
 *.so
 

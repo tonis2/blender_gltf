@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "gltf_exporter"
+version = "1.0.0"
+name = "glTF 2.0 Exporter"
+tagline = "Export Blender scenes to glTF 2.0 with experimental features"
+maintainer = "Tonis"
+type = "add-on"
+
+tags = ["Import-Export"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:Apache-2.0",
+]
