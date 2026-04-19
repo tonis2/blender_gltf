@@ -52,6 +52,24 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         default=True,
     )
 
+    export_animations: BoolProperty(
+        name="Animations",
+        description="Export keyframe animations",
+        default=True,
+    )
+
+    export_morph_targets: BoolProperty(
+        name="Shape Keys",
+        description="Export shape keys as morph targets",
+        default=True,
+    )
+
+    export_gpu_instancing: BoolProperty(
+        name="GPU Instancing",
+        description="Export collection instances using EXT_mesh_gpu_instancing",
+        default=True,
+    )
+
     def execute(self, context):
         settings = ExportSettings(
             filepath=self.filepath,
@@ -60,6 +78,9 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
             export_texcoords=self.export_texcoords,
             export_materials=self.export_materials,
             export_colors=self.export_colors,
+            export_animations=self.export_animations,
+            export_morph_targets=self.export_morph_targets,
+            export_gpu_instancing=self.export_gpu_instancing,
         )
 
         try:
@@ -85,6 +106,15 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         box = layout.box()
         box.label(text="Material")
         box.prop(self, "export_materials")
+
+        box = layout.box()
+        box.label(text="Animation")
+        box.prop(self, "export_animations")
+        box.prop(self, "export_morph_targets")
+
+        box = layout.box()
+        box.label(text="Instancing")
+        box.prop(self, "export_gpu_instancing")
 
     def check(self, context):
         # Update file extension based on format

@@ -218,6 +218,36 @@ class Texture(GltfBase):
 
 
 @dataclass
+class AnimationChannelTarget(GltfBase):
+    path: str = ""
+    node: int | None = None
+    extensions: dict | None = None
+    extras: Any | None = None
+
+
+@dataclass
+class AnimationChannel(GltfBase):
+    sampler: int = 0
+    target: AnimationChannelTarget = field(default_factory=AnimationChannelTarget)
+
+
+@dataclass
+class AnimationSampler(GltfBase):
+    input: int = 0
+    output: int = 0
+    interpolation: str | None = None
+
+
+@dataclass
+class Animation(GltfBase):
+    channels: list[AnimationChannel] = field(default_factory=list)
+    samplers: list[AnimationSampler] = field(default_factory=list)
+    name: str | None = None
+    extensions: dict | None = None
+    extras: Any | None = None
+
+
+@dataclass
 class Gltf(GltfBase):
     asset: Asset = field(default_factory=Asset)
     scene: int | None = None
@@ -232,7 +262,7 @@ class Gltf(GltfBase):
     images: list[Image] | None = None
     samplers: list[Sampler] | None = None
     cameras: list | None = None
-    animations: list | None = None
+    animations: list[Animation] | None = None
     skins: list | None = None
     extensions: dict | None = None
     extensions_used: list[str] | None = None

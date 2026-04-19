@@ -45,8 +45,13 @@ class MeshExporter:
             eval_obj.to_mesh_clear()
             return self._cache[cache_key]
 
+        # Extract shape key deltas before evaluation (shape keys live on original data)
+        shape_key_data = None
+        if self.settings.export_morph_targets:
+            shape_key_data = self._extract_shape_keys(blender_object)
+
         try:
-            mesh = self._extract(blender_mesh, blender_object.name, material_map)
+            mesh = self._extract(blender_mesh, blender_object, material_map, shape_key_data)
         finally:
             eval_obj.to_mesh_clear()
 
@@ -58,12 +63,44 @@ class MeshExporter:
         self._cache[cache_key] = index
         return index
 
+    def _extract_shape_keys(
+        self, blender_object: "bpy.types.Object",
+    ) -> list[tuple[str, np.ndarray]] | None:
+        """Extract shape key position deltas from the original mesh data.
+        Returns list of (name, delta_positions) or None."""
+        if not hasattr(blender_object.data, "shape_keys") or blender_object.data.shape_keys is None:
+            return None
+
+        key_blocks = blender_object.data.shape_keys.key_blocks
+        if len(key_blocks) < 2:
+            return None
+
+        # Extract basis positions
+        basis = key_blocks[0]
+        num_verts = len(basis.data)
+        basis_co = np.empty(num_verts * 3, dtype=np.float32)
+        basis.data.foreach_get("co", basis_co)
+        basis_co = basis_co.reshape(-1, 3)
+
+        results: list[tuple[str, np.ndarray]] = []
+        for kb in key_blocks[1:]:
+            co = np.empty(num_verts * 3, dtype=np.float32)
+            kb.data.foreach_get("co", co)
+            co = co.reshape(-1, 3)
+            delta = co - basis_co
+            convert_positions(delta)
+            results.append((kb.name, delta))
+
+        return results
+
     def _extract(
         self,
         blender_mesh: "bpy.types.Mesh",
-        name: str,
+        blender_object: "bpy.types.Object",
         material_map: dict[int, int] | None = None,
+        shape_key_data: list[tuple[str, np.ndarray]] | None = None,
     ) -> Mesh | None:
+        name = blender_object.name
         blender_mesh.calc_loop_triangles()
         if len(blender_mesh.loop_triangles) == 0:
             return None
@@ -173,6 +210,7 @@ class MeshExporter:
             prim = self._build_primitive(
                 positions, dots, prim_loop_indices,
                 len(uv_arrays), len(color_arrays), gltf_mat_idx,
+                shape_key_data,
             )
             if prim is not None:
                 primitives.append(prim)
@@ -180,7 +218,12 @@ class MeshExporter:
         if not primitives:
             return None
 
-        return Mesh(primitives=primitives, name=name)
+        # Set default morph target weights from original shape keys
+        weights = None
+        if shape_key_data and blender_object.data.shape_keys:
+            weights = [kb.value for kb in blender_object.data.shape_keys.key_blocks[1:]]
+
+        return Mesh(primitives=primitives, name=name, weights=weights)
 
     def _build_primitive(
         self,
@@ -190,6 +233,7 @@ class MeshExporter:
         num_uv_layers: int,
         num_color_layers: int,
         material_index: int | None,
+        shape_key_data: list[tuple[str, np.ndarray]] | None = None,
     ) -> MeshPrimitive | None:
         """Deduplicate vertices and create buffer accessors for one primitive."""
         # Extract dots for this primitive's loops
@@ -253,6 +297,18 @@ class MeshExporter:
                 target=BufferViewTarget.ARRAY_BUFFER,
             )
 
+        # Morph targets (shape key deltas)
+        targets = None
+        if shape_key_data:
+            targets = []
+            for _name, all_deltas in shape_key_data:
+                prim_deltas = all_deltas[vert_indices]
+                target_acc = self.buffer.add_accessor(
+                    prim_deltas, ComponentType.FLOAT, DataType.VEC3,
+                    target=BufferViewTarget.ARRAY_BUFFER,
+                )
+                targets.append({"POSITION": target_acc})
+
         indices_accessor = self.buffer.add_accessor(
             indices, index_type, DataType.SCALAR,
             target=BufferViewTarget.ELEMENT_ARRAY_BUFFER,
@@ -262,4 +318,5 @@ class MeshExporter:
             attributes=attributes,
             indices=indices_accessor,
             material=material_index,
+            targets=targets,
         )
