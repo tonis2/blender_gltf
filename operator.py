@@ -77,12 +77,19 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         default=True,
     )
 
+    export_physics: BoolProperty(
+        name="Physics",
+        description="Export rigid bodies and collision shapes",
+        default=True,
+    )
+
     # Section toggles (not exported, just for UI)
     show_mesh: BoolProperty(name="Mesh", default=True, options={"HIDDEN"})
     show_material: BoolProperty(name="Material", default=True, options={"HIDDEN"})
     show_animation: BoolProperty(name="Animation", default=True, options={"HIDDEN"})
     show_skinning: BoolProperty(name="Skinning", default=True, options={"HIDDEN"})
     show_instancing: BoolProperty(name="Instancing", default=True, options={"HIDDEN"})
+    show_physics: BoolProperty(name="Physics", default=True, options={"HIDDEN"})
 
     def execute(self, context):
         settings = ExportSettings(
@@ -96,6 +103,7 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
             export_morph_targets=self.export_morph_targets,
             export_gpu_instancing=self.export_gpu_instancing,
             export_skinning=self.export_skinning,
+            export_physics=self.export_physics,
         )
 
         try:
@@ -154,6 +162,14 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
                  emboss=False)
         if self.show_instancing:
             box.prop(self, "export_gpu_instancing")
+
+        box = layout.box()
+        row = box.row()
+        row.prop(self, "show_physics",
+                 icon="DISCLOSURE_TRI_DOWN" if self.show_physics else "DISCLOSURE_TRI_RIGHT",
+                 emboss=False)
+        if self.show_physics:
+            box.prop(self, "export_physics")
 
     def check(self, context):
         # Update file extension based on format
@@ -228,11 +244,18 @@ class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
         default=True,
     )
 
+    import_physics: BoolProperty(
+        name="Physics",
+        description="Import rigid bodies and collision shapes",
+        default=True,
+    )
+
     # Section toggles (not imported, just for UI)
     show_mesh: BoolProperty(name="Mesh", default=True, options={"HIDDEN"})
     show_material: BoolProperty(name="Material", default=True, options={"HIDDEN"})
     show_animation: BoolProperty(name="Animation", default=True, options={"HIDDEN"})
     show_skinning: BoolProperty(name="Skinning", default=True, options={"HIDDEN"})
+    show_physics: BoolProperty(name="Physics", default=True, options={"HIDDEN"})
 
     def execute(self, context):
         settings = ImportSettings(
@@ -244,6 +267,7 @@ class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
             import_animations=self.import_animations,
             import_morph_targets=self.import_morph_targets,
             import_skinning=self.import_skinning,
+            import_physics=self.import_physics,
         )
 
         try:
@@ -293,6 +317,14 @@ class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
                  emboss=False)
         if self.show_skinning:
             box.prop(self, "import_skinning")
+
+        box = layout.box()
+        row = box.row()
+        row.prop(self, "show_physics",
+                 icon="DISCLOSURE_TRI_DOWN" if self.show_physics else "DISCLOSURE_TRI_RIGHT",
+                 emboss=False)
+        if self.show_physics:
+            box.prop(self, "import_physics")
 
 
 def menu_func_export(self, context):

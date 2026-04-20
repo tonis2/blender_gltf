@@ -14,7 +14,7 @@ from . import operator
 from . import exporter
 from . import importer
 from .gltf import constants, types, buffer, serialize
-from .export import converter, mesh, material, texture, scene, animation, skin
+from .export import converter, mesh, material, texture, scene, animation, skin, physics
 from .import_ import (
     converter as import_converter,
     buffer_reader,
@@ -24,6 +24,7 @@ from .import_ import (
     scene as import_scene,
     animation as import_animation,
     skin as import_skin,
+    physics as import_physics,
 )
 
 if _needs_reload:
@@ -41,6 +42,7 @@ if _needs_reload:
     scene = importlib.reload(scene)
     animation = importlib.reload(animation)
     skin = importlib.reload(skin)
+    physics = importlib.reload(physics)
     importer = importlib.reload(importer)
     import_converter = importlib.reload(import_converter)
     buffer_reader = importlib.reload(buffer_reader)
@@ -50,6 +52,7 @@ if _needs_reload:
     import_scene = importlib.reload(import_scene)
     import_animation = importlib.reload(import_animation)
     import_skin = importlib.reload(import_skin)
+    import_physics = importlib.reload(import_physics)
 
 
 def register():

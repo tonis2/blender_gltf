@@ -15,6 +15,7 @@ from .converter import (
 from .mesh import MeshExporter
 from .material import MaterialExporter
 from .skin import SkinExporter
+from .physics import PhysicsExporter
 
 if TYPE_CHECKING:
     import bpy
@@ -33,12 +34,14 @@ class SceneExporter:
         buffer: BufferBuilder,
         settings: "ExportSettings",
         skin_exporter: SkinExporter | None = None,
+        physics_exporter: PhysicsExporter | None = None,
     ) -> None:
         self.mesh_exporter = mesh_exporter
         self.material_exporter = material_exporter
         self.buffer = buffer
         self.settings = settings
         self.skin_exporter = skin_exporter
+        self.physics_exporter = physics_exporter
         self.nodes: list[Node] = []
         self.object_to_node_index: dict[str, int] = {}
         self.extensions_used: set[str] = set()
@@ -192,6 +195,14 @@ class SceneExporter:
             scale=gltf_scale if not is_identity_s else None,
             extensions=extensions,
         )
+
+        # Physics extension (rigid body / collider)
+        if self.physics_exporter:
+            physics_ext = self.physics_exporter.gather_node(obj, mesh_index)
+            if physics_ext:
+                if node.extensions is None:
+                    node.extensions = {}
+                node.extensions.update(physics_ext)
 
         index = len(self.nodes)
         self.nodes.append(node)

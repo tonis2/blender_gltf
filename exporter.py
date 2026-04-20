@@ -13,6 +13,7 @@ from .export.material import MaterialExporter
 from .export.mesh import MeshExporter
 from .export.scene import SceneExporter
 from .export.skin import SkinExporter
+from .export.physics import PhysicsExporter
 
 if TYPE_CHECKING:
     import bpy
@@ -30,6 +31,7 @@ class ExportSettings:
     export_morph_targets: bool = True
     export_gpu_instancing: bool = True
     export_skinning: bool = True
+    export_physics: bool = True
 
 
 class GltfExporter:
@@ -41,14 +43,23 @@ class GltfExporter:
         self.material_exporter = MaterialExporter(self.texture_exporter, settings)
         self.mesh_exporter = MeshExporter(self.buffer, settings)
         self.skin_exporter = SkinExporter(self.buffer, settings) if settings.export_skinning else None
+        self.physics_exporter = PhysicsExporter(settings) if settings.export_physics else None
         self.scene_exporter = SceneExporter(
             self.mesh_exporter, self.material_exporter, self.buffer, settings,
             skin_exporter=self.skin_exporter,
+            physics_exporter=self.physics_exporter,
         )
 
     def export(self) -> None:
         # 1. Gather scene data
         scenes, active_scene = self.scene_exporter.gather(self.context)
+
+        # 1b. Physics joint post-pass (needs node mapping from scene pass)
+        if self.physics_exporter:
+            self.physics_exporter.gather_joints(
+                self.scene_exporter.object_to_node_index,
+                self.scene_exporter.nodes,
+            )
 
         # 2. Gather animations (needs node mapping from scene pass)
         animations = None
@@ -77,7 +88,14 @@ class GltfExporter:
         all_extensions = set(self.scene_exporter.extensions_used)
         if animation_exporter:
             all_extensions |= animation_exporter.extensions_used
+        if self.physics_exporter:
+            all_extensions |= self.physics_exporter.extensions_used
         extensions_used = sorted(all_extensions) or None
+
+        # 5b. Collect root-level extensions
+        root_extensions = None
+        if self.physics_exporter:
+            root_extensions = self.physics_exporter.get_root_extensions()
 
         # 6. Assemble glTF
         gltf = Gltf(
@@ -95,6 +113,7 @@ class GltfExporter:
             samplers=self.texture_exporter.samplers or None,
             animations=animations,
             skins=self.skin_exporter.skins if self.skin_exporter and self.skin_exporter.skins else None,
+            extensions=root_extensions,
             extensions_used=extensions_used,
         )
 

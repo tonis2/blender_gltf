@@ -13,6 +13,7 @@ from .import_.mesh import MeshImporter
 from .import_.skin import SkinImporter
 from .import_.scene import SceneImporter
 from .import_.animation import AnimationImporter
+from .import_.physics import PhysicsImporter
 
 if TYPE_CHECKING:
     import bpy
@@ -28,6 +29,7 @@ class ImportSettings:
     import_animations: bool = True
     import_morph_targets: bool = True
     import_skinning: bool = True
+    import_physics: bool = True
 
 
 class GltfImporter:
@@ -69,12 +71,24 @@ class GltfImporter:
         if self.settings.import_skinning and gltf.skins:
             skin_importer = SkinImporter(gltf, buffer_reader, mesh_importer, self.settings)
 
+        # 7b. Prepare physics importer
+        physics_importer = None
+        if self.settings.import_physics:
+            physics_importer = PhysicsImporter(gltf, self.settings)
+            if not physics_importer.has_physics():
+                physics_importer = None
+
         # 8. Import scene hierarchy (creates armatures for skinned meshes)
         scene_importer = SceneImporter(
             gltf, buffer_reader, mesh_importer, self.settings,
             skin_importer=skin_importer,
+            physics_importer=physics_importer,
         )
         node_to_blender = scene_importer.import_scene(self.context)
+
+        # 8b. Physics joint fixup (needs node mapping)
+        if physics_importer:
+            physics_importer.fixup_joints(self.context, node_to_blender)
 
         # 9. Import animations
         if self.settings.import_animations:

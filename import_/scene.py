@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from .buffer_reader import BufferReader
     from .mesh import MeshImporter
     from .skin import SkinImporter
+    from .physics import PhysicsImporter
     from ..importer import ImportSettings
 
 
@@ -24,12 +25,14 @@ class SceneImporter:
         mesh_importer: "MeshImporter",
         settings: "ImportSettings",
         skin_importer: "SkinImporter | None" = None,
+        physics_importer: "PhysicsImporter | None" = None,
     ) -> None:
         self.gltf = gltf
         self.buffer_reader = buffer_reader
         self.mesh_importer = mesh_importer
         self.settings = settings
         self.skin_importer = skin_importer
+        self.physics_importer = physics_importer
         self.node_to_blender: dict[int, "bpy.types.Object"] = {}
 
     def import_scene(self, context: "bpy.types.Context") -> dict[int, "bpy.types.Object"]:
@@ -113,6 +116,10 @@ class SceneImporter:
                 and self.gltf.meshes):
             gltf_mesh = self.gltf.meshes[node.mesh]
             self.mesh_importer.apply_morph_targets(obj, node.mesh, gltf_mesh)
+
+        # Physics (rigid body / collider)
+        if self.physics_importer and self.settings.import_physics:
+            self.physics_importer.import_node(context, obj, node, node_index)
 
         # Recurse children
         if node.children:
