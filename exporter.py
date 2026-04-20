@@ -12,6 +12,7 @@ from .export.texture import TextureExporter
 from .export.material import MaterialExporter
 from .export.mesh import MeshExporter
 from .export.scene import SceneExporter
+from .export.skin import SkinExporter
 
 if TYPE_CHECKING:
     import bpy
@@ -28,6 +29,7 @@ class ExportSettings:
     export_animations: bool = True
     export_morph_targets: bool = True
     export_gpu_instancing: bool = True
+    export_skinning: bool = True
 
 
 class GltfExporter:
@@ -38,8 +40,10 @@ class GltfExporter:
         self.texture_exporter = TextureExporter(self.buffer, settings)
         self.material_exporter = MaterialExporter(self.texture_exporter, settings)
         self.mesh_exporter = MeshExporter(self.buffer, settings)
+        self.skin_exporter = SkinExporter(self.buffer, settings) if settings.export_skinning else None
         self.scene_exporter = SceneExporter(
             self.mesh_exporter, self.material_exporter, self.buffer, settings,
+            skin_exporter=self.skin_exporter,
         )
 
     def export(self) -> None:
@@ -55,6 +59,7 @@ class GltfExporter:
                 self.settings,
                 self.scene_exporter.object_to_node_index,
                 self.material_exporter._cache,
+                bone_to_node_index=self.skin_exporter.bone_to_node_index if self.skin_exporter else None,
             )
             animation_exporter.gather(self.context)
             if animation_exporter.animations:
@@ -89,6 +94,7 @@ class GltfExporter:
             images=self.texture_exporter.images or None,
             samplers=self.texture_exporter.samplers or None,
             animations=animations,
+            skins=self.skin_exporter.skins if self.skin_exporter and self.skin_exporter.skins else None,
             extensions_used=extensions_used,
         )
 

@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from ..gltf.types import Gltf, Node
     from .buffer_reader import BufferReader
     from .mesh import MeshImporter
+    from .skin import SkinImporter
     from ..importer import ImportSettings
 
 
@@ -22,11 +23,13 @@ class SceneImporter:
         buffer_reader: "BufferReader",
         mesh_importer: "MeshImporter",
         settings: "ImportSettings",
+        skin_importer: "SkinImporter | None" = None,
     ) -> None:
         self.gltf = gltf
         self.buffer_reader = buffer_reader
         self.mesh_importer = mesh_importer
         self.settings = settings
+        self.skin_importer = skin_importer
         self.node_to_blender: dict[int, "bpy.types.Object"] = {}
 
     def import_scene(self, context: "bpy.types.Context") -> dict[int, "bpy.types.Object"]:
@@ -57,6 +60,11 @@ class SceneImporter:
         node = self.gltf.nodes[node_index]
         name = node.name or f"Node_{node_index}"
 
+        # Skip joint nodes (they become bones inside armatures)
+        if (self.skin_importer and self.settings.import_skinning
+                and node_index in self.skin_importer.joint_node_indices):
+            return
+
         # Check for EXT_mesh_gpu_instancing
         if node.extensions and "EXT_mesh_gpu_instancing" in node.extensions:
             self._import_gpu_instanced_node(context, node, node_index, collection, parent_obj)
@@ -82,6 +90,22 @@ class SceneImporter:
                 obj.hide_render = True
 
         self.node_to_blender[node_index] = obj
+
+        # Handle skinned mesh: create armature and apply weights
+        if (node.skin is not None and self.skin_importer
+                and self.settings.import_skinning):
+            armature_obj = self.skin_importer.import_skin(
+                context, node.skin, obj, collection,
+            )
+            self._apply_transform(armature_obj, node)
+            if parent_obj:
+                armature_obj.parent = parent_obj
+            # Clear transform on mesh since armature carries it
+            obj.location = (0, 0, 0)
+            obj.rotation_quaternion = (1, 0, 0, 0)
+            obj.rotation_mode = "QUATERNION"
+            obj.scale = (1, 1, 1)
+            obj.parent = armature_obj
 
         # Apply morph targets (needs object)
         if (node.mesh is not None

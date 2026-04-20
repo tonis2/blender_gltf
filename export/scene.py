@@ -14,6 +14,7 @@ from .converter import (
 )
 from .mesh import MeshExporter
 from .material import MaterialExporter
+from .skin import SkinExporter
 
 if TYPE_CHECKING:
     import bpy
@@ -31,11 +32,13 @@ class SceneExporter:
         material_exporter: MaterialExporter,
         buffer: BufferBuilder,
         settings: "ExportSettings",
+        skin_exporter: SkinExporter | None = None,
     ) -> None:
         self.mesh_exporter = mesh_exporter
         self.material_exporter = material_exporter
         self.buffer = buffer
         self.settings = settings
+        self.skin_exporter = skin_exporter
         self.nodes: list[Node] = []
         self.object_to_node_index: dict[str, int] = {}
         self.extensions_used: set[str] = set()
@@ -68,12 +71,14 @@ class SceneExporter:
                 if obj:
                     skip_objects.add(name)
 
-        for obj in scene.objects:
-            if obj.parent is not None:
-                continue
-            if obj.name in skip_objects:
-                continue
+        # Process armatures first to ensure skin data is available for skinned meshes
+        root_objects = [
+            obj for obj in scene.objects
+            if obj.parent is None and obj.name not in skip_objects
+        ]
+        root_objects.sort(key=lambda o: (0 if o.type == "ARMATURE" else 1))
 
+        for obj in root_objects:
             node_index = self._gather_node(obj)
             if node_index is not None:
                 root_nodes.append(node_index)
@@ -90,13 +95,67 @@ class SceneExporter:
 
         # Gather mesh (if applicable)
         mesh_index = None
+        skin_index = None
         if obj.type == "MESH":
+            # Check for armature modifier (skinned mesh)
+            joint_map = None
+            if self.skin_exporter and self.settings.export_skinning:
+                armature_mod = self._find_armature_modifier(obj)
+                if armature_mod and armature_mod.object:
+                    arm_name = armature_mod.object.name
+                    if arm_name in self.skin_exporter.armature_joint_maps:
+                        joint_map = self.skin_exporter.armature_joint_maps[arm_name]
+                        skin_index = self.skin_exporter.armature_skin_index[arm_name]
+
             # Build material slot -> glTF material index mapping
             material_map = self._gather_materials_for_object(obj)
-            mesh_index = self.mesh_exporter.gather(obj, material_map)
+            mesh_index = self.mesh_exporter.gather(obj, material_map, joint_map)
 
         # Gather children recursively (include hidden children too)
         children: list[int] = []
+
+        # For armatures, create bone nodes as children
+        if obj.type == "ARMATURE" and self.skin_exporter and self.settings.export_skinning:
+            # Create armature node first so we have its index
+            loc, rot, scale = obj.matrix_local.decompose()
+            translation = convert_location(loc)
+            rotation = convert_rotation(rot)
+            gltf_scale = convert_scale(scale)
+
+            is_identity_t = all(abs(v) < 1e-6 for v in translation)
+            is_identity_r = (abs(rotation[0]) < 1e-6 and abs(rotation[1]) < 1e-6 and
+                             abs(rotation[2]) < 1e-6 and abs(rotation[3] - 1.0) < 1e-6)
+            is_identity_s = all(abs(v - 1.0) < 1e-6 for v in gltf_scale)
+
+            extensions = None
+            if not is_visible:
+                extensions = {EXT_NODE_VISIBILITY: {"visible": False}}
+                self.extensions_used.add(EXT_NODE_VISIBILITY)
+
+            node = Node(
+                name=obj.name,
+                translation=translation if not is_identity_t else None,
+                rotation=rotation if not is_identity_r else None,
+                scale=gltf_scale if not is_identity_s else None,
+                extensions=extensions,
+            )
+            index = len(self.nodes)
+            self.nodes.append(node)
+            self.object_to_node_index[obj.name] = index
+
+            # Create bone child nodes
+            root_bone_indices = self.skin_exporter.gather_armature(obj, index, self.nodes)
+            children.extend(root_bone_indices)
+
+            # Recurse regular children (skinned meshes parented to armature)
+            for child in obj.children:
+                child_index = self._gather_node(child)
+                if child_index is not None:
+                    children.append(child_index)
+
+            node.children = children if children else None
+            return index
+
         for child in obj.children:
             child_index = self._gather_node(child)
             if child_index is not None:
@@ -126,6 +185,7 @@ class SceneExporter:
         node = Node(
             name=obj.name,
             mesh=mesh_index,
+            skin=skin_index,
             children=children if children else None,
             translation=translation if not is_identity_t else None,
             rotation=rotation if not is_identity_r else None,
@@ -137,6 +197,14 @@ class SceneExporter:
         self.nodes.append(node)
         self.object_to_node_index[obj.name] = index
         return index
+
+    @staticmethod
+    def _find_armature_modifier(obj: "bpy.types.Object"):
+        """Find the first active Armature modifier on an object."""
+        for mod in obj.modifiers:
+            if mod.type == "ARMATURE" and mod.object:
+                return mod
+        return None
 
     def _gather_materials_for_object(self, obj: "bpy.types.Object") -> dict[int, int]:
         """Gather materials and return mapping: Blender slot index -> glTF material index."""

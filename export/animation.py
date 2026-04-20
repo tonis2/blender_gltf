@@ -53,6 +53,12 @@ _MATERIAL_SOCKET_MAP: dict[str, tuple[str, DataType, int]] = {
     "Alpha": ("pbrMetallicRoughness/baseColorFactor", DataType.VEC4, 4),
 }
 
+# Regex to parse pose bone fcurve data_paths
+# e.g. pose.bones["BoneName"].location
+_BONE_FCURVE_RE = re.compile(
+    r'pose\.bones\["([^"]+)"\]\.(location|rotation_quaternion|rotation_euler|scale)'
+)
+
 # Regex to parse material node tree fcurve data_paths
 # e.g. nodes["Principled BSDF"].inputs[0].default_value
 _MAT_FCURVE_RE = re.compile(
@@ -103,11 +109,13 @@ class AnimationExporter:
         settings: "ExportSettings",
         object_to_node_index: dict[str, int],
         material_to_index: dict[str, int],
+        bone_to_node_index: dict[str, int] | None = None,
     ) -> None:
         self.buffer = buffer
         self.settings = settings
         self.object_to_node_index = object_to_node_index
         self.material_to_index = material_to_index
+        self.bone_to_node_index = bone_to_node_index or {}
         self.animations: list[Animation] = []
         self.extensions_used: set[str] = set()
 
@@ -132,6 +140,10 @@ class AnimationExporter:
             anim = self._gather_action(action_name, pairs, fps)
             if anim is not None:
                 self.animations.append(anim)
+
+        # --- Bone/pose animations ---
+        if self.settings.export_skinning and self.bone_to_node_index:
+            self._gather_bone_animations(scene, fps)
 
         # --- Shape key weight animations (on shape_keys.animation_data) ---
         if self.settings.export_morph_targets:
@@ -343,6 +355,192 @@ class AnimationExporter:
         elif gltf_path == "scale":
             return convert_scale_array(values)
         return values
+
+    # --- Bone/pose animation ---
+
+    def _gather_bone_animations(
+        self, scene: "bpy.types.Scene", fps: float,
+    ) -> None:
+        """Gather bone/pose animations from armature objects."""
+        for obj in scene.objects:
+            if obj.type != "ARMATURE":
+                continue
+            if obj.animation_data is None or obj.animation_data.action is None:
+                continue
+
+            action = obj.animation_data.action
+            anim = self._gather_bone_action(obj, action, fps)
+            if anim is not None:
+                self.animations.append(anim)
+
+    def _gather_bone_action(
+        self,
+        armature_obj: "bpy.types.Object",
+        action: "bpy.types.Action",
+        fps: float,
+    ) -> "Animation | None":
+        """Gather bone animation channels from an armature action."""
+        import mathutils
+
+        channels: list[AnimationChannel] = []
+        samplers: list[AnimationSampler] = []
+
+        # Group fcurves by (bone_name, property)
+        bone_fcurves: dict[tuple[str, str], dict[int, "bpy.types.FCurve"]] = defaultdict(dict)
+        for fcurve in _get_fcurves(action, armature_obj.animation_data):
+            match = _BONE_FCURVE_RE.match(fcurve.data_path)
+            if match:
+                bone_name = match.group(1)
+                data_path = match.group(2)
+                bone_fcurves[(bone_name, data_path)][fcurve.array_index] = fcurve
+
+        for (bone_name, data_path), fc_dict in bone_fcurves.items():
+            if bone_name not in self.bone_to_node_index:
+                continue
+            # Skip rotation_euler if quaternion also exists
+            if data_path == "rotation_euler" and (bone_name, "rotation_quaternion") in bone_fcurves:
+                continue
+
+            result = self._gather_bone_trs_channel(
+                armature_obj, bone_name, fc_dict, data_path, fps,
+            )
+            if result is not None:
+                sampler, channel = result
+                sampler_idx = len(samplers)
+                samplers.append(sampler)
+                channel.sampler = sampler_idx
+                channels.append(channel)
+
+        if not channels:
+            return None
+
+        return Animation(name=action.name, channels=channels, samplers=samplers)
+
+    def _gather_bone_trs_channel(
+        self,
+        armature_obj: "bpy.types.Object",
+        bone_name: str,
+        fcurves: dict[int, "bpy.types.FCurve"],
+        data_path: str,
+        fps: float,
+    ) -> "tuple[AnimationSampler, AnimationChannel] | None":
+        """Build sampler + channel for one bone TRS property.
+
+        Blender pose bone values are deltas from rest pose.
+        glTF needs absolute local TRS, so we compose: absolute = rest_local @ delta.
+        """
+        import mathutils
+
+        gltf_path, data_type = _TRS_PATH_MAP[data_path]
+        num_components = _PATH_COMPONENTS[data_path]
+
+        bone = armature_obj.data.bones.get(bone_name)
+        if bone is None:
+            return None
+        node_index = self.bone_to_node_index[bone_name]
+
+        # Compute rest local matrix (bone relative to parent)
+        if bone.parent:
+            rest_local = bone.parent.matrix_local.inverted() @ bone.matrix_local
+        else:
+            rest_local = bone.matrix_local.copy()
+
+        # Collect all unique keyframe times
+        frames: set[float] = set()
+        for fcurve in fcurves.values():
+            for kp in fcurve.keyframe_points:
+                frames.add(kp.co[0])
+
+        if not frames:
+            return None
+
+        sorted_frames = sorted(frames)
+        times = np.array([f / fps for f in sorted_frames], dtype=np.float32)
+
+        # Determine interpolation
+        first_fcurve = next(iter(fcurves.values()))
+        blender_interp = first_fcurve.keyframe_points[0].interpolation if first_fcurve.keyframe_points else "LINEAR"
+        gltf_interp = _INTERPOLATION_MAP.get(blender_interp, "LINEAR")
+
+        # Rest values for pose bone deltas (identity)
+        if data_path in ("location",):
+            rest_delta = [0.0, 0.0, 0.0]
+        elif data_path == "rotation_quaternion":
+            rest_delta = [1.0, 0.0, 0.0, 0.0]
+        elif data_path == "rotation_euler":
+            rest_delta = [0.0, 0.0, 0.0]
+        elif data_path == "scale":
+            rest_delta = [1.0, 1.0, 1.0]
+        else:
+            rest_delta = [0.0] * num_components
+
+        # Evaluate delta values at each keyframe
+        n_keyframes = len(sorted_frames)
+        delta_values = np.empty((n_keyframes, num_components), dtype=np.float32)
+        for i, frame in enumerate(sorted_frames):
+            for c in range(num_components):
+                if c in fcurves:
+                    delta_values[i, c] = fcurves[c].evaluate(frame)
+                else:
+                    delta_values[i, c] = rest_delta[c]
+
+        # Handle euler -> quaternion conversion for deltas
+        if data_path == "rotation_euler":
+            pose_bone = armature_obj.pose.bones.get(bone_name)
+            rotation_mode = pose_bone.rotation_mode if pose_bone else "XYZ"
+            quats = np.empty((n_keyframes, 4), dtype=np.float32)
+            for i in range(n_keyframes):
+                euler = mathutils.Euler(delta_values[i], rotation_mode)
+                q = euler.to_quaternion()
+                quats[i] = [q.w, q.x, q.y, q.z]
+            delta_values = quats
+            num_components = 4
+
+        # Compose delta with rest pose to get absolute local TRS
+        abs_values = np.empty((n_keyframes, data_type.num_components), dtype=np.float32)
+        for i in range(n_keyframes):
+            if gltf_path == "translation":
+                delta_loc = mathutils.Vector(delta_values[i])
+                delta_mat = mathutils.Matrix.Translation(delta_loc)
+            elif gltf_path == "rotation":
+                delta_rot = mathutils.Quaternion(delta_values[i])
+                delta_mat = delta_rot.to_matrix().to_4x4()
+            elif gltf_path == "scale":
+                delta_scl = mathutils.Vector(delta_values[i])
+                delta_mat = mathutils.Matrix.Diagonal(delta_scl).to_4x4()
+            else:
+                continue
+
+            absolute = rest_local @ delta_mat
+            abs_loc, abs_rot, abs_scl = absolute.decompose()
+
+            if gltf_path == "translation":
+                abs_values[i] = [abs_loc.x, abs_loc.y, abs_loc.z]
+            elif gltf_path == "rotation":
+                abs_values[i] = [abs_rot.w, abs_rot.x, abs_rot.y, abs_rot.z]
+            elif gltf_path == "scale":
+                abs_values[i] = [abs_scl.x, abs_scl.y, abs_scl.z]
+
+        # Apply coordinate conversion
+        abs_values = self._convert_values(abs_values, gltf_path)
+
+        # Write accessors
+        input_acc = self.buffer.add_accessor(
+            times, ComponentType.FLOAT, DataType.SCALAR, include_bounds=True,
+        )
+        output_acc = self.buffer.add_accessor(
+            abs_values, ComponentType.FLOAT, data_type,
+        )
+
+        sampler = AnimationSampler(
+            input=input_acc,
+            output=output_acc,
+            interpolation=gltf_interp if gltf_interp != "LINEAR" else None,
+        )
+        channel = AnimationChannel(
+            target=AnimationChannelTarget(node=node_index, path=gltf_path),
+        )
+        return sampler, channel
 
     # --- Shape key weight animation ---
 

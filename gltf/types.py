@@ -165,6 +165,16 @@ class Node(GltfBase):
 
 
 @dataclass
+class Skin(GltfBase):
+    joints: list[int] = field(default_factory=list)
+    inverse_bind_matrices: int | None = None
+    skeleton: int | None = None
+    name: str | None = None
+    extensions: dict | None = None
+    extras: Any | None = None
+
+
+@dataclass
 class Scene(GltfBase):
     name: str | None = None
     nodes: list[int] | None = None
@@ -300,7 +310,7 @@ class Gltf(GltfBase):
     samplers: list[Sampler] | None = None
     cameras: list | None = None
     animations: list[Animation] | None = None
-    skins: list | None = None
+    skins: list[Skin] | None = None
     extensions: dict | None = None
     extensions_used: list[str] | None = None
     extensions_required: list[str] | None = None
@@ -321,6 +331,7 @@ _NESTED_TYPES.update({
     (Gltf, "images"): Image,
     (Gltf, "samplers"): Sampler,
     (Gltf, "animations"): Animation,
+    (Gltf, "skins"): Skin,
     (Mesh, "primitives"): MeshPrimitive,
     (Material, "pbr_metallic_roughness"): MaterialPBRMetallicRoughness,
     (Material, "normal_texture"): NormalTextureInfo,

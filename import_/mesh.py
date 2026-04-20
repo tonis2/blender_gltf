@@ -27,6 +27,8 @@ class MeshImporter:
         self.material_importer = material_importer
         self.settings = settings
         self.blender_meshes: dict[int, "bpy.types.Mesh"] = {}
+        # Skin data: mesh_index -> list of (joints_array, weights_array, vertex_offset)
+        self.skin_data: dict[int, list[tuple[np.ndarray, np.ndarray, int]]] = {}
 
     def import_all(self) -> None:
         if self.gltf.meshes is None:
@@ -95,6 +97,14 @@ class MeshImporter:
                     all_colors.append((color_idx, vertex_offset, colors, indices))
                 color_idx += 1
             num_color_layers = max(num_color_layers, color_idx)
+
+            # Skinning data (JOINTS_0 / WEIGHTS_0)
+            if "JOINTS_0" in prim.attributes and "WEIGHTS_0" in prim.attributes:
+                joints_acc = self.buffer_reader.read_accessor(prim.attributes["JOINTS_0"])
+                weights_acc = self.buffer_reader.read_accessor(prim.attributes["WEIGHTS_0"])
+                if index not in self.skin_data:
+                    self.skin_data[index] = []
+                self.skin_data[index].append((joints_acc, weights_acc, vertex_offset))
 
             vertex_offset += num_verts
 

@@ -58,3 +58,23 @@ def convert_scale_array(scales: np.ndarray) -> np.ndarray:
     result = scales.copy()
     result[:, [1, 2]] = result[:, [2, 1]]
     return result
+
+
+def convert_matrix(mat) -> list[float]:
+    """Convert a Blender Z-up 4x4 matrix to glTF Y-up, column-major 16-float list.
+
+    Applies M' = C @ M @ C^-1 where C maps (x,y,z) -> (x,z,-y).
+    """
+    # Convert to numpy for manipulation
+    m = np.array([list(row) for row in mat], dtype=np.float64)
+
+    # Swap rows 1 and 2, negate new row 2
+    m[[1, 2]] = m[[2, 1]]
+    m[2] *= -1
+
+    # Swap cols 1 and 2, negate new col 2
+    m[:, [1, 2]] = m[:, [2, 1]]
+    m[:, 2] *= -1
+
+    # Flatten column-major (glTF convention)
+    return m.T.flatten().tolist()

@@ -25,6 +25,7 @@ class MeshExporter:
         self,
         blender_object: "bpy.types.Object",
         material_map: dict[int, int] | None = None,
+        skin_joint_map: dict[str, int] | None = None,
     ) -> int | None:
         """Export mesh data from a Blender object. Returns mesh index or None."""
         import bpy
@@ -32,9 +33,24 @@ class MeshExporter:
         if blender_object.type != "MESH":
             return None
 
-        depsgraph = bpy.context.evaluated_depsgraph_get()
-        eval_obj = blender_object.evaluated_get(depsgraph)
-        blender_mesh = eval_obj.to_mesh()
+        # Temporarily disable armature modifier for rest-pose vertices
+        armature_mod = None
+        armature_was_visible = None
+        if skin_joint_map is not None:
+            for mod in blender_object.modifiers:
+                if mod.type == "ARMATURE":
+                    armature_mod = mod
+                    armature_was_visible = mod.show_viewport
+                    mod.show_viewport = False
+                    break
+
+        try:
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+            eval_obj = blender_object.evaluated_get(depsgraph)
+            blender_mesh = eval_obj.to_mesh()
+        finally:
+            if armature_mod is not None:
+                armature_mod.show_viewport = armature_was_visible
 
         if blender_mesh is None or len(blender_mesh.vertices) == 0:
             eval_obj.to_mesh_clear()
@@ -50,8 +66,19 @@ class MeshExporter:
         if self.settings.export_morph_targets:
             shape_key_data = self._extract_shape_keys(blender_object)
 
+        # Extract vertex weights for skinning
+        joint_data = None
+        weight_data = None
+        if skin_joint_map is not None:
+            joint_data, weight_data = self._extract_vertex_weights(
+                blender_mesh, blender_object, skin_joint_map,
+            )
+
         try:
-            mesh = self._extract(blender_mesh, blender_object, material_map, shape_key_data)
+            mesh = self._extract(
+                blender_mesh, blender_object, material_map,
+                shape_key_data, joint_data, weight_data,
+            )
         finally:
             eval_obj.to_mesh_clear()
 
@@ -93,12 +120,50 @@ class MeshExporter:
 
         return results
 
+    def _extract_vertex_weights(
+        self,
+        blender_mesh: "bpy.types.Mesh",
+        blender_object: "bpy.types.Object",
+        joint_map: dict[str, int],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Extract per-vertex bone weights. Returns (joints, weights) arrays of shape (N, 4)."""
+        num_verts = len(blender_mesh.vertices)
+        joints = np.zeros((num_verts, 4), dtype=np.uint16)
+        weights = np.zeros((num_verts, 4), dtype=np.float32)
+
+        # Build vertex group index -> joint index mapping
+        group_to_joint: dict[int, int] = {}
+        for vg in blender_object.vertex_groups:
+            if vg.name in joint_map:
+                group_to_joint[vg.index] = joint_map[vg.name]
+
+        for v_idx, vert in enumerate(blender_mesh.vertices):
+            bone_weights: list[tuple[int, float]] = []
+            for g in vert.groups:
+                if g.group in group_to_joint and g.weight > 0:
+                    bone_weights.append((group_to_joint[g.group], g.weight))
+
+            # Sort by weight descending, take top 4
+            bone_weights.sort(key=lambda x: x[1], reverse=True)
+            bone_weights = bone_weights[:4]
+
+            # Normalize
+            total = sum(w for _, w in bone_weights)
+            if total > 0:
+                for i, (j, w) in enumerate(bone_weights):
+                    joints[v_idx, i] = j
+                    weights[v_idx, i] = w / total
+
+        return joints, weights
+
     def _extract(
         self,
         blender_mesh: "bpy.types.Mesh",
         blender_object: "bpy.types.Object",
         material_map: dict[int, int] | None = None,
         shape_key_data: list[tuple[str, np.ndarray]] | None = None,
+        joint_data: np.ndarray | None = None,
+        weight_data: np.ndarray | None = None,
     ) -> Mesh | None:
         name = blender_object.name
         blender_mesh.calc_loop_triangles()
@@ -210,7 +275,7 @@ class MeshExporter:
             prim = self._build_primitive(
                 positions, dots, prim_loop_indices,
                 len(uv_arrays), len(color_arrays), gltf_mat_idx,
-                shape_key_data,
+                shape_key_data, joint_data, weight_data,
             )
             if prim is not None:
                 primitives.append(prim)
@@ -234,6 +299,8 @@ class MeshExporter:
         num_color_layers: int,
         material_index: int | None,
         shape_key_data: list[tuple[str, np.ndarray]] | None = None,
+        joint_data: np.ndarray | None = None,
+        weight_data: np.ndarray | None = None,
     ) -> MeshPrimitive | None:
         """Deduplicate vertices and create buffer accessors for one primitive."""
         # Extract dots for this primitive's loops
@@ -294,6 +361,19 @@ class MeshExporter:
             ])
             attributes[f"COLOR_{i}"] = self.buffer.add_accessor(
                 color_data, ComponentType.FLOAT, DataType.VEC4,
+                target=BufferViewTarget.ARRAY_BUFFER,
+            )
+
+        # Skinning attributes (per vertex, indexed like positions)
+        if joint_data is not None and weight_data is not None:
+            prim_joints = joint_data[vert_indices]
+            prim_weights = weight_data[vert_indices]
+            attributes["JOINTS_0"] = self.buffer.add_accessor(
+                prim_joints, ComponentType.UNSIGNED_SHORT, DataType.VEC4,
+                target=BufferViewTarget.ARRAY_BUFFER,
+            )
+            attributes["WEIGHTS_0"] = self.buffer.add_accessor(
+                prim_weights, ComponentType.FLOAT, DataType.VEC4,
                 target=BufferViewTarget.ARRAY_BUFFER,
             )
 

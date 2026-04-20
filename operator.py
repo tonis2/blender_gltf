@@ -71,6 +71,12 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         default=True,
     )
 
+    export_skinning: BoolProperty(
+        name="Skinning",
+        description="Export armatures and bone weights",
+        default=True,
+    )
+
     def execute(self, context):
         settings = ExportSettings(
             filepath=self.filepath,
@@ -82,6 +88,7 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
             export_animations=self.export_animations,
             export_morph_targets=self.export_morph_targets,
             export_gpu_instancing=self.export_gpu_instancing,
+            export_skinning=self.export_skinning,
         )
 
         try:
@@ -112,6 +119,10 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         box.label(text="Animation")
         box.prop(self, "export_animations")
         box.prop(self, "export_morph_targets")
+
+        box = layout.box()
+        box.label(text="Skinning")
+        box.prop(self, "export_skinning")
 
         box = layout.box()
         box.label(text="Instancing")
@@ -184,6 +195,12 @@ class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
         default=True,
     )
 
+    import_skinning: BoolProperty(
+        name="Skinning",
+        description="Import armatures and bone weights",
+        default=True,
+    )
+
     def execute(self, context):
         settings = ImportSettings(
             filepath=self.filepath,
@@ -193,6 +210,7 @@ class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
             import_colors=self.import_colors,
             import_animations=self.import_animations,
             import_morph_targets=self.import_morph_targets,
+            import_skinning=self.import_skinning,
         )
 
         try:
@@ -222,6 +240,10 @@ class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
         box.label(text="Animation")
         box.prop(self, "import_animations")
         box.prop(self, "import_morph_targets")
+
+        box = layout.box()
+        box.label(text="Skinning")
+        box.prop(self, "import_skinning")
 
 
 def menu_func_export(self, context):

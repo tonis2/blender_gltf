@@ -23,12 +23,14 @@ class AnimationImporter:
         node_to_blender: dict[int, "bpy.types.Object"],
         material_importer: "MaterialImporter",
         settings: "ImportSettings",
+        bone_node_to_armature: dict[int, tuple["bpy.types.Object", str]] | None = None,
     ) -> None:
         self.gltf = gltf
         self.buffer_reader = buffer_reader
         self.node_to_blender = node_to_blender
         self.material_importer = material_importer
         self.settings = settings
+        self.bone_node_to_armature = bone_node_to_armature or {}
 
     def import_all(self, context: "bpy.types.Context") -> None:
         if self.gltf.animations is None:
@@ -60,6 +62,14 @@ class AnimationImporter:
         import bpy
 
         node_index = target.node
+
+        # Check if this is a bone animation
+        if node_index in self.bone_node_to_armature:
+            self._import_bone_trs_animation(
+                node_index, gltf_path, times, values, interp, fps, anim_name,
+            )
+            return
+
         obj = self.node_to_blender.get(node_index)
         if obj is None:
             return
@@ -114,6 +124,123 @@ class AnimationImporter:
                     kp.co = (frame, values[i, c])
                     kp.interpolation = blender_interp
                 fcurve.update()
+
+    def _import_bone_trs_animation(
+        self,
+        node_index: int,
+        gltf_path: str,
+        times,
+        values,
+        interp: str,
+        fps: float,
+        anim_name: str | None,
+    ) -> None:
+        """Import TRS animation for a bone node, converting absolute TRS to pose deltas."""
+        import bpy
+        import mathutils
+
+        armature_obj, bone_name = self.bone_node_to_armature[node_index]
+        bone = armature_obj.data.bones.get(bone_name)
+        if bone is None:
+            return
+
+        # Compute rest local matrix (bone relative to parent)
+        if bone.parent:
+            rest_local = bone.parent.matrix_local.inverted() @ bone.matrix_local
+        else:
+            rest_local = bone.matrix_local.copy()
+        rest_local_inv = rest_local.inverted()
+
+        # Decompose rest local for per-channel delta computation
+        rest_loc, rest_rot, rest_scl = rest_local.decompose()
+
+        if gltf_path == "translation":
+            data_path = f'pose.bones["{bone_name}"].location'
+            num_components = 3
+        elif gltf_path == "rotation":
+            data_path = f'pose.bones["{bone_name}"].rotation_quaternion'
+            num_components = 4
+        elif gltf_path == "scale":
+            data_path = f'pose.bones["{bone_name}"].scale'
+            num_components = 3
+        else:
+            return
+
+        # Set rotation mode on pose bone
+        pose_bone = armature_obj.pose.bones.get(bone_name)
+        if pose_bone and gltf_path == "rotation":
+            pose_bone.rotation_mode = "QUATERNION"
+
+        action = self._ensure_action(armature_obj, anim_name or "Action")
+
+        values = values.reshape(-1, num_components if gltf_path != "rotation" else 4)
+        values = self._convert_values(values, gltf_path)
+        blender_interp = "CONSTANT" if interp == "STEP" else "LINEAR"
+
+        # Convert absolute TRS to pose bone deltas
+        if gltf_path == "translation":
+            # For each keyframe: compose absolute translation into a matrix,
+            # compute delta = rest_inv @ absolute_matrix, extract translation
+            delta_out = np.empty((len(times), 3), dtype=np.float32)
+            for i in range(len(times)):
+                abs_loc = mathutils.Vector(values[i])
+                # Build absolute local matrix with rest rotation and scale
+                abs_mat = (
+                    mathutils.Matrix.Translation(abs_loc)
+                    @ rest_rot.to_matrix().to_4x4()
+                    @ mathutils.Matrix.Diagonal((*rest_scl, 1.0))
+                )
+                delta_mat = rest_local_inv @ abs_mat
+                d_loc, _, _ = delta_mat.decompose()
+                delta_out[i] = [d_loc.x, d_loc.y, d_loc.z]
+            out_components = 3
+            out_values = delta_out
+
+        elif gltf_path == "rotation":
+            # delta_rot = rest_rot.inverted() @ abs_rot
+            rest_rot_inv = rest_rot.inverted()
+            delta_out = np.empty((len(times), 4), dtype=np.float32)
+            for i in range(len(times)):
+                abs_rot_val = mathutils.Quaternion(values[i])
+                # Build absolute local matrix with rest translation and scale
+                abs_mat = (
+                    mathutils.Matrix.Translation(rest_loc)
+                    @ abs_rot_val.to_matrix().to_4x4()
+                    @ mathutils.Matrix.Diagonal((*rest_scl, 1.0))
+                )
+                delta_mat = rest_local_inv @ abs_mat
+                _, d_rot, _ = delta_mat.decompose()
+                delta_out[i] = [d_rot.w, d_rot.x, d_rot.y, d_rot.z]
+            out_components = 4
+            out_values = delta_out
+
+        elif gltf_path == "scale":
+            # delta_scale = abs_scale / rest_scale (component-wise)
+            delta_out = np.empty((len(times), 3), dtype=np.float32)
+            for i in range(len(times)):
+                abs_scl_val = mathutils.Vector(values[i])
+                abs_mat = (
+                    mathutils.Matrix.Translation(rest_loc)
+                    @ rest_rot.to_matrix().to_4x4()
+                    @ mathutils.Matrix.Diagonal((*abs_scl_val, 1.0))
+                )
+                delta_mat = rest_local_inv @ abs_mat
+                _, _, d_scl = delta_mat.decompose()
+                delta_out[i] = [d_scl.x, d_scl.y, d_scl.z]
+            out_components = 3
+            out_values = delta_out
+        else:
+            return
+
+        for c in range(out_components):
+            fcurve = self._create_fcurve(action, data_path, c, armature_obj)
+            fcurve.keyframe_points.add(len(times))
+            for i in range(len(times)):
+                frame = times[i] * fps
+                kp = fcurve.keyframe_points[i]
+                kp.co = (frame, out_values[i, c])
+                kp.interpolation = blender_interp
+            fcurve.update()
 
     def _import_weight_animation(
         self, target, times, values, interp: str, fps: float, anim_name: str | None,
