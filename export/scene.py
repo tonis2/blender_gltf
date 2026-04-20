@@ -96,6 +96,10 @@ class SceneExporter:
         """Convert a Blender object to a glTF Node. Returns node index."""
         is_visible = obj.visible_get()
 
+        # Skip hidden objects entirely when "only visible" is enabled
+        if self.settings.export_only_visible and not is_visible:
+            return None
+
         # Gather mesh (if applicable)
         mesh_index = None
         skin_index = None

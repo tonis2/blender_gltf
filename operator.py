@@ -97,6 +97,7 @@ _EXPORT_PROPS = (
     "export_gpu_instancing",
     "export_skinning",
     "export_physics",
+    "export_only_visible",
 )
 
 
@@ -121,6 +122,7 @@ class GltfExportSceneSettings(bpy.types.PropertyGroup):
     export_gpu_instancing: BoolProperty(name="GPU Instancing", default=True)
     export_skinning: BoolProperty(name="Skinning", default=True)
     export_physics: BoolProperty(name="Physics", default=True)
+    export_only_visible: BoolProperty(name="Only Visible", default=False)
 
 
 class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
@@ -200,6 +202,12 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         default=True,
     )
 
+    export_only_visible: BoolProperty(
+        name="Only Visible",
+        description="Only export objects that are visible in the viewport",
+        default=False,
+    )
+
     # Section toggles (not exported, just for UI)
     show_mesh: BoolProperty(name="Mesh", default=True, options={"HIDDEN"})
     show_material: BoolProperty(name="Material", default=True, options={"HIDDEN"})
@@ -233,6 +241,7 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
             export_gpu_instancing=self.export_gpu_instancing,
             export_skinning=self.export_skinning,
             export_physics=self.export_physics,
+            export_only_visible=self.export_only_visible,
         )
 
         try:
@@ -248,6 +257,7 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "export_format")
+        layout.prop(self, "export_only_visible")
 
         box = layout.box()
         row = box.row()

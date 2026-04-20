@@ -32,6 +32,7 @@ class ExportSettings:
     export_gpu_instancing: bool = True
     export_skinning: bool = True
     export_physics: bool = True
+    export_only_visible: bool = False
 
 
 class GltfExporter:
