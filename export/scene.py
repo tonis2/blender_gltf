@@ -59,8 +59,35 @@ class SceneExporter:
         self._light_cache: dict[str, int] = {}  # blender light data name -> gltf index
 
     def gather(self, context: "bpy.types.Context") -> tuple[list[Scene], int]:
-        """Traverse the active scene and return (scenes, active_scene_index)."""
-        scene = context.scene
+        """Traverse scene(s) and return (scenes, active_scene_index)."""
+        import bpy
+
+        if self.settings.export_all_scenes:
+            blender_scenes = list(bpy.data.scenes)
+        else:
+            blender_scenes = [context.scene]
+
+        active_scene_index = 0
+        original_scene = context.window.scene
+        gltf_scenes: list[Scene] = []
+
+        for scene_idx, scene in enumerate(blender_scenes):
+            if scene == original_scene:
+                active_scene_index = scene_idx
+
+            # Switch active scene so depsgraph evaluates correctly
+            context.window.scene = scene
+
+            gltf_scene = self._gather_single_scene(scene)
+            gltf_scenes.append(gltf_scene)
+
+        # Restore original scene
+        context.window.scene = original_scene
+
+        return gltf_scenes, active_scene_index
+
+    def _gather_single_scene(self, scene: "bpy.types.Scene") -> Scene:
+        """Process a single Blender scene into a glTF Scene."""
         root_nodes: list[int] = []
 
         # Pre-pass: detect instances via depsgraph (GN, collection instances, particles)
@@ -73,14 +100,11 @@ class SceneExporter:
                 root_nodes.append(idx)
             # Only skip objects that are purely instancers (empties with collection instances)
             # or source objects that aren't real scene objects.
-            # Don't skip mesh objects that also serve as GN hosts (like Ground),
-            # since GN output replaces their geometry and they should be exported normally.
             for name in self._instancer_names:
                 obj = scene.objects.get(name)
                 if obj and obj.type != "MESH":
                     skip_objects.add(name)
             # Skip source meshes that only exist as instance sources
-            # (e.g., Trunk/Foliage in a hidden collection)
             for name in self._instanced_source_names:
                 obj = scene.objects.get(name)
                 if obj:
@@ -98,14 +122,17 @@ class SceneExporter:
             if node_index is not None:
                 root_nodes.append(node_index)
 
-        gltf_scene = Scene(
+        return Scene(
             name=scene.name,
             nodes=root_nodes if root_nodes else None,
         )
-        return [gltf_scene], 0
 
     def _gather_node(self, obj: "bpy.types.Object") -> int | None:
         """Convert a Blender object to a glTF Node. Returns node index."""
+        # If this object was already exported (shared across scenes), reuse its node
+        if obj.name in self.object_to_node_index:
+            return self.object_to_node_index[obj.name]
+
         is_visible = obj.visible_get()
 
         # Skip hidden objects entirely when "only visible" is enabled

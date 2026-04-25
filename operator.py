@@ -98,6 +98,7 @@ _EXPORT_PROPS = (
     "export_skinning",
     "export_physics",
     "export_only_visible",
+    "export_all_scenes",
     "image_format",
 )
 
@@ -124,6 +125,7 @@ class GltfExportSceneSettings(bpy.types.PropertyGroup):
     export_skinning: BoolProperty(name="Skinning", default=True)
     export_physics: BoolProperty(name="Physics", default=True)
     export_only_visible: BoolProperty(name="Only Visible", default=False)
+    export_all_scenes: BoolProperty(name="All Scenes", default=False)
     image_format: EnumProperty(
         name="Image Format",
         items=[
@@ -218,6 +220,12 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         default=False,
     )
 
+    export_all_scenes: BoolProperty(
+        name="All Scenes",
+        description="Export all Blender scenes into a single glTF file",
+        default=False,
+    )
+
     image_format: EnumProperty(
         name="Image Format",
         description="Format for exported textures",
@@ -255,6 +263,7 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
             export_skinning=self.export_skinning,
             export_physics=self.export_physics,
             export_only_visible=self.export_only_visible,
+            export_all_scenes=self.export_all_scenes,
             image_format=self.image_format,
         )
 
@@ -275,6 +284,7 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
 
         layout.prop(self, "export_format")
         layout.prop(self, "export_only_visible")
+        layout.prop(self, "export_all_scenes")
 
         header, body = layout.panel("GLTF_export_mesh", default_closed=True)
         header.label(text="Mesh")

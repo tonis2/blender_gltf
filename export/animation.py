@@ -119,22 +119,28 @@ class AnimationExporter:
         self.animations: list[Animation] = []
         self.extensions_used: set[str] = set()
 
-    def gather(self, context: "bpy.types.Context") -> None:
-        """Gather all animations from the scene."""
-        scene = context.scene
-        fps = scene.render.fps / scene.render.fps_base
+    def gather(self, context: "bpy.types.Context", scenes: "list[bpy.types.Scene] | None" = None) -> None:
+        """Gather all animations from the scene(s)."""
+        if scenes is None:
+            scenes = [context.scene]
+        fps = context.scene.render.fps / context.scene.render.fps_base
 
         # --- Object TRS + weight animations ---
         # Group (object, action) pairs by action name
         action_objects: dict[str, list[tuple["bpy.types.Object", "bpy.types.Action"]]] = defaultdict(list)
+        seen: set[str] = set()
 
-        for obj in scene.objects:
-            if obj.animation_data is None or obj.animation_data.action is None:
-                continue
-            if obj.name not in self.object_to_node_index:
-                continue
-            action = obj.animation_data.action
-            action_objects[action.name].append((obj, action))
+        for scene in scenes:
+            for obj in scene.objects:
+                if obj.name in seen:
+                    continue
+                seen.add(obj.name)
+                if obj.animation_data is None or obj.animation_data.action is None:
+                    continue
+                if obj.name not in self.object_to_node_index:
+                    continue
+                action = obj.animation_data.action
+                action_objects[action.name].append((obj, action))
 
         for action_name, pairs in action_objects.items():
             anim = self._gather_action(action_name, pairs, fps)
@@ -143,11 +149,11 @@ class AnimationExporter:
 
         # --- Bone/pose animations ---
         if self.settings.export_skinning and self.bone_to_node_index:
-            self._gather_bone_animations(scene, fps)
+            self._gather_bone_animations(scenes, fps)
 
         # --- Shape key weight animations (on shape_keys.animation_data) ---
         if self.settings.export_morph_targets:
-            self._gather_shape_key_animations(scene, fps)
+            self._gather_shape_key_animations(scenes, fps)
 
         # --- Material animations (KHR_animation_pointer) ---
         if self.settings.export_materials:
@@ -359,19 +365,24 @@ class AnimationExporter:
     # --- Bone/pose animation ---
 
     def _gather_bone_animations(
-        self, scene: "bpy.types.Scene", fps: float,
+        self, scenes: "list[bpy.types.Scene]", fps: float,
     ) -> None:
         """Gather bone/pose animations from armature objects."""
-        for obj in scene.objects:
-            if obj.type != "ARMATURE":
-                continue
-            if obj.animation_data is None or obj.animation_data.action is None:
-                continue
+        seen: set[str] = set()
+        for scene in scenes:
+            for obj in scene.objects:
+                if obj.name in seen:
+                    continue
+                seen.add(obj.name)
+                if obj.type != "ARMATURE":
+                    continue
+                if obj.animation_data is None or obj.animation_data.action is None:
+                    continue
 
-            action = obj.animation_data.action
-            anim = self._gather_bone_action(obj, action, fps)
-            if anim is not None:
-                self.animations.append(anim)
+                action = obj.animation_data.action
+                anim = self._gather_bone_action(obj, action, fps)
+                if anim is not None:
+                    self.animations.append(anim)
 
     def _gather_bone_action(
         self,
@@ -545,28 +556,33 @@ class AnimationExporter:
     # --- Shape key weight animation ---
 
     def _gather_shape_key_animations(
-        self, scene: "bpy.types.Scene", fps: float,
+        self, scenes: "list[bpy.types.Scene]", fps: float,
     ) -> None:
         """Gather shape key weight animations from obj.data.shape_keys.animation_data."""
-        for obj in scene.objects:
-            if obj.type != "MESH" or obj.name not in self.object_to_node_index:
-                continue
-            if not obj.data or not obj.data.shape_keys:
-                continue
+        seen: set[str] = set()
+        for scene in scenes:
+            for obj in scene.objects:
+                if obj.name in seen:
+                    continue
+                seen.add(obj.name)
+                if obj.type != "MESH" or obj.name not in self.object_to_node_index:
+                    continue
+                if not obj.data or not obj.data.shape_keys:
+                    continue
 
-            shape_keys = obj.data.shape_keys
-            if shape_keys.animation_data is None or shape_keys.animation_data.action is None:
-                continue
-            if len(shape_keys.key_blocks) < 2:
-                continue
+                shape_keys = obj.data.shape_keys
+                if shape_keys.animation_data is None or shape_keys.animation_data.action is None:
+                    continue
+                if len(shape_keys.key_blocks) < 2:
+                    continue
 
-            node_index = self.object_to_node_index[obj.name]
-            action = shape_keys.animation_data.action
-            result = self._gather_weight_animation(
-                obj, node_index, shape_keys, action, fps,
-            )
-            if result is not None:
-                self.animations.append(result)
+                node_index = self.object_to_node_index[obj.name]
+                action = shape_keys.animation_data.action
+                result = self._gather_weight_animation(
+                    obj, node_index, shape_keys, action, fps,
+                )
+                if result is not None:
+                    self.animations.append(result)
 
     def _gather_weight_animation(
         self,

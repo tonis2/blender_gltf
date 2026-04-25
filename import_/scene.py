@@ -37,16 +37,44 @@ class SceneImporter:
         self._skin_armatures: dict[int, "bpy.types.Object"] = {}
 
     def import_scene(self, context: "bpy.types.Context") -> dict[int, "bpy.types.Object"]:
-        scene_index = self.gltf.scene if self.gltf.scene is not None else 0
-        if not self.gltf.scenes or scene_index >= len(self.gltf.scenes):
+        """Import all glTF scenes, creating Blender scenes as needed."""
+        import bpy
+
+        if not self.gltf.scenes:
             return self.node_to_blender
 
-        gltf_scene = self.gltf.scenes[scene_index]
-        collection = context.scene.collection
+        active_scene_index = self.gltf.scene if self.gltf.scene is not None else 0
+        original_scene = context.window.scene
 
-        if gltf_scene.nodes:
-            for node_index in gltf_scene.nodes:
-                self._import_node(context, node_index, collection, parent_obj=None)
+        for scene_idx, gltf_scene in enumerate(self.gltf.scenes):
+            if scene_idx == 0:
+                # Use the existing active scene for the first glTF scene
+                bl_scene = context.scene
+            else:
+                bl_scene = bpy.data.scenes.new(gltf_scene.name or f"Scene_{scene_idx}")
+
+            if gltf_scene.name:
+                bl_scene.name = gltf_scene.name
+
+            context.window.scene = bl_scene
+            collection = bl_scene.collection
+
+            if gltf_scene.nodes:
+                for node_index in gltf_scene.nodes:
+                    self._import_node(context, node_index, collection, parent_obj=None)
+
+        # Switch to the active scene as indicated by the glTF
+        if active_scene_index < len(self.gltf.scenes):
+            target_name = self.gltf.scenes[active_scene_index].name
+            if target_name:
+                for sc in bpy.data.scenes:
+                    if sc.name == target_name or sc.name.startswith(target_name):
+                        context.window.scene = sc
+                        break
+            else:
+                context.window.scene = original_scene
+        else:
+            context.window.scene = original_scene
 
         return self.node_to_blender
 
@@ -61,6 +89,14 @@ class SceneImporter:
 
         if self.gltf.nodes is None or node_index >= len(self.gltf.nodes):
             return
+
+        # If this node was already imported (shared across scenes), link into this collection
+        if node_index in self.node_to_blender:
+            existing_obj = self.node_to_blender[node_index]
+            if existing_obj.name not in collection.objects:
+                collection.objects.link(existing_obj)
+            return
+
         node = self.gltf.nodes[node_index]
         name = node.name or f"Node_{node_index}"
 

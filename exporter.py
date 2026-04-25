@@ -33,6 +33,7 @@ class ExportSettings:
     export_skinning: bool = True
     export_physics: bool = True
     export_only_visible: bool = False
+    export_all_scenes: bool = False
     image_format: str = "AUTO"  # "AUTO", "JPEG", or "PNG"
 
 
@@ -74,7 +75,12 @@ class GltfExporter:
                 self.material_exporter._cache,
                 bone_to_node_index=self.skin_exporter.bone_to_node_index if self.skin_exporter else None,
             )
-            animation_exporter.gather(self.context)
+            if self.settings.export_all_scenes:
+                import bpy
+                exported_scenes = list(bpy.data.scenes)
+            else:
+                exported_scenes = [self.context.scene]
+            animation_exporter.gather(self.context, scenes=exported_scenes)
             if animation_exporter.animations:
                 animations = animation_exporter.animations
 
