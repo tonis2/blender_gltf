@@ -99,6 +99,14 @@ class GltfExporter:
         if self.physics_exporter:
             root_extensions = self.physics_exporter.get_root_extensions()
 
+        # 5c. KHR_lights_punctual root extension
+        if self.scene_exporter.lights:
+            if root_extensions is None:
+                root_extensions = {}
+            root_extensions["KHR_lights_punctual"] = {
+                "lights": self.scene_exporter.lights,
+            }
+
         # 6. Assemble glTF
         gltf = Gltf(
             asset=Asset(generator="gltf-exporter", version="2.0"),
@@ -113,6 +121,7 @@ class GltfExporter:
             textures=self.texture_exporter.textures or None,
             images=self.texture_exporter.images or None,
             samplers=self.texture_exporter.samplers or None,
+            cameras=self.scene_exporter.cameras or None,
             animations=animations,
             skins=self.skin_exporter.skins if self.skin_exporter and self.skin_exporter.skins else None,
             extensions=root_extensions,

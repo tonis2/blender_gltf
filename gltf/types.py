@@ -295,6 +295,36 @@ class Animation(GltfBase):
 
 
 @dataclass
+class CameraPerspective(GltfBase):
+    yfov: float = 0.0
+    znear: float = 0.01
+    zfar: float | None = None
+    aspect_ratio: float | None = None
+    extensions: dict | None = None
+    extras: Any | None = None
+
+
+@dataclass
+class CameraOrthographic(GltfBase):
+    xmag: float = 0.0
+    ymag: float = 0.0
+    znear: float = 0.01
+    zfar: float = 1000.0
+    extensions: dict | None = None
+    extras: Any | None = None
+
+
+@dataclass
+class Camera(GltfBase):
+    type: str = "perspective"
+    perspective: CameraPerspective | None = None
+    orthographic: CameraOrthographic | None = None
+    name: str | None = None
+    extensions: dict | None = None
+    extras: Any | None = None
+
+
+@dataclass
 class Gltf(GltfBase):
     asset: Asset = field(default_factory=Asset)
     scene: int | None = None
@@ -308,7 +338,7 @@ class Gltf(GltfBase):
     textures: list[Texture] | None = None
     images: list[Image] | None = None
     samplers: list[Sampler] | None = None
-    cameras: list | None = None
+    cameras: list[Camera] | None = None
     animations: list[Animation] | None = None
     skins: list[Skin] | None = None
     extensions: dict | None = None
@@ -343,4 +373,7 @@ _NESTED_TYPES.update({
     (Animation, "samplers"): AnimationSampler,
     (AnimationChannel, "target"): AnimationChannelTarget,
     (Accessor, "sparse"): AccessorSparse,
+    (Gltf, "cameras"): Camera,
+    (Camera, "perspective"): CameraPerspective,
+    (Camera, "orthographic"): CameraOrthographic,
 })

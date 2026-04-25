@@ -102,11 +102,17 @@ class SceneImporter:
             return
 
         # Create Blender object
-        blender_mesh = None
+        obj_data = None
         if node.mesh is not None:
-            blender_mesh = self.mesh_importer.blender_meshes.get(node.mesh)
+            obj_data = self.mesh_importer.blender_meshes.get(node.mesh)
+        elif node.camera is not None and self.gltf.cameras:
+            obj_data = self._create_camera(node.camera)
+        elif (node.extensions and "KHR_lights_punctual" in node.extensions):
+            light_idx = node.extensions["KHR_lights_punctual"].get("light")
+            if light_idx is not None:
+                obj_data = self._create_light(light_idx)
 
-        obj = bpy.data.objects.new(name, blender_mesh)
+        obj = bpy.data.objects.new(name, obj_data)
         collection.objects.link(obj)
         self._apply_transform(obj, node)
 
@@ -161,6 +167,78 @@ class SceneImporter:
         if node.children:
             for child_index in node.children:
                 self._import_node(context, child_index, collection, parent_obj=obj)
+
+    def _create_camera(self, camera_index: int) -> "bpy.types.Camera | None":
+        """Create a Blender camera from a glTF camera index."""
+        import bpy
+
+        if camera_index >= len(self.gltf.cameras):
+            return None
+        gltf_cam = self.gltf.cameras[camera_index]
+        cam_name = gltf_cam.name if hasattr(gltf_cam, 'name') and gltf_cam.name else f"Camera_{camera_index}"
+
+        if hasattr(gltf_cam, 'type') and gltf_cam.type == "orthographic":
+            cam = bpy.data.cameras.new(cam_name)
+            cam.type = "ORTHO"
+            ortho = gltf_cam.orthographic if hasattr(gltf_cam, 'orthographic') else None
+            if ortho:
+                xmag = ortho.xmag if hasattr(ortho, 'xmag') else ortho.get("xmag", 1.0)
+                ymag = ortho.ymag if hasattr(ortho, 'ymag') else ortho.get("ymag", 1.0)
+                cam.ortho_scale = max(xmag, ymag) * 2.0
+                cam.clip_start = ortho.znear if hasattr(ortho, 'znear') else ortho.get("znear", 0.01)
+                cam.clip_end = ortho.zfar if hasattr(ortho, 'zfar') else ortho.get("zfar", 1000.0)
+        else:
+            cam = bpy.data.cameras.new(cam_name)
+            cam.type = "PERSP"
+            persp = gltf_cam.perspective if hasattr(gltf_cam, 'perspective') else None
+            if persp:
+                yfov = persp.yfov if hasattr(persp, 'yfov') else persp.get("yfov", 0.5)
+                cam.angle_y = yfov
+                cam.lens_unit = "FOV"
+                cam.clip_start = persp.znear if hasattr(persp, 'znear') else persp.get("znear", 0.01)
+                zfar = persp.zfar if hasattr(persp, 'zfar') else persp.get("zfar", None)
+                if zfar is not None:
+                    cam.clip_end = zfar
+        return cam
+
+    _GLTF_LIGHT_TYPE_MAP = {
+        "point": "POINT",
+        "directional": "SUN",
+        "spot": "SPOT",
+    }
+
+    def _create_light(self, light_index: int) -> "bpy.types.Light | None":
+        """Create a Blender light from a KHR_lights_punctual light index."""
+        import bpy
+
+        root_ext = self.gltf.extensions or {}
+        lights = root_ext.get("KHR_lights_punctual", {}).get("lights", [])
+        if light_index >= len(lights):
+            return None
+        gltf_light = lights[light_index]
+
+        gltf_type = gltf_light.get("type", "point")
+        bl_type = self._GLTF_LIGHT_TYPE_MAP.get(gltf_type, "POINT")
+        light_name = gltf_light.get("name", f"Light_{light_index}")
+
+        light = bpy.data.lights.new(light_name, bl_type)
+        light.energy = gltf_light.get("intensity", 1.0)
+
+        color = gltf_light.get("color", [1.0, 1.0, 1.0])
+        light.color = (color[0], color[1], color[2])
+
+        if "range" in gltf_light:
+            light.use_custom_distance = True
+            light.cutoff_distance = gltf_light["range"]
+
+        if gltf_type == "spot" and "spot" in gltf_light:
+            spot = gltf_light["spot"]
+            outer = spot.get("outerConeAngle", 0.7854)
+            inner = spot.get("innerConeAngle", 0.0)
+            light.spot_size = outer * 2.0
+            light.spot_blend = inner / outer if outer > 0 else 0.0
+
+        return light
 
     def _get_node_world_matrix(self, node: "Node", parent_obj: "bpy.types.Object | None"):
         """Compute the expected world matrix for a node from its TRS and parent."""

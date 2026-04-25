@@ -7,7 +7,7 @@ import numpy as np
 
 from ..gltf.buffer import BufferBuilder
 from ..gltf.constants import ComponentType, DataType
-from ..gltf.types import Scene, Node
+from ..gltf.types import Scene, Node, Camera, CameraPerspective, CameraOrthographic
 from .converter import (
     convert_location, convert_rotation, convert_scale,
     convert_location_array, convert_rotation_array, convert_scale_array,
@@ -24,6 +24,14 @@ if TYPE_CHECKING:
 
 EXT_NODE_VISIBILITY = "KHR_node_visibility"
 EXT_GPU_INSTANCING = "EXT_mesh_gpu_instancing"
+EXT_LIGHTS_PUNCTUAL = "KHR_lights_punctual"
+
+# Blender light type -> glTF light type
+_LIGHT_TYPE_MAP = {
+    "POINT": "point",
+    "SUN": "directional",
+    "SPOT": "spot",
+}
 
 
 class SceneExporter:
@@ -45,6 +53,10 @@ class SceneExporter:
         self.nodes: list[Node] = []
         self.object_to_node_index: dict[str, int] = {}
         self.extensions_used: set[str] = set()
+        self.cameras: list[Camera] = []
+        self._camera_cache: dict[str, int] = {}  # blender camera data name -> gltf index
+        self.lights: list[dict] = []
+        self._light_cache: dict[str, int] = {}  # blender light data name -> gltf index
 
     def gather(self, context: "bpy.types.Context") -> tuple[list[Scene], int]:
         """Traverse the active scene and return (scenes, active_scene_index)."""
@@ -103,6 +115,9 @@ class SceneExporter:
         # Gather mesh (if applicable)
         mesh_index = None
         skin_index = None
+        camera_index = None
+        light_ext = None
+
         if obj.type == "MESH":
             # Check for armature modifier (skinned mesh)
             joint_map = None
@@ -117,6 +132,10 @@ class SceneExporter:
             # Build material slot -> glTF material index mapping
             material_map = self._gather_materials_for_object(obj)
             mesh_index = self.mesh_exporter.gather(obj, material_map, joint_map)
+        elif obj.type == "CAMERA":
+            camera_index = self._gather_camera(obj)
+        elif obj.type == "LIGHT":
+            light_ext = self._gather_light(obj)
 
         # Gather children recursively (include hidden children too)
         children: list[int] = []
@@ -189,9 +208,16 @@ class SceneExporter:
             }
             self.extensions_used.add(EXT_NODE_VISIBILITY)
 
+        # KHR_lights_punctual node extension
+        if light_ext is not None:
+            if extensions is None:
+                extensions = {}
+            extensions[EXT_LIGHTS_PUNCTUAL] = light_ext
+
         node = Node(
             name=obj.name,
             mesh=mesh_index,
+            camera=camera_index,
             skin=skin_index,
             children=children if children else None,
             translation=translation if not is_identity_t else None,
@@ -230,6 +256,88 @@ class SceneExporter:
                 if gltf_idx is not None:
                     material_map[i] = gltf_idx
         return material_map
+
+    def _gather_camera(self, obj: "bpy.types.Object") -> int | None:
+        """Convert a Blender camera to a glTF Camera. Returns camera index."""
+        cam = obj.data
+        if cam is None:
+            return None
+
+        # Deduplicate by camera data name
+        if cam.name in self._camera_cache:
+            return self._camera_cache[cam.name]
+
+        if cam.type == "PERSP":
+            # Blender stores the vertical FOV in angle_y for VERTICAL sensor fit,
+            # and the horizontal FOV in angle_x for HORIZONTAL. glTF always wants yfov.
+            # cam.angle is the effective FOV along the sensor_fit axis.
+            # cam.angle_y is always the vertical FOV regardless of sensor_fit.
+            gltf_cam = Camera(
+                type="perspective",
+                name=cam.name,
+                perspective=CameraPerspective(
+                    yfov=cam.angle_y,
+                    znear=cam.clip_start,
+                    zfar=cam.clip_end,
+                ),
+            )
+        elif cam.type == "ORTHO":
+            gltf_cam = Camera(
+                type="orthographic",
+                name=cam.name,
+                orthographic=CameraOrthographic(
+                    xmag=cam.ortho_scale / 2.0,
+                    ymag=cam.ortho_scale / 2.0,
+                    znear=cam.clip_start,
+                    zfar=cam.clip_end,
+                ),
+            )
+        else:
+            return None
+
+        index = len(self.cameras)
+        self.cameras.append(gltf_cam)
+        self._camera_cache[cam.name] = index
+        return index
+
+    def _gather_light(self, obj: "bpy.types.Object") -> dict | None:
+        """Convert a Blender light to a KHR_lights_punctual entry.
+        Returns the node-level extension dict {"light": index}, or None."""
+        light = obj.data
+        if light is None:
+            return None
+
+        gltf_type = _LIGHT_TYPE_MAP.get(light.type)
+        if gltf_type is None:
+            return None
+
+        # Deduplicate by light data name
+        if light.name in self._light_cache:
+            return {"light": self._light_cache[light.name]}
+
+        gltf_light: dict = {
+            "name": light.name,
+            "type": gltf_type,
+            "color": [light.color.r, light.color.g, light.color.b],
+            "intensity": light.energy,
+        }
+
+        # Point and spot lights can have range
+        if gltf_type in ("point", "spot") and light.use_custom_distance:
+            gltf_light["range"] = light.cutoff_distance
+
+        # Spot lights have cone angles
+        if gltf_type == "spot":
+            gltf_light["spot"] = {
+                "innerConeAngle": light.spot_blend * light.spot_size / 2.0,
+                "outerConeAngle": light.spot_size / 2.0,
+            }
+
+        index = len(self.lights)
+        self.lights.append(gltf_light)
+        self._light_cache[light.name] = index
+        self.extensions_used.add(EXT_LIGHTS_PUNCTUAL)
+        return {"light": index}
 
     # --- EXT_mesh_gpu_instancing (depsgraph-based) ---
 
