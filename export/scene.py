@@ -16,6 +16,7 @@ from .mesh import MeshExporter
 from .material import MaterialExporter
 from .skin import SkinExporter
 from .physics import PhysicsExporter
+from .particles import ParticleExporter
 
 if TYPE_CHECKING:
     import bpy
@@ -43,6 +44,7 @@ class SceneExporter:
         settings: "ExportSettings",
         skin_exporter: SkinExporter | None = None,
         physics_exporter: PhysicsExporter | None = None,
+        particle_exporter: ParticleExporter | None = None,
     ) -> None:
         self.mesh_exporter = mesh_exporter
         self.material_exporter = material_exporter
@@ -50,6 +52,8 @@ class SceneExporter:
         self.settings = settings
         self.skin_exporter = skin_exporter
         self.physics_exporter = physics_exporter
+        self.particle_exporter = particle_exporter
+        self._fps: float = 24.0
         self.nodes: list[Node] = []
         self.object_to_node_index: dict[str, int] = {}
         self.extensions_used: set[str] = set()
@@ -67,6 +71,7 @@ class SceneExporter:
         else:
             blender_scenes = [context.scene]
 
+        self._fps = context.scene.render.fps
         active_scene_index = 0
         original_scene = context.window.scene
         gltf_scenes: list[Scene] = []
@@ -260,6 +265,14 @@ class SceneExporter:
                 if node.extensions is None:
                     node.extensions = {}
                 node.extensions.update(physics_ext)
+
+        # Particle systems
+        if self.particle_exporter:
+            particle_ext = self.particle_exporter.gather_node(obj, self._fps)
+            if particle_ext:
+                if node.extensions is None:
+                    node.extensions = {}
+                node.extensions.update(particle_ext)
 
         # Custom properties as extras
         if self.settings.export_extras:

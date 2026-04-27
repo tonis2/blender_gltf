@@ -14,6 +14,7 @@ from .export.mesh import MeshExporter
 from .export.scene import SceneExporter
 from .export.skin import SkinExporter
 from .export.physics import PhysicsExporter
+from .export.particles import ParticleExporter
 
 if TYPE_CHECKING:
     import bpy
@@ -33,6 +34,7 @@ class ExportSettings:
     export_skinning: bool = True
     export_physics: bool = True
     export_extras: bool = True
+    export_particles: bool = True
     export_only_visible: bool = False
     export_all_scenes: bool = False
     image_format: str = "AUTO"  # "AUTO", "JPEG", or "PNG"
@@ -48,10 +50,14 @@ class GltfExporter:
         self.mesh_exporter = MeshExporter(self.buffer, settings)
         self.skin_exporter = SkinExporter(self.buffer, settings) if settings.export_skinning else None
         self.physics_exporter = PhysicsExporter(settings) if settings.export_physics else None
+        self.particle_exporter = ParticleExporter(
+            settings, self.mesh_exporter, self.material_exporter,
+        ) if settings.export_particles else None
         self.scene_exporter = SceneExporter(
             self.mesh_exporter, self.material_exporter, self.buffer, settings,
             skin_exporter=self.skin_exporter,
             physics_exporter=self.physics_exporter,
+            particle_exporter=self.particle_exporter,
         )
 
     def export(self) -> None:
@@ -101,6 +107,8 @@ class GltfExporter:
             all_extensions |= animation_exporter.extensions_used
         if self.physics_exporter:
             all_extensions |= self.physics_exporter.extensions_used
+        if self.particle_exporter:
+            all_extensions |= self.particle_exporter.extensions_used
         extensions_used = sorted(all_extensions) or None
 
         # 5b. Collect root-level extensions

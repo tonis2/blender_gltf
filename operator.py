@@ -127,6 +127,7 @@ _EXPORT_PROPS = (
     "export_skinning",
     "export_physics",
     "export_extras",
+    "export_particles",
     "export_only_visible",
     "export_all_scenes",
     "image_format",
@@ -155,6 +156,7 @@ class GltfExportSceneSettings(bpy.types.PropertyGroup):
     export_skinning: BoolProperty(name="Skinning", default=True)
     export_physics: BoolProperty(name="Physics", default=True)
     export_extras: BoolProperty(name="Custom Properties", default=True)
+    export_particles: BoolProperty(name="Particles", default=True)
     export_only_visible: BoolProperty(name="Only Visible", default=False)
     export_all_scenes: BoolProperty(name="All Scenes", default=False)
     image_format: EnumProperty(
@@ -251,6 +253,12 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         default=True,
     )
 
+    export_particles: BoolProperty(
+        name="Particles",
+        description="Export particle system settings as CUSTOM_particle_emitter",
+        default=True,
+    )
+
     export_only_visible: BoolProperty(
         name="Only Visible",
         description="Only export objects that are visible in the viewport",
@@ -300,6 +308,7 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
             export_skinning=self.export_skinning,
             export_physics=self.export_physics,
             export_extras=self.export_extras,
+            export_particles=self.export_particles,
             export_only_visible=self.export_only_visible,
             export_all_scenes=self.export_all_scenes,
             image_format=self.image_format,
@@ -357,6 +366,11 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         header.label(text="Physics")
         if body:
             body.prop(self, "export_physics")
+
+        header, body = layout.panel("GLTF_export_particles", default_closed=True)
+        header.label(text="Particles")
+        if body:
+            body.prop(self, "export_particles")
 
         header, body = layout.panel("GLTF_export_extras", default_closed=True)
         header.label(text="Extras")
@@ -442,6 +456,12 @@ class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
         default=True,
     )
 
+    import_particles: BoolProperty(
+        name="Particles",
+        description="Import particle system settings",
+        default=True,
+    )
+
     def execute(self, context):
         settings = ImportSettings(
             filepath=self.filepath,
@@ -453,6 +473,7 @@ class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
             import_morph_targets=self.import_morph_targets,
             import_skinning=self.import_skinning,
             import_physics=self.import_physics,
+            import_particles=self.import_particles,
         )
 
         try:
@@ -497,6 +518,11 @@ class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
         header.label(text="Physics")
         if body:
             body.prop(self, "import_physics")
+
+        header, body = layout.panel("GLTF_import_particles", default_closed=True)
+        header.label(text="Particles")
+        if body:
+            body.prop(self, "import_particles")
 
 
 def menu_func_export(self, context):

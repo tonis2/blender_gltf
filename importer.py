@@ -14,6 +14,7 @@ from .import_.skin import SkinImporter
 from .import_.scene import SceneImporter
 from .import_.animation import AnimationImporter
 from .import_.physics import PhysicsImporter
+from .import_.particles import ParticleImporter
 
 if TYPE_CHECKING:
     import bpy
@@ -30,6 +31,7 @@ class ImportSettings:
     import_morph_targets: bool = True
     import_skinning: bool = True
     import_physics: bool = True
+    import_particles: bool = True
 
 
 class GltfImporter:
@@ -78,11 +80,19 @@ class GltfImporter:
             if not physics_importer.has_physics():
                 physics_importer = None
 
+        # 7c. Prepare particle importer
+        particle_importer = None
+        if self.settings.import_particles:
+            particle_importer = ParticleImporter(gltf, self.settings)
+            if not particle_importer.has_particles():
+                particle_importer = None
+
         # 8. Import scene hierarchy (creates armatures for skinned meshes)
         scene_importer = SceneImporter(
             gltf, buffer_reader, mesh_importer, self.settings,
             skin_importer=skin_importer,
             physics_importer=physics_importer,
+            particle_importer=particle_importer,
         )
         node_to_blender = scene_importer.import_scene(self.context)
 
