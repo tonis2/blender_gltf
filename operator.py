@@ -130,6 +130,7 @@ _EXPORT_PROPS = (
     "export_particles",
     "export_only_visible",
     "export_all_scenes",
+    "export_camera_y_up",
     "image_format",
 )
 
@@ -159,6 +160,7 @@ class GltfExportSceneSettings(bpy.types.PropertyGroup):
     export_particles: BoolProperty(name="Particles", default=True)
     export_only_visible: BoolProperty(name="Only Visible", default=False)
     export_all_scenes: BoolProperty(name="All Scenes", default=False)
+    export_camera_y_up: BoolProperty(name="Cameras Y-Up", default=True)
     image_format: EnumProperty(
         name="Image Format",
         items=[
@@ -271,6 +273,16 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         default=False,
     )
 
+    export_camera_y_up: BoolProperty(
+        name="Cameras Y-Up",
+        description=(
+            "Apply a -90° X-axis fix-up to camera nodes so their forward "
+            "direction matches the glTF Y-up convention. Disable for tools "
+            "that expect Blender's raw camera orientation"
+        ),
+        default=True,
+    )
+
     image_format: EnumProperty(
         name="Image Format",
         description="Format for exported textures",
@@ -311,6 +323,7 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
             export_particles=self.export_particles,
             export_only_visible=self.export_only_visible,
             export_all_scenes=self.export_all_scenes,
+            export_camera_y_up=self.export_camera_y_up,
             image_format=self.image_format,
         )
 
@@ -361,6 +374,11 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         header.label(text="Instancing")
         if body:
             body.prop(self, "export_gpu_instancing")
+
+        header, body = layout.panel("GLTF_export_cameras", default_closed=True)
+        header.label(text="Cameras")
+        if body:
+            body.prop(self, "export_camera_y_up")
 
         header, body = layout.panel("GLTF_export_physics", default_closed=True)
         header.label(text="Physics")

@@ -14,7 +14,12 @@ from ..gltf.types import (
     AnimationChannelTarget,
     AnimationSampler,
 )
-from .converter import convert_location_array, convert_rotation_array, convert_scale_array
+from .converter import (
+    convert_location_array,
+    convert_rotation_array,
+    convert_rotation_camera_array,
+    convert_scale_array,
+)
 
 if TYPE_CHECKING:
     import bpy
@@ -264,15 +269,26 @@ class AnimationExporter:
             values = quats
 
         # Apply coordinate conversion
+        is_camera_rot = (
+            gltf_path == "rotation"
+            and obj.type == "CAMERA"
+            and self.settings.export_camera_y_up
+        )
         if gltf_interp == "CUBICSPLINE":
             # For cubicspline, values are interleaved: [in_tangent, value, out_tangent] x N
             # Reshape to (N*3, components), convert, reshape back
             n_keyframes = len(sorted_frames)
             flat = values.reshape(n_keyframes * 3, -1)
-            flat = self._convert_values(flat, gltf_path)
+            if is_camera_rot:
+                flat = convert_rotation_camera_array(flat)
+            else:
+                flat = self._convert_values(flat, gltf_path)
             values = flat.reshape(n_keyframes * 3, -1)
         else:
-            values = self._convert_values(values, gltf_path)
+            if is_camera_rot:
+                values = convert_rotation_camera_array(values)
+            else:
+                values = self._convert_values(values, gltf_path)
 
         # Write accessors
         input_acc = self.buffer.add_accessor(

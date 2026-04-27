@@ -37,6 +37,7 @@ class ExportSettings:
     export_particles: bool = True
     export_only_visible: bool = False
     export_all_scenes: bool = False
+    export_camera_y_up: bool = True
     image_format: str = "AUTO"  # "AUTO", "JPEG", or "PNG"
 
 

@@ -9,7 +9,7 @@ from ..gltf.buffer import BufferBuilder
 from ..gltf.constants import ComponentType, DataType
 from ..gltf.types import Scene, Node, Camera, CameraPerspective, CameraOrthographic
 from .converter import (
-    convert_location, convert_rotation, convert_scale,
+    convert_location, convert_rotation, convert_scale, convert_rotation_camera,
     convert_location_array, convert_rotation_array, convert_scale_array,
 )
 from .mesh import MeshExporter
@@ -223,7 +223,10 @@ class SceneExporter:
         loc, rot, scale = obj.matrix_local.decompose()
 
         translation = convert_location(loc)
-        rotation = convert_rotation(rot)
+        if obj.type == "CAMERA" and self.settings.export_camera_y_up:
+            rotation = convert_rotation_camera(rot)
+        else:
+            rotation = convert_rotation(rot)
         gltf_scale = convert_scale(scale)
 
         # Omit identity transforms

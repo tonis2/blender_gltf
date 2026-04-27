@@ -53,6 +53,42 @@ def convert_rotation_array(quats: np.ndarray) -> np.ndarray:
     return np.column_stack([quats[:, 1], quats[:, 3], -quats[:, 2], quats[:, 0]])
 
 
+# √2 / 2 — half-angle component of the Rx(-90°) fix-up quaternion used to align
+# Blender camera/light forward (-Z local) with glTF forward after the world
+# Z-up -> Y-up axis swap.
+_AXIS_FIXUP_S = 0.7071067811865476
+
+
+def convert_rotation_camera(quat: tuple[float, float, float, float]) -> list[float]:
+    """Like convert_rotation, but post-multiplies by Rx(-90°) so the camera's
+    glTF local -Z forward direction matches the Blender camera's forward."""
+    w, x, y, z = quat
+    rx, ry, rz, rw = x, z, -y, w  # standard conversion in (x,y,z,w)
+    s = _AXIS_FIXUP_S
+    return [
+        s * (rx - rw),
+        s * (ry - rz),
+        s * (ry + rz),
+        s * (rw + rx),
+    ]
+
+
+def convert_rotation_camera_array(quats: np.ndarray) -> np.ndarray:
+    """Vectorised convert_rotation_camera over (N, 4) Blender [w,x,y,z] input."""
+    converted = convert_rotation_array(quats)  # (N, 4) glTF [x,y,z,w]
+    rx = converted[:, 0]
+    ry = converted[:, 1]
+    rz = converted[:, 2]
+    rw = converted[:, 3]
+    s = _AXIS_FIXUP_S
+    return np.column_stack([
+        s * (rx - rw),
+        s * (ry - rz),
+        s * (ry + rz),
+        s * (rw + rx),
+    ]).astype(quats.dtype, copy=False)
+
+
 def convert_scale_array(scales: np.ndarray) -> np.ndarray:
     """Convert (N, 3) scale array: [x,y,z] -> [x,z,y]."""
     result = scales.copy()
