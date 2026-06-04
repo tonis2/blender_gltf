@@ -13,7 +13,7 @@ _needs_reload = "operator" in locals()
 from . import operator
 from . import exporter
 from . import importer
-from . import material_layer_nodes
+from . import layer_node
 from . import interactivity_nodes
 from .gltf import constants, types, buffer, serialize
 from .export import converter, mesh, material, texture, scene, animation, skin, physics, particles, interactivity
@@ -35,7 +35,7 @@ if _needs_reload:
     import importlib
     exporter = importlib.reload(exporter)
     operator = importlib.reload(operator)
-    material_layer_nodes = importlib.reload(material_layer_nodes)
+    layer_node = importlib.reload(layer_node)
     interactivity_nodes = importlib.reload(interactivity_nodes)
     constants = importlib.reload(constants)
     types = importlib.reload(types)
@@ -67,11 +67,11 @@ if _needs_reload:
 
 def register():
     operator.register()
-    material_layer_nodes.register()
+    layer_node.register()
     interactivity_nodes.register()
 
 
 def unregister():
     interactivity_nodes.unregister()
-    material_layer_nodes.unregister()
+    layer_node.unregister()
     operator.unregister()

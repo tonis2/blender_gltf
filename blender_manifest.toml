@@ -13,4 +13,5 @@ blender_version_min = "4.2.0"
 
 license = [
   "SPDX:Apache-2.0",
+  "SPDX:GPL-3.0-or-later",
 ]

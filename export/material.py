@@ -12,11 +12,22 @@ if TYPE_CHECKING:
 
 EXT_MATERIALS_UNLIT = "KHR_materials_unlit"
 EXT_MATERIALS_LAYERS = "CUSTOM_materials_layers"
-LAYER_NODE_GROUP_NAME = "glTF Material Layer"
-UCUPAINT_GROUP_PREFIX = "Ucupaint "
-UCUPAINT_LAYER_PREFIX = ".yP Layer "
-_VALID_BLEND_MODES = {"MIX", "ADD", "MULTIPLY"}
+BSDF_STACK_NODE_IDNAME = "BSDFStackNodeType"
+# All Blender ShaderNodeMix blend types the BSDFStackNode exposes per layer.
+_VALID_BLEND_MODES = {
+    "MIX", "MULTIPLY", "ADD", "SUBTRACT", "SCREEN", "OVERLAY",
+    "SOFT_LIGHT", "DIFFERENCE", "DARKEN", "LIGHTEN",
+}
 _VALID_MASK_CHANNELS = {"R", "G", "B", "A"}
+
+# BSDFStackNode per-layer input layout: N_CH sockets per layer, ordered as below.
+# Keep in sync with layer_node/bsdf_node.py CHANNELS.
+_N_CH = 10
+_CH = {
+    "Color": 0, "Mask": 1, "Normal": 2, "Roughness": 3, "Metallic": 4,
+    "Alpha": 5, "Emission Color": 6, "Emission Strength": 7,
+    "Subsurface Weight": 8, "Subsurface Radius": 9,
+}
 
 
 class MaterialExporter:
@@ -49,19 +60,42 @@ class MaterialExporter:
         alpha_mode = None
         alpha_cutoff = None
         double_sided = None
+        layers = None
+        base_extra = None
 
-        principled = self._find_principled_bsdf(blender_material)
-
-        if principled is not None:
-            pbr = self._gather_pbr(principled)
-            normal_texture = self._gather_normal(principled)
-            emissive_texture, emissive_factor = self._gather_emission(principled)
-            alpha_mode, alpha_cutoff = self._gather_alpha(blender_material, principled)
+        stack_node = self._find_bsdf_stack_node(blender_material)
+        if stack_node is not None:
+            # BSDFStackNode drives Material Output.Surface. Its Principled BSDF
+            # is internal to the node group, so _find_principled_bsdf won't see
+            # it. Layer 0 becomes the base material; layers 1..N become the
+            # CUSTOM_materials_layers extension.
+            (
+                pbr, normal_texture, emissive_texture, emissive_factor,
+                alpha_mode, alpha_cutoff, layers, base_extra,
+            ) = self._extract_from_bsdf_stack(blender_material, stack_node)
         else:
-            # No Principled BSDF: try to recover base color + alpha from a
-            # custom shader group plugged directly into Material Output.Surface
-            # (e.g. tree-leaf shaders).
-            pbr, alpha_mode, alpha_cutoff = self._gather_from_surface_group(blender_material)
+            principled = self._find_principled_bsdf(blender_material)
+
+            if principled is not None:
+                pbr = self._gather_pbr(principled)
+                normal_texture = self._gather_normal(principled)
+                emissive_texture, emissive_factor = self._gather_emission(principled)
+                alpha_mode, alpha_cutoff = self._gather_alpha(blender_material, principled)
+
+                # A Bump node feeding Normal may carry a Height (displacement)
+                # map that core glTF can't hold -> extension.base.
+                h, b = self._bump_info_from_socket(principled.inputs.get("Normal"))
+                if h is not None or b is not None:
+                    base_extra = {}
+                    if h is not None:
+                        base_extra["heightTexture"] = h
+                    if b is not None:
+                        base_extra["bump"] = b
+            else:
+                # No Principled BSDF: try to recover base color + alpha from a
+                # custom shader group plugged directly into Material Output.Surface
+                # (e.g. tree-leaf shaders).
+                pbr, alpha_mode, alpha_cutoff = self._gather_from_surface_group(blender_material)
 
         if blender_material.use_backface_culling is False:
             double_sided = True
@@ -74,11 +108,15 @@ class MaterialExporter:
             self.extensions_used.add(EXT_MATERIALS_UNLIT)
 
         # CUSTOM_materials_layers
-        layers = self._gather_layers(blender_material)
-        if layers:
+        if layers or base_extra:
             if extensions is None:
                 extensions = {}
-            extensions[EXT_MATERIALS_LAYERS] = {"layers": layers}
+            ext_dict: dict = {}
+            if layers:
+                ext_dict["layers"] = layers
+            if base_extra:
+                ext_dict["base"] = base_extra
+            extensions[EXT_MATERIALS_LAYERS] = ext_dict
             self.extensions_used.add(EXT_MATERIALS_LAYERS)
 
         return Material(
@@ -156,6 +194,16 @@ class MaterialExporter:
                 upstream.inputs.get("Color"),
                 _group_stack, _visited, _depth + 1,
             )
+        if t == "BUMP":
+            # A Bump node combines a Height (bump/displacement) map with an
+            # optional tangent-space Normal map. The tangent-space normal lives
+            # on the `Normal` input; the Height map is captured separately as
+            # heightTexture (see _layer_bump_info). For normalTexture purposes,
+            # follow the Normal input.
+            return self._walk_to_image(
+                upstream.inputs.get("Normal"),
+                _group_stack, _visited, _depth + 1,
+            )
         if t == "GROUP":
             tree = getattr(upstream, "node_tree", None)
             if tree is None:
@@ -208,9 +256,8 @@ class MaterialExporter:
     def _gather_pbr(
         self, principled: "bpy.types.ShaderNodeBsdfPrincipled"
     ) -> MaterialPBRMetallicRoughness:
-        # Base color — if Principled.Base Color is fed by a layer chain,
-        # the base material's color comes from the deepest layer's "Below Color".
-        base_color_socket = self._resolve_base_color_socket(principled)
+        # Base color
+        base_color_socket = principled.inputs.get("Base Color")
         base_color_factor, base_color_texture = self._read_color_socket(base_color_socket)
 
         # Metallic
@@ -382,247 +429,278 @@ class MaterialExporter:
         )
         return pbr, alpha_mode, alpha_cutoff
 
-    def _gather_layers(
-        self, blender_material: "bpy.types.Material",
-    ) -> list[dict] | None:
-        """Walk the layer chain from the Principled BSDF's Base Color back."""
-        principled = self._find_principled_bsdf(blender_material)
-        if principled is None:
-            return None
-        chain = self._collect_layer_chain(principled)
-        if chain:
-            layers: list[dict] = []
-            for node in chain:
-                layer = self._gather_one_layer(node)
-                if layer is not None:
-                    layers.append(layer)
-            return layers or None
+    # ------------------------------------------------------------------
+    # CUSTOM_materials_layers — BSDFStackNode authoring path
+    # ------------------------------------------------------------------
 
-        # Ucupaint integration: when Principled.Base Color is fed by a Ucupaint
-        # group with >=2 painted layers, export each `.yP Layer …` sub-group as
-        # a glTF material layer. Single-layer Ucupaint already round-trips via
-        # the regular pbrMetallicRoughness path through the walker.
-        bc_socket = principled.inputs.get("Base Color")
-        if bc_socket is None or not bc_socket.is_linked:
+    def _find_bsdf_stack_node(self, blender_material):
+        """Return the BSDFStackNode feeding Material Output.Surface, if any."""
+        if not blender_material.use_nodes or blender_material.node_tree is None:
             return None
-        upstream = bc_socket.links[0].from_node
-        if not self._is_ucupaint_group(upstream):
-            return None
-        layer_nodes = self._collect_ucupaint_layers(upstream)
-        if len(layer_nodes) < 2:
-            return None
-        layers = []
-        for ln in layer_nodes:
-            layer = self._gather_one_ucupaint_layer(ln)
-            if layer is not None:
-                layers.append(layer)
-        # Only emit the extension when at least 2 non-empty layers survive —
-        # a single layer would round-trip as plain pbrMetallicRoughness.
-        if len(layers) < 2:
-            return None
-        return layers
-
-    def _is_ucupaint_group(self, node) -> bool:
-        return (
-            getattr(node, "type", None) == "GROUP"
-            and getattr(node, "node_tree", None) is not None
-            and node.node_tree.name.startswith(UCUPAINT_GROUP_PREFIX)
+        out = next(
+            (n for n in blender_material.node_tree.nodes
+             if n.type == "OUTPUT_MATERIAL"),
+            None,
         )
-
-    def _is_ucupaint_layer_group(self, node) -> bool:
-        return (
-            getattr(node, "type", None) == "GROUP"
-            and getattr(node, "node_tree", None) is not None
-            and node.node_tree.name.startswith(UCUPAINT_LAYER_PREFIX)
-        )
-
-    def _collect_ucupaint_layers(self, ucu_group_node) -> list:
-        """Return `.yP Layer …` sub-group nodes inside the Ucupaint group, in
-        base→top order. Walks back from GROUP_OUTPUT.Color through the layer
-        chain (passing through MIX/Reroute clamps); falls back to node-list
-        order if the chain can't be resolved.
-        """
-        tree = ucu_group_node.node_tree
-        if tree is None:
-            return []
-
-        gout = next((n for n in tree.nodes if n.type == "GROUP_OUTPUT"), None)
-        layers: list = []
-        seen_layer_ids: set[int] = set()
-        if gout is not None:
-            sock = gout.inputs.get("Color")
-            depth = 0
-            while sock is not None and sock.is_linked and depth < 64:
-                depth += 1
-                up = sock.links[0].from_node
-                if self._is_ucupaint_layer_group(up):
-                    if id(up) in seen_layer_ids:
-                        break
-                    seen_layer_ids.add(id(up))
-                    layers.append(up)
-                    # Find this layer's "below"/background input to continue
-                    # walking down the stack.
-                    below = None
-                    for cand in (
-                        "Background", "Below Color", "Color Below",
-                        "Below", "Bottom",
-                    ):
-                        s = up.inputs.get(cand)
-                        if s is not None and s.is_linked:
-                            below = s
-                            break
-                    if below is None:
-                        for inp in up.inputs:
-                            if inp.is_linked and getattr(inp, "type", None) == "RGBA":
-                                below = inp
-                                break
-                    sock = below
-                    continue
-                if up.type in ("MIX", "MIX_RGB", "REROUTE"):
-                    next_sock = None
-                    for inp in up.inputs:
-                        n = inp.name.lower()
-                        if n in ("fac", "factor"):
-                            continue
-                        if hasattr(inp, "type") and inp.type not in ("RGBA", "VECTOR"):
-                            continue
-                        if inp.is_linked:
-                            next_sock = inp
-                            break
-                    sock = next_sock
-                    continue
-                break
-
-        if layers:
-            layers.reverse()  # base → top
-            return layers
-        # Fallback: enumerate all `.yP Layer …` groups (order undefined).
-        return [n for n in tree.nodes if self._is_ucupaint_layer_group(n)]
-
-    def _find_labeled_tex_image(self, tree, label_prefix):
-        if tree is None:
+        if out is None:
             return None
-        for n in tree.nodes:
-            if n.type == "TEX_IMAGE" and n.label.startswith(label_prefix):
-                return n
+        surface = out.inputs.get("Surface")
+        if surface is None or not surface.is_linked:
+            return None
+        node = surface.links[0].from_node
+        if getattr(node, "bl_idname", "") == BSDF_STACK_NODE_IDNAME:
+            return node
         return None
 
-    @staticmethod
-    def _tex_info_to_dict(ti) -> dict:
-        d = {"index": ti.index}
-        if getattr(ti, "tex_coord", None) is not None:
-            d["texCoord"] = ti.tex_coord
-        if getattr(ti, "extensions", None):
-            d["extensions"] = ti.extensions
-        return d
+    def _layer_socket(self, node, layer_index, channel_name):
+        """Look up a BSDFStackNode input socket by (layer, channel name)."""
+        idx = layer_index * _N_CH + _CH[channel_name]
+        if 0 <= idx < len(node.inputs):
+            return node.inputs[idx]
+        return None
 
-    def _gather_one_ucupaint_layer(self, layer_node) -> dict | None:
-        """Build a glTF material-layer dict from a `.yP Layer …` sub-group."""
-        tree = getattr(layer_node, "node_tree", None)
-        if tree is None:
+    def _layer_image_tex(self, node, layer_index, channel_name):
+        """TextureInfo for the image feeding a layer's channel socket, or None."""
+        socket = self._layer_socket(node, layer_index, channel_name)
+        img = self._walk_to_image(socket) if socket is not None else None
+        if img is None:
+            return None
+        return self.texture_exporter.gather_texture_info(img)
+
+    def _layer_float(self, node, layer_index, channel_name):
+        socket = self._layer_socket(node, layer_index, channel_name)
+        if socket is None:
+            return None
+        try:
+            return float(socket.default_value)
+        except (TypeError, ValueError):
             return None
 
-        layer: dict = {}
-        if layer_node.label:
-            layer["name"] = layer_node.label
-        else:
-            name = tree.name
-            if name.startswith(UCUPAINT_LAYER_PREFIX):
-                name = name[len(UCUPAINT_LAYER_PREFIX):]
-            layer["name"] = name
+    def _layer_color_rgb(self, node, layer_index, channel_name):
+        socket = self._layer_socket(node, layer_index, channel_name)
+        if socket is None:
+            return None
+        v = socket.default_value
+        return [float(v[0]), float(v[1]), float(v[2])]
 
+    def _layer_pbr_dict(self, node, i):
+        """Build a pbrMetallicRoughness dict for layer i (factors + textures)."""
         pbr: dict = {}
-
-        src = self._find_labeled_tex_image(tree, "Source")
-        if src is not None:
-            ti = self.texture_exporter.gather_texture_info(src)
-            if ti is not None:
-                pbr["baseColorTexture"] = self._tex_info_to_dict(ti)
-
-        mr_node = (
-            self._find_labeled_tex_image(tree, "Metallic Override")
-            or self._find_labeled_tex_image(tree, "Roughness Override")
+        rgb = self._layer_color_rgb(node, i, "Color")
+        alpha = self._layer_float(node, i, "Alpha")
+        a = alpha if alpha is not None else 1.0
+        if rgb is not None and (rgb != [1.0, 1.0, 1.0] or a != 1.0):
+            pbr["baseColorFactor"] = [rgb[0], rgb[1], rgb[2], a]
+        bc_tex = self._layer_image_tex(node, i, "Color")
+        if bc_tex is not None:
+            pbr["baseColorTexture"] = bc_tex
+        m = self._layer_float(node, i, "Metallic")
+        if m is not None and m != 1.0:
+            pbr["metallicFactor"] = m
+        r = self._layer_float(node, i, "Roughness")
+        if r is not None and r != 1.0:
+            pbr["roughnessFactor"] = r
+        mr_tex = (
+            self._layer_image_tex(node, i, "Metallic")
+            or self._layer_image_tex(node, i, "Roughness")
         )
-        if mr_node is not None:
-            ti = self.texture_exporter.gather_texture_info(mr_node)
-            if ti is not None:
-                pbr["metallicRoughnessTexture"] = self._tex_info_to_dict(ti)
+        if mr_tex is not None:
+            pbr["metallicRoughnessTexture"] = mr_tex
+        return pbr or None
 
+    def _layer_normal_info(self, node, i):
+        """NormalTextureInfo for layer i's Normal channel, or None."""
+        socket = self._layer_socket(node, i, "Normal")
+        if socket is None or not socket.is_linked:
+            return None
+        img = self._walk_to_image(socket)
+        if img is None:
+            return None
+        ti = self.texture_exporter.gather_texture_info(img)
+        if ti is None:
+            return None
+        scale = self._normal_map_scale(socket)
+        return NormalTextureInfo(
+            index=ti.index, tex_coord=ti.tex_coord,
+            scale=scale, extensions=ti.extensions,
+        )
+
+    def _normal_map_scale(self, socket):
+        """Return the Normal Map node's Strength (!= 1.0) feeding `socket`, or
+        None. Looks through a Bump node (Normal input) if present.
+        """
+        if socket is None or not socket.is_linked:
+            return None
+        src = socket.links[0].from_node
+        if src.type == "BUMP":
+            inner = src.inputs.get("Normal")
+            if inner is not None and inner.is_linked:
+                src = inner.links[0].from_node
+            else:
+                return None
+        if src.type == "NORMAL_MAP":
+            strength = src.inputs.get("Strength")
+            if strength is not None and strength.default_value != 1.0:
+                return float(strength.default_value)
+        return None
+
+    def _layer_bump_info(self, node, i):
+        """If layer i's Normal socket is driven by a Bump node carrying a Height
+        (depth/displacement) map, return (height_texture_info, bump_dict);
+        otherwise (None, None). `bump_dict` = {strength, distance}.
+        """
+        return self._bump_info_from_socket(self._layer_socket(node, i, "Normal"))
+
+    def _bump_info_from_socket(self, socket):
+        """If `socket` is driven by a Bump node carrying a Height (depth/
+        displacement) map, return (height_texture_info, bump_dict); otherwise
+        (None, None). `bump_dict` = {strength, distance}.
+        """
+        if socket is None or not socket.is_linked:
+            return None, None
+        src = socket.links[0].from_node
+        if src.type != "BUMP":
+            return None, None
+        height_socket = src.inputs.get("Height")
+        himg = self._walk_to_image(height_socket) if height_socket is not None else None
+        if himg is None:
+            # A Bump node with no Height map carries no depth data to preserve.
+            return None, None
+        height_ti = self.texture_exporter.gather_texture_info(himg)
+        if height_ti is None:
+            return None, None
+        bump = {}
+        strength = src.inputs.get("Strength")
+        if strength is not None:
+            bump["strength"] = float(strength.default_value)
+        distance = src.inputs.get("Distance")
+        if distance is not None:
+            bump["distance"] = float(distance.default_value)
+        return height_ti, (bump or None)
+
+    def _layer_emission(self, node, i):
+        """Return (emissive_factor list|None, TextureInfo|None) for layer i."""
+        rgb = self._layer_color_rgb(node, i, "Emission Color")
+        strength = self._layer_float(node, i, "Emission Strength")
+        if rgb is None:
+            return None, None
+        s = strength if strength is not None else 1.0
+        factor = [rgb[0] * s, rgb[1] * s, rgb[2] * s]
+        tex = self._layer_image_tex(node, i, "Emission Color")
+        if factor == [0.0, 0.0, 0.0] and tex is None:
+            return None, None
+        return factor, tex
+
+    def _layer_subsurface(self, node, i):
+        """Return {weight, radius} dict for layer i, or None when inactive."""
+        weight = self._layer_float(node, i, "Subsurface Weight")
+        if weight is None or weight == 0.0:
+            return None
+        out = {"weight": weight}
+        radius = self._layer_color_rgb(node, i, "Subsurface Radius")
+        if radius is not None:
+            out["radius"] = radius
+        return out
+
+    def _extract_from_bsdf_stack(self, blender_material, node):
+        """Map a BSDFStackNode to (pbr, normal, emis_tex, emis_factor,
+        alpha_mode, alpha_cutoff, layers, base_extra). Layer 0 -> base material;
+        layers 1..N -> the CUSTOM_materials_layers `layers` array. `base_extra`
+        carries layer-0 data with no core glTF slot (heightTexture/bump) and
+        becomes extension.base.
+        """
+        n_layers = len(node.layers)
+
+        # ---- Layer 0 -> base material ----
+        rgb = self._layer_color_rgb(node, 0, "Color") or [1.0, 1.0, 1.0]
+        alpha = self._layer_float(node, 0, "Alpha")
+        a = alpha if alpha is not None else 1.0
+        base_factor = [rgb[0], rgb[1], rgb[2], a]
+        metallic = self._layer_float(node, 0, "Metallic")
+        roughness = self._layer_float(node, 0, "Roughness")
+        pbr = MaterialPBRMetallicRoughness(
+            base_color_factor=(
+                base_factor if base_factor != [1.0, 1.0, 1.0, 1.0] else None
+            ),
+            base_color_texture=self._layer_image_tex(node, 0, "Color"),
+            metallic_factor=metallic,
+            roughness_factor=roughness,
+            metallic_roughness_texture=(
+                self._layer_image_tex(node, 0, "Metallic")
+                or self._layer_image_tex(node, 0, "Roughness")
+            ),
+        )
+        normal_texture = self._layer_normal_info(node, 0)
+        emissive_factor, emissive_texture = self._layer_emission(node, 0)
+        alpha_mode, alpha_cutoff = self._gather_alpha(blender_material, node)
+
+        # Base height/bump has no core glTF slot -> extension.base.
+        base_extra: dict = {}
+        base_height, base_bump = self._layer_bump_info(node, 0)
+        if base_height is not None:
+            base_extra["heightTexture"] = base_height
+        if base_bump is not None:
+            base_extra["bump"] = base_bump
+
+        # ---- Layers 1..N -> extension ----
+        layers: list[dict] = []
+        for i in range(1, n_layers):
+            layer = self._gather_bsdf_layer(node, i)
+            if layer is not None:
+                layers.append(layer)
+
+        return (
+            pbr, normal_texture, emissive_texture, emissive_factor,
+            alpha_mode, alpha_cutoff, (layers or None), (base_extra or None),
+        )
+
+    def _gather_bsdf_layer(self, node, i):
+        """Build one extension layer dict from BSDFStackNode layer i (i >= 1)."""
+        layer: dict = {}
+        props = node.layers[i] if i < len(node.layers) else None
+
+        if props is not None and props.layer_name:
+            layer["name"] = props.layer_name
+
+        pbr = self._layer_pbr_dict(node, i)
         if pbr:
             layer["pbrMetallicRoughness"] = pbr
 
-        normal_node = (
-            self._find_labeled_tex_image(tree, "Normal Override 1")
-            or self._find_labeled_tex_image(tree, "Normal Override")
-        )
-        if normal_node is not None:
-            ti = self.texture_exporter.gather_texture_info(normal_node)
-            if ti is not None:
-                layer["normalTexture"] = self._tex_info_to_dict(ti)
+        normal = self._layer_normal_info(node, i)
+        if normal is not None:
+            layer["normalTexture"] = normal
 
-        # Mask: Ucupaint stores mask images as TEX_IMAGE nodes labeled like
-        # "Mask : IMAGE" or starting with "Mask".
-        mask_node = self._find_labeled_tex_image(tree, "Mask")
-        if mask_node is not None:
-            ti = self.texture_exporter.gather_texture_info(mask_node)
-            if ti is not None:
-                layer["mask"] = {
-                    "source": "TEXTURE",
-                    "texture": self._tex_info_to_dict(ti),
-                }
+        height_ti, bump = self._layer_bump_info(node, i)
+        if height_ti is not None:
+            layer["heightTexture"] = height_ti
+        if bump is not None:
+            layer["bump"] = bump
 
-        # Blend mode from the layer-internal Color blend node.
-        blend_node = next(
-            (
-                n for n in tree.nodes
-                if n.type in ("MIX", "MIX_RGB") and n.label == "Blend"
-            ),
-            None,
-        )
-        if blend_node is not None:
-            bt = getattr(blend_node, "blend_type", "MIX")
-            if bt in _VALID_BLEND_MODES and bt != "MIX":
-                layer["blendMode"] = bt
+        emissive_factor, emissive_texture = self._layer_emission(node, i)
+        if emissive_factor is not None:
+            layer["emissiveFactor"] = emissive_factor
+        if emissive_texture is not None:
+            layer["emissiveTexture"] = emissive_texture
 
-        # Drop empty layers — a layer with no images and no mask carries no
-        # information that the renderer can act on. This filters out
-        # Ucupaint's "Solid Color" (no image) layers.
-        has_content = (
-            "pbrMetallicRoughness" in layer
-            or "normalTexture" in layer
-            or "mask" in layer
-        )
-        if not has_content:
-            return None
+        subsurface = self._layer_subsurface(node, i)
+        if subsurface is not None:
+            layer["subsurface"] = subsurface
+
+        # Mask (optional): omit for a full-opacity unmasked layer.
+        mask = self._gather_layer_mask(self._layer_socket(node, i, "Mask"))
+        if mask is not None:
+            layer["mask"] = mask
+
+        if props is not None:
+            bm = str(props.blend_mode).upper()
+            if bm in _VALID_BLEND_MODES and bm != "MIX":
+                layer["blendMode"] = bm
+            if props.opacity != 1.0:
+                layer["opacity"] = float(props.opacity)
+            if not props.enabled:
+                layer["enabled"] = False
 
         return layer
-
-    def _is_layer_node(self, node) -> bool:
-        return (
-            getattr(node, "type", None) == "GROUP"
-            and getattr(node, "node_tree", None) is not None
-            and node.node_tree.name == LAYER_NODE_GROUP_NAME
-        )
-
-    def _resolve_base_color_socket(self, principled):
-        """Walk through any layer chain on Principled.Base Color and return the
-        socket that feeds the base material's color (deepest 'Below Color', or
-        the Principled socket itself if there is no chain).
-        """
-        socket = principled.inputs.get("Base Color")
-        seen: set[int] = set()
-        while socket is not None and socket.is_linked:
-            upstream = socket.links[0].from_node
-            if id(upstream) in seen:
-                break
-            seen.add(id(upstream))
-            if not self._is_layer_node(upstream):
-                break
-            below = upstream.inputs.get("Below Color")
-            if below is None:
-                break
-            socket = below
-        return socket
 
     def _image_node_from_socket(self, socket):
         """Like _get_connected_image_node but takes a socket directly."""
@@ -665,95 +743,7 @@ class MaterialExporter:
         v = socket.default_value
         return [v[0], v[1], v[2], v[3]], None
 
-    def _collect_layer_chain(self, principled) -> list:
-        """Walk Principled.Base Color → ML.Color → ML.Below Color → ML.Color → …
-        Returns layers in BASE→TOP order.
-        """
-        chain: list = []
-        socket = principled.inputs.get("Base Color")
-        seen: set[int] = set()
-        while socket is not None and socket.is_linked:
-            upstream = socket.links[0].from_node
-            if id(upstream) in seen:
-                break
-            seen.add(id(upstream))
-            if not self._is_layer_node(upstream):
-                break
-            chain.append(upstream)
-            below = upstream.inputs.get("Below Color")
-            if below is None:
-                break
-            socket = below
-        return list(reversed(chain))
-
-    def _gather_one_layer(self, group_node) -> dict | None:
-        layer: dict = {}
-
-        if group_node.label:
-            layer["name"] = group_node.label
-
-        pbr: dict = {}
-
-        # Base color (this layer's color)
-        bc = self._get_socket_default(group_node, "Color")
-        if bc is not None:
-            r, g, b, a = float(bc[0]), float(bc[1]), float(bc[2]), float(bc[3])
-            if (r, g, b, a) != (1.0, 1.0, 1.0, 1.0):
-                pbr["baseColorFactor"] = [r, g, b, a]
-        bc_node = self._get_connected_image_node(group_node, "Color")
-        if bc_node:
-            ti = self.texture_exporter.gather_texture_info(bc_node)
-            if ti is not None:
-                pbr["baseColorTexture"] = ti
-
-        # Metallic / roughness
-        m = self._get_socket_default(group_node, "Metallic")
-        if m is not None and float(m) != 1.0:
-            pbr["metallicFactor"] = float(m)
-        r = self._get_socket_default(group_node, "Roughness")
-        if r is not None and float(r) != 1.0:
-            pbr["roughnessFactor"] = float(r)
-
-        mr_node = self._get_connected_image_node(group_node, "Metallic")
-        if mr_node is None:
-            mr_node = self._get_connected_image_node(group_node, "Roughness")
-        if mr_node:
-            ti = self.texture_exporter.gather_texture_info(mr_node)
-            if ti is not None:
-                pbr["metallicRoughnessTexture"] = ti
-
-        if pbr:
-            layer["pbrMetallicRoughness"] = pbr
-
-        # Normal
-        n_node = self._get_connected_image_node(group_node, "Normal")
-        if n_node is not None:
-            ti = self.texture_exporter.gather_texture_info(n_node)
-            if ti is not None:
-                normal: dict = {"index": ti.index}
-                if ti.tex_coord is not None:
-                    normal["texCoord"] = ti.tex_coord
-                if ti.extensions:
-                    normal["extensions"] = ti.extensions
-                layer["normalTexture"] = normal
-
-        # Mask (required)
-        mask = self._gather_layer_mask(group_node)
-        if mask is None:
-            return None  # layers without a mask have no meaning
-        layer["mask"] = mask
-
-        # Blend mode (optional, custom property on the group node)
-        blend = group_node.get("blend_mode")
-        if blend:
-            blend = str(blend).upper()
-            if blend in _VALID_BLEND_MODES and blend != "MIX":
-                layer["blendMode"] = blend
-
-        return layer
-
-    def _gather_layer_mask(self, group_node) -> dict | None:
-        socket = group_node.inputs.get("Mask")
+    def _gather_layer_mask(self, socket) -> dict | None:
         if socket is None or not socket.is_linked:
             return None
 

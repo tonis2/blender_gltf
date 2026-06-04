@@ -12,6 +12,20 @@ if TYPE_CHECKING:
 
 
 EXT_MATERIALS_LAYERS = "CUSTOM_materials_layers"
+BSDF_STACK_NODE_IDNAME = "BSDFStackNodeType"
+
+# BSDFStackNode per-layer input layout — keep in sync with
+# layer_node/bsdf_node.py CHANNELS and export/material.py.
+_N_CH = 10
+_CH = {
+    "Color": 0, "Mask": 1, "Normal": 2, "Roughness": 3, "Metallic": 4,
+    "Alpha": 5, "Emission Color": 6, "Emission Strength": 7,
+    "Subsurface Weight": 8, "Subsurface Radius": 9,
+}
+_VALID_BLEND_MODES = {
+    "MIX", "MULTIPLY", "ADD", "SUBTRACT", "SCREEN", "OVERLAY",
+    "SOFT_LIGHT", "DIFFERENCE", "DARKEN", "LIGHTEN",
+}
 
 
 class MaterialImporter:
@@ -44,30 +58,52 @@ class MaterialImporter:
         tree = mat.node_tree
         tree.nodes.clear()
 
-        principled = tree.nodes.new("ShaderNodeBsdfPrincipled")
-        principled.location = (0, 0)
         output = tree.nodes.new("ShaderNodeOutputMaterial")
         output.location = (400, 0)
-        tree.links.new(principled.outputs["BSDF"], output.inputs["Surface"])
 
-        pbr = gltf_mat.pbr_metallic_roughness
-        if pbr:
-            self._apply_pbr(tree, principled, pbr)
+        # CUSTOM_materials_layers: a material with a non-empty `layers` array is
+        # authored with a single BSDFStackNode (its Principled BSDF is internal).
+        # A `base`-only extension (height/bump on an otherwise plain material)
+        # stays a standard Principled material.
+        ext_layers = (
+            gltf_mat.extensions.get(EXT_MATERIALS_LAYERS)
+            if gltf_mat.extensions else None
+        )
+        has_layers = bool(ext_layers and ext_layers.get("layers"))
+        base = ext_layers.get("base") if ext_layers else None
 
-        if gltf_mat.normal_texture:
-            self._apply_normal_texture(tree, principled, gltf_mat.normal_texture)
+        principled = None
+        if has_layers:
+            self._build_bsdf_stack(tree, output, gltf_mat, ext_layers)
+        else:
+            principled = tree.nodes.new("ShaderNodeBsdfPrincipled")
+            principled.location = (0, 0)
+            tree.links.new(principled.outputs["BSDF"], output.inputs["Surface"])
 
-        if gltf_mat.emissive_factor:
-            r, g, b = gltf_mat.emissive_factor
-            strength = max(r, g, b)
-            if strength > 0:
-                principled.inputs["Emission Color"].default_value = (
-                    r / strength, g / strength, b / strength, 1.0,
+            pbr = gltf_mat.pbr_metallic_roughness
+            if pbr:
+                self._apply_pbr(tree, principled, pbr)
+
+            if base and (base.get("heightTexture") or base.get("bump")):
+                # Rebuild the Bump node (Height <- displacement, Normal <- the
+                # normal map) feeding the Principled Normal socket.
+                self._apply_principled_bump(
+                    tree, principled, gltf_mat.normal_texture, base,
                 )
-                principled.inputs["Emission Strength"].default_value = strength
+            elif gltf_mat.normal_texture:
+                self._apply_normal_texture(tree, principled, gltf_mat.normal_texture)
 
-        if gltf_mat.emissive_texture:
-            self._apply_texture(tree, principled, "Emission Color", gltf_mat.emissive_texture, y_offset=-400)
+            if gltf_mat.emissive_factor:
+                r, g, b = gltf_mat.emissive_factor
+                strength = max(r, g, b)
+                if strength > 0:
+                    principled.inputs["Emission Color"].default_value = (
+                        r / strength, g / strength, b / strength, 1.0,
+                    )
+                    principled.inputs["Emission Strength"].default_value = strength
+
+            if gltf_mat.emissive_texture:
+                self._apply_texture(tree, principled, "Emission Color", gltf_mat.emissive_texture, y_offset=-400)
 
         if gltf_mat.alpha_mode == "BLEND":
             if hasattr(mat, "surface_render_method"):
@@ -82,20 +118,18 @@ class MaterialImporter:
         else:
             mat.use_backface_culling = True
 
-        # CUSTOM_materials_layers
-        if gltf_mat.extensions and EXT_MATERIALS_LAYERS in gltf_mat.extensions:
-            self._apply_layers(tree, gltf_mat.extensions[EXT_MATERIALS_LAYERS])
-
         # KHR_materials_unlit
         if gltf_mat.extensions and "KHR_materials_unlit" in gltf_mat.extensions:
             gltf_props = getattr(mat, "gltf_props", None)
             if gltf_props:
                 gltf_props.unlit = True
-            # Make it look unlit in viewport
-            principled.inputs["Metallic"].default_value = 0.0
-            principled.inputs["Roughness"].default_value = 1.0
-            if "Specular IOR Level" in principled.inputs:
-                principled.inputs["Specular IOR Level"].default_value = 0.0
+            # Make it look unlit in viewport (only meaningful with a top-level
+            # Principled; layered materials drive their own internal BSDF).
+            if principled is not None:
+                principled.inputs["Metallic"].default_value = 0.0
+                principled.inputs["Roughness"].default_value = 1.0
+                if "Specular IOR Level" in principled.inputs:
+                    principled.inputs["Specular IOR Level"].default_value = 0.0
 
         return mat
 
@@ -179,6 +213,43 @@ class MaterialImporter:
         tree.links.new(tex_node.outputs["Color"], normal_map.inputs["Color"])
         tree.links.new(normal_map.outputs["Normal"], principled.inputs["Normal"])
 
+    def _apply_principled_bump(self, tree, principled, normal_info, base) -> None:
+        """Rebuild a Bump node feeding Principled.Normal: Height <- the
+        displacement map, Normal <- the normal map (via a Normal Map node).
+        """
+        bump = tree.nodes.new("ShaderNodeBump")
+        bump.location = (-300, -550)
+        bd = base.get("bump") or {}
+        if bd.get("strength") is not None:
+            bump.inputs["Strength"].default_value = float(bd["strength"])
+        if bd.get("distance") is not None:
+            bump.inputs["Distance"].default_value = float(bd["distance"])
+
+        height = base.get("heightTexture")
+        if height:
+            htex = self._make_texture_node(
+                tree, self._ti_to_dict(height), principled, (-750, -550),
+                non_color=True,
+            )
+            if htex is not None:
+                tree.links.new(htex.outputs["Color"], bump.inputs["Height"])
+
+        if normal_info is not None:
+            ntex = self._make_texture_node(
+                tree, self._ti_to_dict(normal_info), principled, (-750, -800),
+                non_color=True,
+            )
+            if ntex is not None:
+                normal_map = tree.nodes.new("ShaderNodeNormalMap")
+                normal_map.location = (-500, -800)
+                scale = getattr(normal_info, "scale", None)
+                if scale is not None:
+                    normal_map.inputs["Strength"].default_value = float(scale)
+                tree.links.new(ntex.outputs["Color"], normal_map.inputs["Color"])
+                tree.links.new(normal_map.outputs["Normal"], bump.inputs["Normal"])
+
+        tree.links.new(bump.outputs["Normal"], principled.inputs["Normal"])
+
     def _apply_texture_transform(self, tree, tex_node, texture_info) -> None:
         """Create Mapping + Texture Coordinate nodes for KHR_texture_transform."""
         if not hasattr(texture_info, "extensions") or not texture_info.extensions:
@@ -215,146 +286,266 @@ class MaterialImporter:
         tree.links.new(tex_coord.outputs["UV"], mapping.inputs["Vector"])
         tree.links.new(mapping.outputs["Vector"], tex_node.inputs["Vector"])
 
-    def _apply_layers(self, tree, ext: dict) -> None:
-        """Rebuild a chain of glTF Material Layer group nodes feeding the
-        Principled BSDF's Base Color, so the blend is visible in viewport.
+    # ------------------------------------------------------------------
+    # CUSTOM_materials_layers — rebuild a BSDFStackNode
+    # ------------------------------------------------------------------
+
+    def _build_bsdf_stack(self, tree, output, gltf_mat, ext: dict) -> None:
+        """Rebuild a BSDFStackNode from the extension. Layer 0 is the base
+        material; layers 1..N come from ext['layers']. The node's BSDF output
+        drives Material Output.Surface so the blend is visible in the viewport.
         """
-        from ..material_layer_nodes import ensure_layer_node_group
+        ext_layers = ext.get("layers") or []
+        total = 1 + len(ext_layers)
 
-        layers = ext.get("layers") or []
-        if not layers:
-            return
+        node = tree.nodes.new(BSDF_STACK_NODE_IDNAME)
+        node.location = (0, 0)
 
-        principled = next(
-            (n for n in tree.nodes if n.type == "BSDF_PRINCIPLED"), None,
+        # node.init() already created exactly one layer plus the internal tree.
+        # Grow to `total`, then rebuild the whole socket interface once. These
+        # rebuilds run synchronously on the main thread — that is safe here (the
+        # deferred app-timer path in bsdf_node.py only guards live UI edits).
+        for j in range(1, total):
+            layer = node.layers.add()
+            layer.layer_index = j
+        node.rebuild_group(old_to_new=None)
+
+        layer_dicts = [self._base_layer_dict(gltf_mat, ext)] + list(ext_layers)
+        for i, ld in enumerate(layer_dicts):
+            self._populate_stack_layer(tree, node, i, ld, is_base=(i == 0))
+
+        # Final rebuild: wire normal-map mix branches (only created when the
+        # outer Normal socket is_linked) and fold opacity/enabled/blend into
+        # the per-channel mix factors.
+        node.rebuild_internals()
+
+        tree.links.new(node.outputs["BSDF"], output.inputs["Surface"])
+
+    def _base_layer_dict(self, gltf_mat, ext: dict | None = None) -> dict:
+        """Normalize the base material's fields into the same dict shape used by
+        extension layers, so _populate_stack_layer can treat layer 0 uniformly.
+        Base-only extras with no core glTF slot (heightTexture/bump) live in
+        extension.base.
+        """
+        ld: dict = {}
+        base_extra = (ext or {}).get("base") or {}
+        if base_extra.get("heightTexture") is not None:
+            ld["heightTexture"] = base_extra["heightTexture"]
+        if base_extra.get("bump") is not None:
+            ld["bump"] = base_extra["bump"]
+        pbr = gltf_mat.pbr_metallic_roughness
+        if pbr is not None:
+            pdict: dict = {}
+            if pbr.base_color_factor:
+                pdict["baseColorFactor"] = list(pbr.base_color_factor)
+            bct = self._ti_to_dict(pbr.base_color_texture)
+            if bct is not None:
+                pdict["baseColorTexture"] = bct
+            if pbr.metallic_factor is not None:
+                pdict["metallicFactor"] = pbr.metallic_factor
+            if pbr.roughness_factor is not None:
+                pdict["roughnessFactor"] = pbr.roughness_factor
+            mrt = self._ti_to_dict(pbr.metallic_roughness_texture)
+            if mrt is not None:
+                pdict["metallicRoughnessTexture"] = mrt
+            if pdict:
+                ld["pbrMetallicRoughness"] = pdict
+        nt = self._ti_to_dict(gltf_mat.normal_texture)
+        if nt is not None:
+            ld["normalTexture"] = nt
+        if gltf_mat.emissive_factor:
+            ld["emissiveFactor"] = list(gltf_mat.emissive_factor)
+        et = self._ti_to_dict(gltf_mat.emissive_texture)
+        if et is not None:
+            ld["emissiveTexture"] = et
+        return ld
+
+    @staticmethod
+    def _ti_to_dict(ti):
+        """Coerce a TextureInfo/NormalTextureInfo dataclass (or dict) to a
+        plain textureInfo dict that _make_texture_node understands.
+        """
+        if ti is None:
+            return None
+        if isinstance(ti, dict):
+            return ti
+        d = {"index": ti.index}
+        if getattr(ti, "tex_coord", None) is not None:
+            d["texCoord"] = ti.tex_coord
+        if getattr(ti, "scale", None) is not None:
+            d["scale"] = ti.scale
+        if getattr(ti, "extensions", None):
+            d["extensions"] = ti.extensions
+        return d
+
+    def _stack_socket(self, node, i, channel_name):
+        idx = i * _N_CH + _CH[channel_name]
+        if 0 <= idx < len(node.inputs):
+            return node.inputs[idx]
+        return None
+
+    def _populate_stack_layer(self, tree, node, i, layer, is_base) -> None:
+        pbr = layer.get("pbrMetallicRoughness") or {}
+
+        bcf = pbr.get("baseColorFactor")
+        if bcf:
+            color_sock = self._stack_socket(node, i, "Color")
+            if color_sock is not None and len(bcf) >= 3:
+                color_sock.default_value = (bcf[0], bcf[1], bcf[2], 1.0)
+            if len(bcf) >= 4:
+                alpha_sock = self._stack_socket(node, i, "Alpha")
+                if alpha_sock is not None:
+                    alpha_sock.default_value = float(bcf[3])
+
+        mf = pbr.get("metallicFactor")
+        if mf is not None:
+            s = self._stack_socket(node, i, "Metallic")
+            if s is not None:
+                s.default_value = float(mf)
+        rf = pbr.get("roughnessFactor")
+        if rf is not None:
+            s = self._stack_socket(node, i, "Roughness")
+            if s is not None:
+                s.default_value = float(rf)
+
+        self._link_stack_texture(
+            tree, node, i, "Color", pbr.get("baseColorTexture"), (-500, 0),
         )
-        if principled is None:
-            return
+        self._link_stack_texture(
+            tree, node, i, "Metallic", pbr.get("metallicRoughnessTexture"), (-500, -200),
+        )
+        self._link_stack_normal(
+            tree, node, i, layer.get("normalTexture"),
+            layer.get("heightTexture"), layer.get("bump"), (-500, -400),
+        )
 
-        group = ensure_layer_node_group()
+        ef = layer.get("emissiveFactor")
+        if ef and len(ef) >= 3:
+            strength = max(ef[0], ef[1], ef[2])
+            ec = self._stack_socket(node, i, "Emission Color")
+            es = self._stack_socket(node, i, "Emission Strength")
+            if strength > 0:
+                if ec is not None:
+                    ec.default_value = (
+                        ef[0] / strength, ef[1] / strength, ef[2] / strength, 1.0,
+                    )
+                if es is not None:
+                    es.default_value = strength
+            elif ec is not None:
+                ec.default_value = (ef[0], ef[1], ef[2], 1.0)
+        self._link_stack_texture(
+            tree, node, i, "Emission Color", layer.get("emissiveTexture"), (-500, -600),
+        )
 
-        # The base material's existing Base Color link (or default value)
-        # becomes the input to the deepest layer's "Below Color". Capture and
-        # disconnect it first.
-        bc_socket = principled.inputs["Base Color"]
-        previous_color_output = None
-        previous_color_default = tuple(bc_socket.default_value)
-        if bc_socket.is_linked:
-            previous_link = bc_socket.links[0]
-            previous_color_output = previous_link.from_socket
-            tree.links.remove(previous_link)
+        ss = layer.get("subsurface")
+        if ss:
+            w = self._stack_socket(node, i, "Subsurface Weight")
+            if w is not None and ss.get("weight") is not None:
+                w.default_value = float(ss["weight"])
+            radius = ss.get("radius")
+            r = self._stack_socket(node, i, "Subsurface Radius")
+            if r is not None and radius and len(radius) >= 3:
+                r.default_value = (radius[0], radius[1], radius[2])
 
-        for i, layer in enumerate(layers):
-            x = principled.location[0] - 400 - (len(layers) - i) * 350
-            y = principled.location[1] + 400
-            group_node = tree.nodes.new("ShaderNodeGroup")
-            group_node.node_tree = group
-            group_node.location = (x, y)
+        if not is_base:
+            self._link_stack_mask(
+                tree, node, i, layer.get("mask"), (-500, -800),
+            )
+
+        # Per-layer metadata on the StackLayerProperties entry.
+        if i < len(node.layers):
+            props = node.layers[i]
             name = layer.get("name")
             if name:
-                group_node.label = name
+                props.layer_name = name
+            if not is_base:
+                blend = layer.get("blendMode")
+                if blend and str(blend).upper() in _VALID_BLEND_MODES:
+                    props.blend_mode = str(blend).upper()
+                if layer.get("opacity") is not None:
+                    props.opacity = float(layer["opacity"])
+                if layer.get("enabled") is not None:
+                    props.enabled = bool(layer["enabled"])
 
-            blend = layer.get("blendMode")
-            if blend and blend.upper() != "MIX":
-                group_node["blend_mode"] = blend.upper()
-
-            pbr = layer.get("pbrMetallicRoughness") or {}
-
-            bcf = pbr.get("baseColorFactor")
-            if bcf and len(bcf) >= 4:
-                group_node.inputs["Color"].default_value = (
-                    bcf[0], bcf[1], bcf[2], bcf[3],
-                )
-
-            mf = pbr.get("metallicFactor")
-            if mf is not None:
-                group_node.inputs["Metallic"].default_value = float(mf)
-
-            rf = pbr.get("roughnessFactor")
-            if rf is not None:
-                group_node.inputs["Roughness"].default_value = float(rf)
-
-            # The first layer (i==0) is the BASE-most layer; its Below Color
-            # inherits whatever previously fed Principled.Base Color.
-            if i == 0:
-                if previous_color_output is not None:
-                    tree.links.new(previous_color_output, group_node.inputs["Below Color"])
-                else:
-                    group_node.inputs["Below Color"].default_value = previous_color_default
-                previous_color_output = None
-            elif previous_color_output is not None:
-                tree.links.new(previous_color_output, group_node.inputs["Below Color"])
-                previous_color_output = None
-
-            self._apply_layer_texture(
-                tree, group_node, "Color", pbr.get("baseColorTexture"),
-                offset=(-400, 0),
-            )
-            self._apply_layer_texture(
-                tree, group_node, "Metallic", pbr.get("metallicRoughnessTexture"),
-                offset=(-400, -200),
-            )
-            self._apply_layer_normal(
-                tree, group_node, layer.get("normalTexture"), offset=(-400, -400),
-            )
-            self._apply_layer_mask(
-                tree, group_node, layer.get("mask"), offset=(-400, -600),
-            )
-
-            previous_color_output = group_node.outputs["Color"]
-
-        # Topmost layer's Color → Principled.Base Color
-        if previous_color_output is not None:
-            tree.links.new(previous_color_output, principled.inputs["Base Color"])
-
-    def _apply_layer_texture(
-        self, tree, group_node, socket_name: str, tex_dict, offset,
-    ) -> None:
+    def _link_stack_texture(self, tree, node, i, channel_name, tex_dict, offset) -> None:
         if not tex_dict:
             return
-        tex_node = self._make_texture_node(tree, tex_dict, group_node, offset)
+        tex_node = self._make_texture_node(tree, tex_dict, node, offset)
         if tex_node is None:
             return
-        socket = group_node.inputs.get(socket_name)
+        socket = self._stack_socket(node, i, channel_name)
         if socket is not None:
             tree.links.new(tex_node.outputs["Color"], socket)
 
-    def _apply_layer_normal(self, tree, group_node, tex_dict, offset) -> None:
-        if not tex_dict:
+    def _link_stack_normal(
+        self, tree, node, i, normal_dict, height_dict, bump, offset,
+    ) -> None:
+        """Wire layer i's Normal socket. A normal map flows through a Normal Map
+        node; when height/bump data exists it is rebuilt as a Bump node (Height
+        <- depth map, Normal <- the normal map), mirroring the exported graph.
+        """
+        socket = self._stack_socket(node, i, "Normal")
+        if socket is None:
             return
-        tex_node = self._make_texture_node(
-            tree, tex_dict, group_node, offset, non_color=True,
-        )
-        if tex_node is None:
-            return
-        normal_map = tree.nodes.new("ShaderNodeNormalMap")
-        normal_map.location = (
-            group_node.location[0] + offset[0] + 200,
-            group_node.location[1] + offset[1],
-        )
-        scale = tex_dict.get("scale")
-        if scale is not None:
-            normal_map.inputs["Strength"].default_value = float(scale)
-        tree.links.new(tex_node.outputs["Color"], normal_map.inputs["Color"])
-        socket = group_node.inputs.get("Normal")
-        if socket is not None:
-            tree.links.new(normal_map.outputs["Normal"], socket)
 
-    def _apply_layer_mask(self, tree, group_node, mask, offset) -> None:
+        normal_out = None
+        if normal_dict:
+            tex_node = self._make_texture_node(
+                tree, normal_dict, node, offset, non_color=True,
+            )
+            if tex_node is not None:
+                normal_map = tree.nodes.new("ShaderNodeNormalMap")
+                normal_map.location = (
+                    node.location[0] + offset[0] + 200,
+                    node.location[1] + offset[1],
+                )
+                scale = normal_dict.get("scale")
+                if scale is not None:
+                    normal_map.inputs["Strength"].default_value = float(scale)
+                tree.links.new(tex_node.outputs["Color"], normal_map.inputs["Color"])
+                normal_out = normal_map.outputs["Normal"]
+
+        if height_dict or bump:
+            # Rebuild the Bump node that combined the depth map with the normal.
+            bump_node = tree.nodes.new("ShaderNodeBump")
+            bump_node.location = (
+                node.location[0] + offset[0] + 400,
+                node.location[1] + offset[1],
+            )
+            if bump:
+                if bump.get("strength") is not None:
+                    bump_node.inputs["Strength"].default_value = float(bump["strength"])
+                if bump.get("distance") is not None:
+                    bump_node.inputs["Distance"].default_value = float(bump["distance"])
+            height_node = self._make_texture_node(
+                tree, height_dict, node, (offset[0], offset[1] - 200), non_color=True,
+            ) if height_dict else None
+            if height_node is not None:
+                tree.links.new(height_node.outputs["Color"], bump_node.inputs["Height"])
+            if normal_out is not None:
+                tree.links.new(normal_out, bump_node.inputs["Normal"])
+            tree.links.new(bump_node.outputs["Normal"], socket)
+            return
+
+        if normal_out is not None:
+            tree.links.new(normal_out, socket)
+
+    def _link_stack_mask(self, tree, node, i, mask, offset) -> None:
         if not mask:
             return
-        socket = group_node.inputs.get("Mask")
+        socket = self._stack_socket(node, i, "Mask")
         if socket is None:
             return
 
         source = (mask.get("source") or "TEXTURE").upper()
         channel = (mask.get("channel") or "R").upper()
         out_socket_name = "Alpha" if channel == "A" else "Color"
+        sep_loc = (node.location[0] + offset[0] + 200, node.location[1] + offset[1])
 
         if source == "TEXTURE":
             tex = mask.get("texture")
             tex_node = self._make_texture_node(
-                tree, tex, group_node, offset, non_color=True,
+                tree, tex, node, offset, non_color=True,
             )
             if tex_node is None:
                 return
@@ -364,10 +555,7 @@ class MaterialImporter:
             )
             if channel in ("G", "B"):
                 sep = tree.nodes.new("ShaderNodeSeparateColor")
-                sep.location = (
-                    group_node.location[0] + offset[0] + 200,
-                    group_node.location[1] + offset[1],
-                )
+                sep.location = sep_loc
                 tree.links.new(tex_node.outputs["Color"], sep.inputs["Color"])
                 ch_socket = sep.outputs.get(
                     {"R": "Red", "G": "Green", "B": "Blue"}[channel]
@@ -382,19 +570,13 @@ class MaterialImporter:
             attr_name = mask.get("attribute") or "COLOR_0"
             vc = tree.nodes.new("ShaderNodeVertexColor")
             vc.layer_name = attr_name
-            vc.location = (
-                group_node.location[0] + offset[0],
-                group_node.location[1] + offset[1],
-            )
+            vc.location = (node.location[0] + offset[0], node.location[1] + offset[1])
             from_socket = (
                 vc.outputs["Alpha"] if channel == "A" else vc.outputs["Color"]
             )
             if channel in ("G", "B"):
                 sep = tree.nodes.new("ShaderNodeSeparateColor")
-                sep.location = (
-                    group_node.location[0] + offset[0] + 200,
-                    group_node.location[1] + offset[1],
-                )
+                sep.location = sep_loc
                 tree.links.new(vc.outputs["Color"], sep.inputs["Color"])
                 ch_socket = sep.outputs.get(
                     {"R": "Red", "G": "Green", "B": "Blue"}[channel]
