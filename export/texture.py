@@ -42,6 +42,25 @@ class TextureExporter:
             extensions=extensions,
         )
 
+    @staticmethod
+    def _find_mapping_node(socket):
+        """Follow a texture's Vector input upstream through Reroute nodes and
+        return the Mapping node driving it, or None. Guards against cycles.
+        """
+        seen = set()
+        while socket is not None and socket.is_linked:
+            up = socket.links[0].from_node
+            if id(up) in seen:
+                return None
+            seen.add(id(up))
+            if up.type == "MAPPING":
+                return up
+            if up.type == "REROUTE":
+                socket = up.inputs[0] if up.inputs else None
+                continue
+            return None
+        return None
+
     def _gather_texture_transform(
         self, image_node: "bpy.types.ShaderNodeTexImage",
     ) -> dict | None:
@@ -50,8 +69,12 @@ class TextureExporter:
         if vector_input is None or not vector_input.is_linked:
             return None
 
-        linked_node = vector_input.links[0].from_node
-        if linked_node.type != "MAPPING":
+        # Follow the Vector input through any Reroute nodes to reach the Mapping
+        # node. Materials frequently share one Mapping across several textures by
+        # fanning it out through Reroutes; without this walk the transform (and
+        # thus the texture scale) would be silently dropped for those textures.
+        linked_node = self._find_mapping_node(vector_input)
+        if linked_node is None:
             return None
 
         loc = linked_node.inputs["Location"].default_value
@@ -144,6 +167,16 @@ class TextureExporter:
             image_index = self._embed_image_as_data_uri(blender_image)
         else:
             image_index = self._write_image_file(blender_image)
+
+        # glTF core has no per-image colorspace; preserve the Blender colorspace
+        # in extras so a round-trip keeps non-standard setups (e.g. a diffuse
+        # authored as Non-Color) instead of resetting them to the sRGB default.
+        cs = getattr(blender_image.colorspace_settings, "name", None)
+        if cs:
+            img_obj = self.images[image_index]
+            extras = dict(img_obj.extras) if isinstance(img_obj.extras, dict) else {}
+            extras["colorspace"] = cs
+            img_obj.extras = extras
 
         self._image_cache[blender_image.name] = image_index
         return image_index

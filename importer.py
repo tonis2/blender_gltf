@@ -44,8 +44,12 @@ class GltfImporter:
     def import_file(self) -> None:
         path = Path(self.settings.filepath)
 
-        # 1. Read file
-        if path.suffix.lower() == ".glb":
+        # 1. Read file. Detect the container by content (GLB starts with the
+        # "glTF" magic) rather than trusting the extension — tools sometimes
+        # write JSON glTF to a .glb name or vice-versa.
+        with open(path, "rb") as fh:
+            magic = fh.read(4)
+        if magic == b"glTF":
             gltf_dict, binary = read_glb(path)
         else:
             gltf_dict, binary = read_gltf(path)

@@ -34,6 +34,22 @@ class TextureImporter:
             self.blender_images[i] = self._import_image(i, gltf_image)
 
     def _import_image(self, index, gltf_image) -> "bpy.types.Image":
+        img = self._create_image(index, gltf_image)
+        # Restore the Blender colorspace stamped into extras on export, so a
+        # round-trip preserves non-standard setups (e.g. a Non-Color diffuse).
+        # Falls back to Blender's default / the per-slot Non-Color forcing in
+        # the material importer when no hint is present.
+        extras = getattr(gltf_image, "extras", None)
+        if img is not None and isinstance(extras, dict):
+            cs = extras.get("colorspace")
+            if cs:
+                try:
+                    img.colorspace_settings.name = cs
+                except (TypeError, ValueError):
+                    pass
+        return img
+
+    def _create_image(self, index, gltf_image) -> "bpy.types.Image":
         import bpy
 
         name = gltf_image.name or f"Image_{index}"

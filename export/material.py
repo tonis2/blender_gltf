@@ -260,13 +260,24 @@ class MaterialExporter:
         base_color_socket = principled.inputs.get("Base Color")
         base_color_factor, base_color_texture = self._read_color_socket(base_color_socket)
 
-        # Metallic
-        metallic = self._get_socket_default(principled, "Metallic")
-        metallic_factor = float(metallic) if metallic is not None else None
+        # Metallic / Roughness scalar factors. When a socket is linked Blender
+        # ignores its default_value, so the glTF factor must stay at the spec
+        # default of 1.0 (write None). Otherwise the stale socket default would
+        # be multiplied into the texture on a spec-correct import — e.g. halving
+        # a roughness map that sits at a 0.5 default.
+        metallic_socket = principled.inputs.get("Metallic")
+        if metallic_socket is not None and metallic_socket.is_linked:
+            metallic_factor = None
+        else:
+            metallic = self._get_socket_default(principled, "Metallic")
+            metallic_factor = float(metallic) if metallic is not None else None
 
-        # Roughness
-        roughness = self._get_socket_default(principled, "Roughness")
-        roughness_factor = float(roughness) if roughness is not None else None
+        roughness_socket = principled.inputs.get("Roughness")
+        if roughness_socket is not None and roughness_socket.is_linked:
+            roughness_factor = None
+        else:
+            roughness = self._get_socket_default(principled, "Roughness")
+            roughness_factor = float(roughness) if roughness is not None else None
 
         # Metallic/Roughness texture (if connected)
         mr_texture = None
@@ -476,6 +487,20 @@ class MaterialExporter:
         except (TypeError, ValueError):
             return None
 
+    def _layer_scalar_factor(self, node, layer_index, channel_name):
+        """Scalar factor for a metallic/roughness-style channel: the socket's
+        default_value, or None when the socket is linked. A linked socket's
+        default is ignored by Blender, so the glTF factor must stay at its 1.0
+        default to avoid double-applying it on top of the texture at import.
+        """
+        socket = self._layer_socket(node, layer_index, channel_name)
+        if socket is None or socket.is_linked:
+            return None
+        try:
+            return float(socket.default_value)
+        except (TypeError, ValueError):
+            return None
+
     def _layer_color_rgb(self, node, layer_index, channel_name):
         socket = self._layer_socket(node, layer_index, channel_name)
         if socket is None:
@@ -494,10 +519,10 @@ class MaterialExporter:
         bc_tex = self._layer_image_tex(node, i, "Color")
         if bc_tex is not None:
             pbr["baseColorTexture"] = bc_tex
-        m = self._layer_float(node, i, "Metallic")
+        m = self._layer_scalar_factor(node, i, "Metallic")
         if m is not None and m != 1.0:
             pbr["metallicFactor"] = m
-        r = self._layer_float(node, i, "Roughness")
+        r = self._layer_scalar_factor(node, i, "Roughness")
         if r is not None and r != 1.0:
             pbr["roughnessFactor"] = r
         mr_tex = (
@@ -616,8 +641,8 @@ class MaterialExporter:
         alpha = self._layer_float(node, 0, "Alpha")
         a = alpha if alpha is not None else 1.0
         base_factor = [rgb[0], rgb[1], rgb[2], a]
-        metallic = self._layer_float(node, 0, "Metallic")
-        roughness = self._layer_float(node, 0, "Roughness")
+        metallic = self._layer_scalar_factor(node, 0, "Metallic")
+        roughness = self._layer_scalar_factor(node, 0, "Roughness")
         pbr = MaterialPBRMetallicRoughness(
             base_color_factor=(
                 base_factor if base_factor != [1.0, 1.0, 1.0, 1.0] else None

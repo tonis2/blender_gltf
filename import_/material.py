@@ -149,7 +149,59 @@ class MaterialImporter:
             self._apply_texture(tree, principled, "Base Color", pbr.base_color_texture, y_offset=0)
 
         if pbr.metallic_roughness_texture:
-            self._apply_texture(tree, principled, "Metallic", pbr.metallic_roughness_texture, y_offset=-200)
+            self._apply_metallic_roughness_texture(tree, principled, pbr)
+
+    def _apply_metallic_roughness_texture(self, tree, principled, pbr) -> None:
+        """glTF packs roughness in the G channel and metallic in the B channel of
+        a single combined texture. Split it: Green -> Roughness, Blue -> Metallic,
+        honoring the scalar factors (final = factor * sampled_channel).
+
+        (Previously the texture's whole Color output was wired straight into the
+        Metallic socket, which dumped a plain roughness map onto Metallic and left
+        Roughness unconnected.)
+        """
+        tex_node = self._make_texture_node(
+            tree, self._ti_to_dict(pbr.metallic_roughness_texture),
+            principled, (-700, -200), non_color=True,
+        )
+        if tex_node is None:
+            return
+
+        sep = tree.nodes.new("ShaderNodeSeparateColor")
+        sep.location = (principled.location[0] - 400, principled.location[1] - 200)
+        tree.links.new(tex_node.outputs["Color"], sep.inputs["Color"])
+
+        self._wire_channel_factor(
+            tree, sep.outputs["Green"], principled.inputs["Roughness"],
+            pbr.roughness_factor,
+        )
+        self._wire_channel_factor(
+            tree, sep.outputs["Blue"], principled.inputs["Metallic"],
+            pbr.metallic_factor,
+        )
+
+    def _wire_channel_factor(self, tree, from_socket, to_socket, factor) -> None:
+        """Link a separated metallic/roughness channel into `to_socket`,
+        applying the glTF scalar factor (final = factor * channel). A factor of
+        0 zeroes the channel, so the socket is left at 0 and nothing is wired; a
+        factor of 1 (or unspecified) links the channel directly; otherwise a
+        Math MULTIPLY node scales it.
+        """
+        f = 1.0 if factor is None else float(factor)
+        if f == 0.0:
+            try:
+                to_socket.default_value = 0.0
+            except (TypeError, ValueError):
+                pass
+            return
+        if f == 1.0:
+            tree.links.new(from_socket, to_socket)
+            return
+        mul = tree.nodes.new("ShaderNodeMath")
+        mul.operation = "MULTIPLY"
+        mul.inputs[1].default_value = f
+        tree.links.new(from_socket, mul.inputs[0])
+        tree.links.new(mul.outputs["Value"], to_socket)
 
     def _apply_texture(self, tree, principled, socket_name, texture_info, y_offset=0) -> None:
         if self.gltf.textures is None:
@@ -411,8 +463,8 @@ class MaterialImporter:
         self._link_stack_texture(
             tree, node, i, "Color", pbr.get("baseColorTexture"), (-500, 0),
         )
-        self._link_stack_texture(
-            tree, node, i, "Metallic", pbr.get("metallicRoughnessTexture"), (-500, -200),
+        self._link_stack_metallic_roughness(
+            tree, node, i, pbr.get("metallicRoughnessTexture"), mf, rf, (-500, -200),
         )
         self._link_stack_normal(
             tree, node, i, layer.get("normalTexture"),
@@ -476,6 +528,31 @@ class MaterialImporter:
         socket = self._stack_socket(node, i, channel_name)
         if socket is not None:
             tree.links.new(tex_node.outputs["Color"], socket)
+
+    def _link_stack_metallic_roughness(
+        self, tree, node, i, tex_dict, mf, rf, offset,
+    ) -> None:
+        """Split a combined metallic-roughness texture into the layer's separate
+        Roughness (green channel) and Metallic (blue channel) sockets, honoring
+        the scalar factors. Mirrors _apply_metallic_roughness_texture for the
+        BSDFStackNode path.
+        """
+        if not tex_dict:
+            return
+        tex_node = self._make_texture_node(tree, tex_dict, node, offset, non_color=True)
+        if tex_node is None:
+            return
+
+        sep = tree.nodes.new("ShaderNodeSeparateColor")
+        sep.location = (node.location[0] + offset[0] + 200, node.location[1] + offset[1])
+        tree.links.new(tex_node.outputs["Color"], sep.inputs["Color"])
+
+        rough_sock = self._stack_socket(node, i, "Roughness")
+        if rough_sock is not None:
+            self._wire_channel_factor(tree, sep.outputs["Green"], rough_sock, rf)
+        metal_sock = self._stack_socket(node, i, "Metallic")
+        if metal_sock is not None:
+            self._wire_channel_factor(tree, sep.outputs["Blue"], metal_sock, mf)
 
     def _link_stack_normal(
         self, tree, node, i, normal_dict, height_dict, bump, offset,
