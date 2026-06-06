@@ -74,13 +74,23 @@ class MeshExporter:
             _release_mesh()
             return None
 
-        # GeometrySet meshes share a generic name (e.g. "Mesh") across objects,
-        # so disambiguate by the source object's data name when going through
-        # that path — otherwise two GN-driven curves would dedupe into one mesh.
-        if use_geometry_set:
-            cache_key = f"__gset__:{blender_object.data.name}"
-        else:
-            cache_key = blender_mesh.name
+        # Cache key must uniquely identify the *source* geometry so that linked
+        # duplicates (Alt+D: shared data + identical modifiers) dedupe, while
+        # genuinely distinct objects never collide. The evaluated mesh name is
+        # unreliable: to_mesh() names its result after the original datablock,
+        # and datablocks of different ID types can share a name — e.g. a CURVE
+        # named "GPencil" and a MESH named "GPencil" both yield to_mesh().name
+        # == "GPencil", which previously made the door arches dedupe into the
+        # vine stem mesh (dropping the arch geometry, cloning vines onto houses).
+        # Key on the original data's pointer plus a modifier-stack signature.
+        src = blender_object.original
+        key_parts = [str(src.data.as_pointer()) if src.data else str(src.as_pointer())]
+        for mod in src.modifiers:
+            key_parts.append(mod.type)
+            ng = getattr(mod, "node_group", None)
+            if ng is not None:
+                key_parts.append(str(ng.as_pointer()))
+        cache_key = "|".join(key_parts)
         if cache_key in self._cache:
             _release_mesh()
             return self._cache[cache_key]

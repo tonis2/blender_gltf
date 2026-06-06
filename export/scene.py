@@ -502,21 +502,31 @@ class SceneExporter:
 
         result_nodes: list[int] = []
 
-        # Group source meshes that share the same set of instance transforms
-        # (e.g., Trunk and Foliage from the same collection share transforms)
-        # Detect this by comparing instance counts and parent sets
-        transform_groups: dict[str, list[str]] = {}  # key -> list of mesh names
-        mesh_to_key: dict[str, str] = {}
+        # Group source meshes that share the *exact* same set of instance
+        # transforms (e.g., Trunk and Foliage from one collection instanced
+        # together land on identical transforms and should share a single
+        # instancing node with multiple mesh children). Keying on the full
+        # rounded transform list — rather than a count + first-location
+        # heuristic — avoids accidentally merging two distinct meshes that
+        # happen to share an instance count and starting position (e.g. a
+        # vine's random leaf meshes scattered along a curve).
+        transform_groups: dict[tuple, list[str]] = {}  # key -> list of mesh names
+        mesh_to_key: dict[str, tuple] = {}
+
+        def _transform_key(transforms):
+            # Round to absorb float noise; flatten (loc, rot, scl) per instance
+            # into one hashable tuple covering the whole ordered transform list.
+            return tuple(
+                (
+                    round(loc[0], 5), round(loc[1], 5), round(loc[2], 5),
+                    round(rot[0], 5), round(rot[1], 5), round(rot[2], 5), round(rot[3], 5),
+                    round(scl[0], 5), round(scl[1], 5), round(scl[2], 5),
+                )
+                for loc, rot, scl in transforms
+            )
 
         for mesh_name, transforms in instance_groups.items():
-            # Create a hashable key from the number of instances
-            # Meshes from the same collection/GN setup will have identical count
-            count = len(transforms)
-            # Find if any existing group has the same count AND same translations
-            # (comparing first instance location as a quick check)
-            first_loc = tuple(round(v, 4) for v in transforms[0][0])
-            key = f"{count}_{first_loc}"
-
+            key = _transform_key(transforms)
             if key in transform_groups:
                 transform_groups[key].append(mesh_name)
             else:
@@ -524,7 +534,7 @@ class SceneExporter:
             mesh_to_key[mesh_name] = key
 
         # Process each transform group
-        processed_keys: set[str] = set()
+        processed_keys: set[tuple] = set()
         for mesh_name in instance_groups:
             key = mesh_to_key[mesh_name]
             if key in processed_keys:

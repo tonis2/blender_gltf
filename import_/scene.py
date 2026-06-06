@@ -41,6 +41,10 @@ class SceneImporter:
         self.interactivity_importer = interactivity_importer
         self.node_to_blender: dict[int, "bpy.types.Object"] = {}
         self._skin_armatures: dict[int, "bpy.types.Object"] = {}
+        # GPU-instancing reconstruction (Geometry Nodes "Instance on Points")
+        self._instance_node_group: "bpy.types.NodeTree | None" = None
+        self._instances_coll: "bpy.types.Collection | None" = None
+        self._sources_coll: "bpy.types.Collection | None" = None
 
     def import_scene(self, context: "bpy.types.Context") -> dict[int, "bpy.types.Object"]:
         """Import all glTF scenes, creating Blender scenes as needed."""
@@ -341,6 +345,17 @@ class SceneImporter:
         collection: "bpy.types.Collection",
         parent_obj: "bpy.types.Object | None",
     ) -> None:
+        """Reconstruct EXT_mesh_gpu_instancing as a single Geometry-Nodes
+        "Instance on Points" object per source mesh.
+
+        Instead of one collection-instance empty per instance (which litters the
+        viewport with axis gizmos and parent-relationship lines), we build one
+        point cloud whose points carry per-instance rotation/scale attributes,
+        and a GN modifier that instances the (hidden) source object on those
+        points. This is clean in the viewport and still re-exports as
+        EXT_mesh_gpu_instancing, because the modifier emits real depsgraph
+        instances referencing the source object.
+        """
         import bpy
         import numpy as np
 
@@ -360,59 +375,131 @@ class SceneImporter:
 
         num_instances = len(trans) if trans is not None else 1
 
-        # Create collection for source mesh
-        inst_coll_name = node.name or f"Instance_{node_index}"
-        inst_collection = bpy.data.collections.new(inst_coll_name)
-        collection.children.link(inst_collection)
-
-        # Add source mesh object(s)
+        # Gather source meshes (the node's own mesh plus any mesh children that
+        # share these instance transforms).
+        sources: list[tuple[str, int]] = []
         if node.mesh is not None:
-            blender_mesh = self.mesh_importer.blender_meshes.get(node.mesh)
-            source_obj = bpy.data.objects.new(node.name or "InstanceSource", blender_mesh)
-            inst_collection.objects.link(source_obj)
-
+            sources.append((node.name or f"Instance_{node_index}", node.mesh))
         if node.children and self.gltf.nodes:
             for child_idx in node.children:
                 child_node = self.gltf.nodes[child_idx]
                 if child_node.mesh is not None:
-                    child_mesh = self.mesh_importer.blender_meshes.get(child_node.mesh)
-                    child_obj = bpy.data.objects.new(
-                        child_node.name or "ChildMesh", child_mesh,
-                    )
-                    inst_collection.objects.link(child_obj)
+                    sources.append((child_node.name or "ChildMesh", child_node.mesh))
+        if not sources:
+            return
 
-        # Create instance empties
-        for i in range(num_instances):
-            empty = bpy.data.objects.new(f"{inst_coll_name}_{i}", None)
-            empty.instance_type = "COLLECTION"
-            empty.instance_collection = inst_collection
-            collection.objects.link(empty)
+        # Build the shared point cloud (one point per instance) carrying the
+        # per-instance rotation/scale as attributes the node group reads.
+        points_mesh = bpy.data.meshes.new(f"{node.name or f'Instance_{node_index}'}_points")
+        verts = [tuple(t) for t in trans] if trans is not None else [(0.0, 0.0, 0.0)]
+        points_mesh.from_pydata(verts, [], [])
+        points_mesh.update()
 
-            if trans is not None:
-                empty.location = tuple(trans[i])
-            if rots is not None:
-                empty.rotation_mode = "QUATERNION"
-                empty.rotation_quaternion = tuple(rots[i])
-            if scales is not None:
-                empty.scale = tuple(scales[i])
+        rot_attr = points_mesh.attributes.new("instance_rotation", "QUATERNION", "POINT")
+        if rots is not None:
+            rot_flat = np.ascontiguousarray(rots, dtype=np.float32).reshape(-1)
+        else:
+            rot_flat = np.tile(np.array([1, 0, 0, 0], dtype=np.float32), num_instances)
+        rot_attr.data.foreach_set("value", rot_flat)
 
+        scl_attr = points_mesh.attributes.new("instance_scale", "FLOAT_VECTOR", "POINT")
+        if scales is not None:
+            scl_flat = np.ascontiguousarray(scales, dtype=np.float32).reshape(-1)
+        else:
+            scl_flat = np.tile(np.array([1, 1, 1], dtype=np.float32), num_instances)
+        scl_attr.data.foreach_set("vector", scl_flat)
+
+        instances_coll = self._get_instances_collection(collection)
+        sources_coll = self._get_sources_collection(collection)
+
+        for s_idx, (src_name, mesh_idx) in enumerate(sources):
+            blender_mesh = self.mesh_importer.blender_meshes.get(mesh_idx)
+            if blender_mesh is None:
+                continue
+
+            # Hidden source object that the GN modifier instances. It stays in
+            # the depsgraph (hide via the eye, not "disable in viewports") so
+            # Object Info can read its geometry; hide_render keeps it from
+            # rendering as a stray copy at the origin.
+            source_obj = bpy.data.objects.new(f"{blender_mesh.name}_source", blender_mesh)
+            sources_coll.objects.link(source_obj)
+            source_obj.hide_render = True
+            source_obj.hide_set(True)
+
+            # The instancer: shares the single point cloud across sources.
+            inst_name = src_name if s_idx == 0 else f"{src_name}_instances"
+            points_obj = bpy.data.objects.new(inst_name, points_mesh)
+            instances_coll.objects.link(points_obj)
+
+            mod = points_obj.modifiers.new("GLTF Instances", "NODES")
+            mod.node_group = self._build_instance_node_group(source_obj)
+
+            # Instance transforms are in the node's local space; carry the
+            # parent on the instancer object so only one relationship exists.
             if parent_obj:
-                empty.parent = parent_obj
+                points_obj.parent = parent_obj
 
-        # Exclude source collection from view layer
-        self._exclude_collection(context, inst_collection)
+            if s_idx == 0:
+                self.node_to_blender[node_index] = points_obj
 
-    def _exclude_collection(
-        self, context: "bpy.types.Context", target: "bpy.types.Collection"
-    ) -> None:
-        """Recursively find and exclude a collection in the view layer."""
-        def _find_and_exclude(layer_col):
-            if layer_col.collection == target:
-                layer_col.exclude = True
-                return True
-            for child in layer_col.children:
-                if _find_and_exclude(child):
-                    return True
-            return False
+    def _build_instance_node_group(
+        self, source_obj: "bpy.types.Object",
+    ) -> "bpy.types.NodeTree":
+        """Build an 'Instance on Points' node group bound to one source object.
 
-        _find_and_exclude(context.view_layer.layer_collection)
+        The source is set on the Object Info node's Object input directly (its
+        default_value), rather than as a modifier-level input, because Blender
+        5.x NodesModifier no longer exposes the socket id-property interface.
+        """
+        import bpy
+
+        ng = bpy.data.node_groups.new("GLTF Instance on Points", "GeometryNodeTree")
+        iface = ng.interface
+        iface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+        iface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+
+        nodes = ng.nodes
+        links = ng.links
+        n_in = nodes.new("NodeGroupInput"); n_in.location = (-500, 0)
+        n_out = nodes.new("NodeGroupOutput"); n_out.location = (400, 0)
+        iop = nodes.new("GeometryNodeInstanceOnPoints"); iop.location = (150, 0)
+        oinfo = nodes.new("GeometryNodeObjectInfo"); oinfo.location = (-200, -220)
+        oinfo.transform_space = "ORIGINAL"
+        if "As Instance" in oinfo.inputs:
+            oinfo.inputs["As Instance"].default_value = True
+        oinfo.inputs["Object"].default_value = source_obj
+
+        n_rot = nodes.new("GeometryNodeInputNamedAttribute"); n_rot.location = (-200, 240)
+        n_rot.data_type = "QUATERNION"
+        n_rot.inputs["Name"].default_value = "instance_rotation"
+        n_scl = nodes.new("GeometryNodeInputNamedAttribute"); n_scl.location = (-200, 60)
+        n_scl.data_type = "FLOAT_VECTOR"
+        n_scl.inputs["Name"].default_value = "instance_scale"
+
+        links.new(n_in.outputs["Geometry"], iop.inputs["Points"])
+        links.new(oinfo.outputs["Geometry"], iop.inputs["Instance"])
+        links.new(n_rot.outputs["Attribute"], iop.inputs["Rotation"])
+        links.new(n_scl.outputs["Attribute"], iop.inputs["Scale"])
+        links.new(iop.outputs["Instances"], n_out.inputs["Geometry"])
+
+        return ng
+
+    def _get_instances_collection(
+        self, parent: "bpy.types.Collection",
+    ) -> "bpy.types.Collection":
+        """Collection holding the visible GN instancer objects."""
+        import bpy
+        if self._instances_coll is None:
+            self._instances_coll = bpy.data.collections.new("Instances")
+            parent.children.link(self._instances_coll)
+        return self._instances_coll
+
+    def _get_sources_collection(
+        self, parent: "bpy.types.Collection",
+    ) -> "bpy.types.Collection":
+        """Collection holding the hidden source objects that get instanced."""
+        import bpy
+        if self._sources_coll is None:
+            self._sources_coll = bpy.data.collections.new("Instance Sources")
+            parent.children.link(self._sources_coll)
+        return self._sources_coll
