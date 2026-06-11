@@ -57,14 +57,30 @@ class BufferReader:
                 result[i] = np.frombuffer(
                     buffer_data, dtype=dtype, count=num_components, offset=elem_start,
                 )
-            return result
         else:
             # Tightly packed
             total = acc.count * num_components
             data = np.frombuffer(buffer_data, dtype=dtype, count=total, offset=start)
             if num_components > 1:
                 data = data.reshape(acc.count, num_components)
-            return data.copy()
+            result = data.copy()
+
+        if acc.normalized:
+            result = self._dequantize(result, component_type)
+        return result
+
+    @staticmethod
+    def _dequantize(data: np.ndarray, component_type: ComponentType) -> np.ndarray:
+        """Convert normalized integer data to float32 per the glTF spec."""
+        if component_type == ComponentType.BYTE:
+            return np.maximum(data.astype(np.float32) / 127.0, -1.0)
+        if component_type == ComponentType.UNSIGNED_BYTE:
+            return data.astype(np.float32) / 255.0
+        if component_type == ComponentType.SHORT:
+            return np.maximum(data.astype(np.float32) / 32767.0, -1.0)
+        if component_type == ComponentType.UNSIGNED_SHORT:
+            return data.astype(np.float32) / 65535.0
+        return data
 
     def read_buffer_view_bytes(self, buffer_view_index: int) -> bytes:
         """Read raw bytes from a buffer view (for images)."""

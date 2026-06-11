@@ -16,6 +16,7 @@ from .export.skin import SkinExporter
 from .export.physics import PhysicsExporter
 from .export.particles import ParticleExporter
 from .export.interactivity import InteractivityExporter
+from .export.audio import AudioExporter
 
 if TYPE_CHECKING:
     import bpy
@@ -27,16 +28,21 @@ class ExportSettings:
     format: str = "GLB"  # "GLB", "GLTF_SEPARATE", or "GLTF_EMBEDDED"
     export_normals: bool = True
     export_texcoords: bool = True
+    export_tangents: bool = False
+    export_quantization: bool = False
     export_materials: bool = True
     export_colors: bool = True
     export_animations: bool = True
+    export_animation_events: bool = True
     export_morph_targets: bool = True
     export_gpu_instancing: bool = True
+    export_lods: bool = True
     export_skinning: bool = True
     export_physics: bool = True
     export_extras: bool = True
     export_particles: bool = True
     export_interactivity: bool = True
+    export_audio: bool = True
     export_only_visible: bool = False
     export_all_scenes: bool = False
     export_camera_y_up: bool = True
@@ -59,12 +65,14 @@ class GltfExporter:
         self.interactivity_exporter = InteractivityExporter(
             settings,
         ) if settings.export_interactivity else None
+        self.audio_exporter = AudioExporter(self.buffer, settings) if settings.export_audio else None
         self.scene_exporter = SceneExporter(
             self.mesh_exporter, self.material_exporter, self.buffer, settings,
             skin_exporter=self.skin_exporter,
             physics_exporter=self.physics_exporter,
             particle_exporter=self.particle_exporter,
             interactivity_exporter=self.interactivity_exporter,
+            audio_exporter=self.audio_exporter,
         )
         if self.interactivity_exporter is not None:
             self.interactivity_exporter.scene_exporter = self.scene_exporter
@@ -121,6 +129,14 @@ class GltfExporter:
             all_extensions |= self.particle_exporter.extensions_used
         if self.interactivity_exporter:
             all_extensions |= self.interactivity_exporter.extensions_used
+        if self.audio_exporter:
+            all_extensions |= self.audio_exporter.extensions_used
+        extensions_required = None
+        if self.mesh_exporter.used_quantization:
+            # Quantized attribute types are invalid core glTF, so loaders
+            # must understand the extension.
+            all_extensions.add("KHR_mesh_quantization")
+            extensions_required = ["KHR_mesh_quantization"]
         extensions_used = sorted(all_extensions) or None
 
         # 5b. Collect root-level extensions
@@ -144,6 +160,14 @@ class GltfExporter:
                     root_extensions = {}
                 root_extensions.update(interactivity_root)
 
+        # 5e. KHR_audio_emitter root extension
+        if self.audio_exporter:
+            audio_root = self.audio_exporter.get_root_extension()
+            if audio_root:
+                if root_extensions is None:
+                    root_extensions = {}
+                root_extensions.update(audio_root)
+
         # 6. Assemble glTF
         gltf = Gltf(
             asset=Asset(generator="gltf-exporter", version="2.0"),
@@ -163,6 +187,7 @@ class GltfExporter:
             skins=self.skin_exporter.skins if self.skin_exporter and self.skin_exporter.skins else None,
             extensions=root_extensions,
             extensions_used=extensions_used,
+            extensions_required=extensions_required,
         )
 
         # 6. Serialize

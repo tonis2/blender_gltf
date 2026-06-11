@@ -26,10 +26,23 @@ class BufferBuilder:
         data_type: DataType,
         target: BufferViewTarget | None = None,
         include_bounds: bool = False,
+        normalized: bool = False,
+        byte_stride: int | None = None,
     ) -> int:
-        """Append data as a new BufferView + Accessor. Returns the accessor index."""
+        """Append data as a new BufferView + Accessor. Returns the accessor index.
+
+        byte_stride pads each element to the given stride — needed for vertex
+        attributes whose packed size is not a multiple of 4 (glTF requires
+        4-byte-aligned strides)."""
         data = data.astype(component_type.numpy_dtype)
-        raw = data.tobytes()
+        packed_size = data_type.num_components * component_type.byte_size
+        if byte_stride is not None and byte_stride != packed_size:
+            rows = data.reshape(-1, data_type.num_components)
+            padded = np.zeros((len(rows), byte_stride), dtype=np.uint8)
+            padded[:, :packed_size] = rows.view(np.uint8).reshape(len(rows), packed_size)
+            raw = padded.tobytes()
+        else:
+            raw = data.tobytes()
 
         self._pad_to_alignment()
         byte_offset = len(self._data)
@@ -42,6 +55,7 @@ class BufferBuilder:
                 buffer=0,
                 byte_length=len(raw),
                 byte_offset=byte_offset,
+                byte_stride=byte_stride,
                 target=target.value if target else None,
             )
         )
@@ -66,6 +80,7 @@ class BufferBuilder:
                 type=data_type.value,
                 min=accessor_min,
                 max=accessor_max,
+                normalized=normalized or None,
             )
         )
         return acc_index

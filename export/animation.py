@@ -26,6 +26,8 @@ if TYPE_CHECKING:
     from ..exporter import ExportSettings
 
 
+EXT_ANIMATION_EVENTS = "CUSTOM_animation_events"
+
 # Blender fcurve data_path -> (glTF channel path, DataType, converter)
 _TRS_PATH_MAP: dict[str, tuple[str, DataType]] = {
     "location": ("translation", DataType.VEC3),
@@ -207,7 +209,28 @@ class AnimationExporter:
         if not channels:
             return None
 
-        return Animation(name=action_name, channels=channels, samplers=samplers)
+        return Animation(
+            name=action_name, channels=channels, samplers=samplers,
+            extensions=self._gather_events(obj_action_pairs[0][1], f_origin, fps),
+        )
+
+    def _gather_events(
+        self, action: "bpy.types.Action", f_origin: float, fps: float,
+    ) -> dict | None:
+        """Export the action's pose markers as timed events. Times share the
+        same t=0 origin as the rebased channels, so a marker before the first
+        keyframe yields a negative time."""
+        if not self.settings.export_animation_events:
+            return None
+        markers = getattr(action, "pose_markers", None)
+        if not markers:
+            return None
+        events = sorted(
+            ({"time": (m.frame - f_origin) / fps, "name": m.name} for m in markers),
+            key=lambda e: e["time"],
+        )
+        self.extensions_used.add(EXT_ANIMATION_EVENTS)
+        return {EXT_ANIMATION_EVENTS: {"events": events}}
 
     @staticmethod
     def _earliest_keyframe(
@@ -307,7 +330,7 @@ class AnimationExporter:
         # static rest-pose conversion — without this an animated light snaps
         # 90° on the first keyframe.
         needs_camera_fix = gltf_path == "rotation" and (
-            obj.type == "LIGHT"
+            obj.type in {"LIGHT", "SPEAKER"}
             or (obj.type == "CAMERA" and self.settings.export_camera_y_up)
         )
         if gltf_interp == "CUBICSPLINE":
@@ -480,7 +503,10 @@ class AnimationExporter:
         if not channels:
             return None
 
-        return Animation(name=action.name, channels=channels, samplers=samplers)
+        return Animation(
+            name=action.name, channels=channels, samplers=samplers,
+            extensions=self._gather_events(action, f_origin, fps),
+        )
 
     def _gather_bone_trs_channel(
         self,
@@ -709,6 +735,7 @@ class AnimationExporter:
             name=action.name,
             channels=[channel],
             samplers=[sampler],
+            extensions=self._gather_events(action, f_origin, fps),
         )
 
     # --- Material animation (KHR_animation_pointer) ---

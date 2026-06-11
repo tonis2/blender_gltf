@@ -16,7 +16,7 @@ from . import importer
 from . import layer_node
 from . import interactivity_nodes
 from .gltf import constants, types, buffer, serialize
-from .export import converter, mesh, material, texture, scene, animation, skin, physics, particles, interactivity
+from .export import converter, mesh, material, texture, scene, animation, skin, physics, particles, interactivity, quantize, audio
 from .import_ import (
     converter as import_converter,
     buffer_reader,
@@ -29,6 +29,7 @@ from .import_ import (
     physics as import_physics,
     particles as import_particles,
     interactivity as import_interactivity,
+    audio as import_audio,
 )
 
 if _needs_reload:
@@ -51,6 +52,8 @@ if _needs_reload:
     physics = importlib.reload(physics)
     particles = importlib.reload(particles)
     interactivity = importlib.reload(interactivity)
+    quantize = importlib.reload(quantize)
+    audio = importlib.reload(audio)
     importer = importlib.reload(importer)
     import_converter = importlib.reload(import_converter)
     buffer_reader = importlib.reload(buffer_reader)
@@ -63,6 +66,7 @@ if _needs_reload:
     import_physics = importlib.reload(import_physics)
     import_particles = importlib.reload(import_particles)
     import_interactivity = importlib.reload(import_interactivity)
+    import_audio = importlib.reload(import_audio)
 
 
 def register():

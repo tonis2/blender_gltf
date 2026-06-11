@@ -16,6 +16,7 @@ from .import_.animation import AnimationImporter
 from .import_.physics import PhysicsImporter
 from .import_.particles import ParticleImporter
 from .import_.interactivity import InteractivityImporter
+from .import_.audio import AudioImporter
 
 if TYPE_CHECKING:
     import bpy
@@ -34,6 +35,7 @@ class ImportSettings:
     import_physics: bool = True
     import_particles: bool = True
     import_interactivity: bool = True
+    import_audio: bool = True
 
 
 class GltfImporter:
@@ -100,6 +102,13 @@ class GltfImporter:
             if not interactivity_importer.has_interactivity():
                 interactivity_importer = None
 
+        # 7e. Prepare audio importer
+        audio_importer = None
+        if self.settings.import_audio:
+            audio_importer = AudioImporter(gltf, buffer_reader, self.settings, path.parent)
+            if not audio_importer.has_audio():
+                audio_importer = None
+
         # 8. Import scene hierarchy (creates armatures for skinned meshes)
         scene_importer = SceneImporter(
             gltf, buffer_reader, mesh_importer, self.settings,
@@ -107,6 +116,7 @@ class GltfImporter:
             physics_importer=physics_importer,
             particle_importer=particle_importer,
             interactivity_importer=interactivity_importer,
+            audio_importer=audio_importer,
         )
         node_to_blender = scene_importer.import_scene(self.context)
 

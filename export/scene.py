@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
@@ -18,6 +19,7 @@ from .skin import SkinExporter
 from .physics import PhysicsExporter
 from .particles import ParticleExporter
 from .interactivity import InteractivityExporter
+from .audio import AudioExporter
 
 if TYPE_CHECKING:
     import bpy
@@ -27,6 +29,10 @@ if TYPE_CHECKING:
 EXT_NODE_VISIBILITY = "KHR_node_visibility"
 EXT_GPU_INSTANCING = "EXT_mesh_gpu_instancing"
 EXT_LIGHTS_PUNCTUAL = "KHR_lights_punctual"
+EXT_MSFT_LOD = "MSFT_lod"
+
+# Sibling objects named Base_LOD0, Base_LOD1, ... form one LOD group.
+_LOD_RE = re.compile(r"^(.+)_LOD(\d+)$")
 
 # Blender light type -> glTF light type
 _LIGHT_TYPE_MAP = {
@@ -47,6 +53,7 @@ class SceneExporter:
         physics_exporter: PhysicsExporter | None = None,
         particle_exporter: ParticleExporter | None = None,
         interactivity_exporter: InteractivityExporter | None = None,
+        audio_exporter: AudioExporter | None = None,
     ) -> None:
         self.mesh_exporter = mesh_exporter
         self.material_exporter = material_exporter
@@ -56,6 +63,7 @@ class SceneExporter:
         self.physics_exporter = physics_exporter
         self.particle_exporter = particle_exporter
         self.interactivity_exporter = interactivity_exporter
+        self.audio_exporter = audio_exporter
         self._fps: float = 24.0
         self.nodes: list[Node] = []
         self.object_to_node_index: dict[str, int] = {}
@@ -64,6 +72,7 @@ class SceneExporter:
         self._camera_cache: dict[str, int] = {}  # blender camera data name -> gltf index
         self.lights: list[dict] = []
         self._light_cache: dict[str, int] = {}  # blender light data name -> gltf index
+        self._lod_skip_names: set[str] = set()  # LOD1+ objects, excluded from the graph
 
     def gather(self, context: "bpy.types.Context") -> tuple[list[Scene], int]:
         """Traverse scene(s) and return (scenes, active_scene_index)."""
@@ -122,6 +131,11 @@ class SceneExporter:
                 if obj:
                     skip_objects.add(name)
 
+        # LOD pre-pass: group Base_LODn siblings; LOD1+ leave the scene graph
+        lod_groups: dict[tuple[str | None, str], dict[int, "bpy.types.Object"]] = {}
+        if self.settings.export_lods:
+            lod_groups = self._lod_pre_pass(scene)
+
         # Process armatures first to ensure skin data is available for skinned meshes
         root_objects = [
             obj for obj in scene.objects
@@ -134,13 +148,97 @@ class SceneExporter:
             if node_index is not None:
                 root_nodes.append(node_index)
 
+        # LOD post-pass: attach MSFT_lod to the LOD0 nodes
+        for group in lod_groups.values():
+            self._gather_lod_group(group)
+
         return Scene(
             name=scene.name,
             nodes=root_nodes if root_nodes else None,
         )
 
+    def _lod_pre_pass(
+        self, scene: "bpy.types.Scene",
+    ) -> dict[tuple[str | None, str], dict[int, "bpy.types.Object"]]:
+        """Collect valid LOD groups and mark LOD1+ objects for skipping.
+        A group is valid when LOD0 exists and all members share a parent."""
+        groups: dict[tuple[str | None, str], dict[int, "bpy.types.Object"]] = defaultdict(dict)
+        for obj in scene.objects:
+            match = _LOD_RE.match(obj.name)
+            if match:
+                parent_name = obj.parent.name if obj.parent else None
+                groups[(parent_name, match.group(1))][int(match.group(2))] = obj
+
+        valid: dict[tuple[str | None, str], dict[int, "bpy.types.Object"]] = {}
+        instanced = getattr(self, "_instanced_source_names", set()) | getattr(
+            self, "_instancer_names", set(),
+        )
+        for key, members in groups.items():
+            if 0 not in members or len(members) < 2:
+                continue
+            in_instancing = [obj.name for obj in members.values() if obj.name in instanced]
+            if in_instancing:
+                print(f"glTF export: LOD group '{key[1]}' overlaps instancing ({in_instancing}), skipping group")
+                continue
+            valid[key] = members
+            for level, obj in members.items():
+                if level > 0:
+                    self._lod_skip_names.add(obj.name)
+                    if obj.children:
+                        print(f"glTF export: children of LOD object '{obj.name}' are not exported")
+        return valid
+
+    def _gather_lod_group(self, members: dict[int, "bpy.types.Object"]) -> None:
+        """Export LOD1+ meshes as unlinked nodes and reference them from the
+        LOD0 node via MSFT_lod (nodes outside the scene graph are reachable
+        only through the extension — standard for MSFT_lod)."""
+        lod0 = members[0]
+        node_index = self.object_to_node_index.get(lod0.name)
+        if node_index is None:
+            return
+        lod0_node = self.nodes[node_index]
+
+        ids: list[int] = []
+        for level in sorted(members):
+            if level == 0:
+                continue
+            obj = members[level]
+            material_map = self._gather_materials_for_object(obj)
+            mesh_index = self.mesh_exporter.gather(obj, material_map)
+            if mesh_index is None:
+                continue
+            lod_node = Node(name=obj.name, mesh=mesh_index)
+            lod_index = len(self.nodes)
+            self.nodes.append(lod_node)
+            self._wrap_dequant(lod_node)
+            self.object_to_node_index[obj.name] = lod_index
+            ids.append(lod_index)
+
+        if not ids:
+            return
+
+        if lod0_node.extensions is None:
+            lod0_node.extensions = {}
+        lod0_node.extensions[EXT_MSFT_LOD] = {"ids": ids}
+        self.extensions_used.add(EXT_MSFT_LOD)
+
+        # Screen coverage hints: authored via a "screencoverage" custom prop on
+        # LOD0, else generated. One value per LOD plus a final cutoff.
+        coverage = lod0.get("screencoverage")
+        if coverage is not None:
+            coverage = [float(v) for v in coverage]
+        else:
+            coverage = [0.5 * 0.5 ** i for i in range(len(ids) + 1)]
+        if lod0_node.extras is None:
+            lod0_node.extras = {}
+        lod0_node.extras["MSFT_screencoverage"] = coverage
+
     def _gather_node(self, obj: "bpy.types.Object") -> int | None:
         """Convert a Blender object to a glTF Node. Returns node index."""
+        # LOD1+ objects only exist through their LOD0 node's MSFT_lod extension
+        if obj.name in self._lod_skip_names:
+            return None
+
         # If this object was already exported (shared across scenes), reuse its node
         if obj.name in self.object_to_node_index:
             return self.object_to_node_index[obj.name]
@@ -236,11 +334,12 @@ class SceneExporter:
         loc, rot, scale = obj.matrix_local.decompose()
 
         translation = convert_location(loc)
-        if obj.type == "LIGHT" or (obj.type == "CAMERA" and self.settings.export_camera_y_up):
-            # Blender lights shine along local -Z (same as glTF KHR_lights_punctual).
-            # After the Z-up -> Y-up axis swap, that direction lands along glTF local
-            # +Y, so the same Rx(-90°) post-rotation we apply to cameras restores the
-            # glTF -Z forward convention for lights as well.
+        if obj.type in {"LIGHT", "SPEAKER"} or (obj.type == "CAMERA" and self.settings.export_camera_y_up):
+            # Blender lights and speakers point along local -Z (same as glTF
+            # KHR_lights_punctual / KHR_audio_emitter cones). After the Z-up ->
+            # Y-up axis swap, that direction lands along glTF local +Y, so the
+            # same Rx(-90°) post-rotation we apply to cameras restores the
+            # glTF -Z forward convention for them as well.
             rotation = convert_rotation_camera(rot)
         else:
             rotation = convert_rotation(rot)
@@ -302,16 +401,48 @@ class SceneExporter:
                     node.extensions = {}
                 node.extensions.update(interactivity_ext)
 
+        # KHR_audio_emitter (speaker objects)
+        if self.audio_exporter:
+            audio_ext = self.audio_exporter.gather_node(obj)
+            if audio_ext:
+                if node.extensions is None:
+                    node.extensions = {}
+                node.extensions.update(audio_ext)
+
         # Custom properties as extras
         if self.settings.export_extras:
             extras = self._gather_extras(obj)
             if extras:
                 node.extras = extras
 
+        self._wrap_dequant(node)
+
         index = len(self.nodes)
         self.nodes.append(node)
         self.object_to_node_index[obj.name] = index
         return index
+
+    def _wrap_dequant(self, node: Node) -> None:
+        """Move a quantized mesh onto a child node carrying the dequantization
+        translation/scale. Keeps the parent's own TRS (and any instancing
+        extension) untouched — instance transforms compose above the dequant."""
+        if node.mesh is None:
+            return
+        dequant = self.mesh_exporter.dequant_transforms.get(node.mesh)
+        if dequant is None:
+            return
+        translation, scale = dequant
+        child = Node(
+            name=f"{node.name}_dequant",
+            mesh=node.mesh,
+            translation=translation,
+            scale=scale,
+            extras={"gltf_dequant": True},
+        )
+        child_index = len(self.nodes)
+        self.nodes.append(child)
+        node.mesh = None
+        node.children = (node.children or []) + [child_index]
 
     @staticmethod
     def _find_armature_modifier(obj: "bpy.types.Object"):
@@ -582,6 +713,7 @@ class SceneExporter:
                 child_node = Node(name=mesh_name, mesh=mesh_index)
                 child_idx = len(self.nodes)
                 self.nodes.append(child_node)
+                self._wrap_dequant(child_node)
                 children.append(child_idx)
 
         if not children:
@@ -665,11 +797,13 @@ class SceneExporter:
                     )
                     idx = len(self.nodes)
                     self.nodes.append(node)
+                    self._wrap_dequant(node)
                     return idx
                 else:
                     child_node = Node(name=mesh_name, mesh=mesh_index)
                     child_idx = len(self.nodes)
                     self.nodes.append(child_node)
+                    self._wrap_dequant(child_node)
                     children.append(child_idx)
 
         if not children:

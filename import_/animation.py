@@ -31,6 +31,9 @@ class AnimationImporter:
         self.material_importer = material_importer
         self.settings = settings
         self.bone_node_to_armature = bone_node_to_armature or {}
+        # Actions created while importing the current animation, so
+        # CUSTOM_animation_events markers land on all of them.
+        self._anim_actions: set = set()
 
     def import_all(self, context: "bpy.types.Context") -> None:
         if self.gltf.animations is None:
@@ -41,6 +44,7 @@ class AnimationImporter:
             self._import_animation(gltf_anim, fps)
 
     def _import_animation(self, gltf_anim: "Animation", fps: float) -> None:
+        self._anim_actions = set()
         for channel in gltf_anim.channels:
             sampler = gltf_anim.samplers[channel.sampler]
             times = self.buffer_reader.read_accessor(sampler.input).flatten()
@@ -55,6 +59,25 @@ class AnimationImporter:
                 self._import_weight_animation(target, times, values, interp, fps, gltf_anim.name)
             elif path in ("translation", "rotation", "scale"):
                 self._import_trs_animation(target, path, times, values, interp, fps, gltf_anim.name)
+
+        self._import_events(gltf_anim, fps)
+
+    def _import_events(self, gltf_anim: "Animation", fps: float) -> None:
+        """Recreate CUSTOM_animation_events as pose markers on the imported action(s)."""
+        ext = (gltf_anim.extensions or {}).get("CUSTOM_animation_events")
+        if not ext:
+            return
+        for action in self._anim_actions:
+            markers = getattr(action, "pose_markers", None)
+            if markers is None:
+                continue
+            for event in ext.get("events", []):
+                frame = round(event["time"] * fps)
+                name = event.get("name", "Event")
+                if any(m.name == name and m.frame == frame for m in markers):
+                    continue
+                marker = markers.new(name)
+                marker.frame = frame
 
     def _import_trs_animation(
         self, target, gltf_path: str, times, values, interp: str, fps: float, anim_name: str | None,
@@ -268,6 +291,7 @@ class AnimationImporter:
             shape_keys.animation_data_create()
         action = bpy.data.actions.new(name=anim_name or "ShapeKeyAction")
         shape_keys.animation_data.action = action
+        self._anim_actions.add(action)
 
         for t in range(num_targets):
             kb = key_blocks[t + 1]
@@ -365,9 +389,11 @@ class AnimationImporter:
         if obj.animation_data is None:
             obj.animation_data_create()
         if obj.animation_data.action and obj.animation_data.action.name == action_name:
+            self._anim_actions.add(obj.animation_data.action)
             return obj.animation_data.action
         action = bpy.data.actions.new(name=action_name)
         obj.animation_data.action = action
+        self._anim_actions.add(action)
         return action
 
     def _create_fcurve(self, action, data_path: str, index: int, id_data=None):

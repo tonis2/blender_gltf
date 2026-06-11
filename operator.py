@@ -51,6 +51,42 @@ class KHR_PhysicsProperties(bpy.types.PropertyGroup):
     )
 
 
+class GltfAudioProperties(bpy.types.PropertyGroup):
+    """KHR_audio_emitter source properties without a Blender-native equivalent."""
+
+    auto_play: BoolProperty(
+        name="Auto Play",
+        description="Start playback as soon as the scene loads",
+        default=True,
+    )
+    loop: BoolProperty(
+        name="Loop",
+        description="Loop the audio source",
+        default=True,
+    )
+
+
+class DATA_PT_gltf_audio(bpy.types.Panel):
+    """Panel in speaker data properties for glTF audio settings."""
+    bl_label = "glTF Audio"
+    bl_idname = "DATA_PT_gltf_audio"
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = "data"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == "SPEAKER"
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.active_object.data.gltf_audio
+        layout.prop(props, "auto_play")
+        layout.prop(props, "loop")
+
+
 class GltfMaterialProperties(bpy.types.PropertyGroup):
     """glTF material extension properties."""
 
@@ -119,16 +155,21 @@ _EXPORT_PROPS = (
     "export_format",
     "export_normals",
     "export_texcoords",
+    "export_tangents",
+    "export_quantization",
     "export_materials",
     "export_colors",
     "export_animations",
+    "export_animation_events",
     "export_morph_targets",
     "export_gpu_instancing",
+    "export_lods",
     "export_skinning",
     "export_physics",
     "export_extras",
     "export_particles",
     "export_interactivity",
+    "export_audio",
     "export_only_visible",
     "export_all_scenes",
     "export_camera_y_up",
@@ -150,16 +191,21 @@ class GltfExportSceneSettings(bpy.types.PropertyGroup):
     )
     export_normals: BoolProperty(name="Normals", default=True)
     export_texcoords: BoolProperty(name="UVs", default=True)
+    export_tangents: BoolProperty(name="Tangents", default=False)
+    export_quantization: BoolProperty(name="Quantize Attributes", default=False)
     export_materials: BoolProperty(name="Materials", default=True)
     export_colors: BoolProperty(name="Vertex Colors", default=True)
     export_animations: BoolProperty(name="Animations", default=True)
+    export_animation_events: BoolProperty(name="Animation Events", default=True)
     export_morph_targets: BoolProperty(name="Shape Keys", default=True)
     export_gpu_instancing: BoolProperty(name="GPU Instancing", default=True)
+    export_lods: BoolProperty(name="LODs (MSFT_lod)", default=True)
     export_skinning: BoolProperty(name="Skinning", default=True)
     export_physics: BoolProperty(name="Physics", default=True)
     export_extras: BoolProperty(name="Custom Properties", default=True)
     export_particles: BoolProperty(name="Particles", default=True)
     export_interactivity: BoolProperty(name="Interactivity", default=True)
+    export_audio: BoolProperty(name="Audio", default=True)
     export_only_visible: BoolProperty(name="Only Visible", default=False)
     export_all_scenes: BoolProperty(name="All Scenes", default=False)
     export_camera_y_up: BoolProperty(name="Cameras Y-Up", default=True)
@@ -209,6 +255,22 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         default=True,
     )
 
+    export_tangents: BoolProperty(
+        name="Tangents",
+        description="Export MikkTSpace vertex tangents (requires Normals and UVs)",
+        default=False,
+    )
+
+    export_quantization: BoolProperty(
+        name="Quantize Attributes",
+        description=(
+            "Compress vertex data with KHR_mesh_quantization (16-bit "
+            "positions/UVs, 8-bit normals/tangents). Smaller files and "
+            "less GPU memory; slight precision loss on very glossy surfaces"
+        ),
+        default=False,
+    )
+
     export_materials: BoolProperty(
         name="Materials",
         description="Export PBR materials",
@@ -227,6 +289,12 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         default=True,
     )
 
+    export_animation_events: BoolProperty(
+        name="Animation Events",
+        description="Export action pose markers as timed events (CUSTOM_animation_events)",
+        default=True,
+    )
+
     export_morph_targets: BoolProperty(
         name="Shape Keys",
         description="Export shape keys as morph targets",
@@ -236,6 +304,15 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
     export_gpu_instancing: BoolProperty(
         name="GPU Instancing",
         description="Export collection instances using EXT_mesh_gpu_instancing",
+        default=True,
+    )
+
+    export_lods: BoolProperty(
+        name="LODs (MSFT_lod)",
+        description=(
+            "Group sibling objects named Base_LOD0, Base_LOD1, ... into "
+            "MSFT_lod levels of detail on the LOD0 node"
+        ),
         default=True,
     )
 
@@ -266,6 +343,12 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
     export_interactivity: BoolProperty(
         name="Interactivity",
         description="Export per-object behavior graphs as KHR_interactivity",
+        default=True,
+    )
+
+    export_audio: BoolProperty(
+        name="Audio",
+        description="Export speaker objects as KHR_audio_emitter",
         default=True,
     )
 
@@ -320,16 +403,21 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
             format=self.export_format,
             export_normals=self.export_normals,
             export_texcoords=self.export_texcoords,
+            export_tangents=self.export_tangents,
+            export_quantization=self.export_quantization,
             export_materials=self.export_materials,
             export_colors=self.export_colors,
             export_animations=self.export_animations,
+            export_animation_events=self.export_animation_events,
             export_morph_targets=self.export_morph_targets,
             export_gpu_instancing=self.export_gpu_instancing,
+            export_lods=self.export_lods,
             export_skinning=self.export_skinning,
             export_physics=self.export_physics,
             export_extras=self.export_extras,
             export_particles=self.export_particles,
             export_interactivity=self.export_interactivity,
+            export_audio=self.export_audio,
             export_only_visible=self.export_only_visible,
             export_all_scenes=self.export_all_scenes,
             export_camera_y_up=self.export_camera_y_up,
@@ -360,7 +448,9 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         if body:
             body.prop(self, "export_normals")
             body.prop(self, "export_texcoords")
+            body.prop(self, "export_tangents")
             body.prop(self, "export_colors")
+            body.prop(self, "export_quantization")
 
         header, body = layout.panel("GLTF_export_material", default_closed=True)
         header.label(text="Material")
@@ -372,6 +462,7 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         header.label(text="Animation")
         if body:
             body.prop(self, "export_animations")
+            body.prop(self, "export_animation_events")
             body.prop(self, "export_morph_targets")
 
         header, body = layout.panel("GLTF_export_skinning", default_closed=True)
@@ -383,6 +474,11 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         header.label(text="Instancing")
         if body:
             body.prop(self, "export_gpu_instancing")
+
+        header, body = layout.panel("GLTF_export_lod", default_closed=True)
+        header.label(text="LOD")
+        if body:
+            body.prop(self, "export_lods")
 
         header, body = layout.panel("GLTF_export_cameras", default_closed=True)
         header.label(text="Cameras")
@@ -403,6 +499,11 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         header.label(text="Interactivity")
         if body:
             body.prop(self, "export_interactivity")
+
+        header, body = layout.panel("GLTF_export_audio", default_closed=True)
+        header.label(text="Audio")
+        if body:
+            body.prop(self, "export_audio")
 
         header, body = layout.panel("GLTF_export_extras", default_closed=True)
         header.label(text="Extras")
@@ -500,6 +601,12 @@ class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
         default=True,
     )
 
+    import_audio: BoolProperty(
+        name="Audio",
+        description="Import KHR_audio_emitter as speaker objects",
+        default=True,
+    )
+
     def execute(self, context):
         settings = ImportSettings(
             filepath=self.filepath,
@@ -513,6 +620,7 @@ class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
             import_physics=self.import_physics,
             import_particles=self.import_particles,
             import_interactivity=self.import_interactivity,
+            import_audio=self.import_audio,
         )
 
         try:
@@ -568,6 +676,11 @@ class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
         if body:
             body.prop(self, "import_interactivity")
 
+        header, body = layout.panel("GLTF_import_audio", default_closed=True)
+        header.label(text="Audio")
+        if body:
+            body.prop(self, "import_audio")
+
 
 def menu_func_export(self, context):
     self.layout.operator(EXPORT_SCENE_OT_gltf.bl_idname, text="glTF 2.0 (.glb/.gltf) Custom")
@@ -578,6 +691,9 @@ def menu_func_import(self, context):
 
 
 def register():
+    bpy.utils.register_class(GltfAudioProperties)
+    bpy.types.Speaker.gltf_audio = bpy.props.PointerProperty(type=GltfAudioProperties)
+    bpy.utils.register_class(DATA_PT_gltf_audio)
     bpy.utils.register_class(GltfMaterialProperties)
     bpy.types.Material.gltf_props = bpy.props.PointerProperty(type=GltfMaterialProperties)
     bpy.utils.register_class(MATERIAL_PT_gltf_properties)
@@ -605,3 +721,6 @@ def unregister():
     bpy.utils.unregister_class(MATERIAL_PT_gltf_properties)
     del bpy.types.Material.gltf_props
     bpy.utils.unregister_class(GltfMaterialProperties)
+    bpy.utils.unregister_class(DATA_PT_gltf_audio)
+    del bpy.types.Speaker.gltf_audio
+    bpy.utils.unregister_class(GltfAudioProperties)

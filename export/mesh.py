@@ -8,6 +8,7 @@ from ..gltf.buffer import BufferBuilder
 from ..gltf.constants import ComponentType, DataType, BufferViewTarget
 from ..gltf.types import Mesh, MeshPrimitive
 from .converter import convert_positions, convert_normals, flip_uv_v
+from . import quantize
 
 if TYPE_CHECKING:
     import bpy
@@ -20,6 +21,11 @@ class MeshExporter:
         self.settings = settings
         self.meshes: list[Mesh] = []
         self._cache: dict[str, int] = {}
+        self.used_quantization = False
+        # mesh index -> (translation, scale) a wrapper node needs to undo
+        # POSITION quantization. Absent for unquantized/skinned meshes.
+        self.dequant_transforms: dict[int, tuple[list[float], list[float]]] = {}
+        self._last_dequant: tuple[list[float], list[float]] | None = None
 
     def gather(
         self,
@@ -122,6 +128,8 @@ class MeshExporter:
         index = len(self.meshes)
         self.meshes.append(mesh)
         self._cache[cache_key] = index
+        if self._last_dequant is not None:
+            self.dequant_transforms[index] = self._last_dequant
         return index
 
     def _extract_shape_keys(
@@ -204,6 +212,21 @@ class MeshExporter:
         if len(blender_mesh.loop_triangles) == 0:
             return None
 
+        # MikkTSpace tangents need normals, a UV map, and no n-gon faces.
+        has_tangents = False
+        if (
+            self.settings.export_tangents
+            and self.settings.export_normals
+            and self.settings.export_texcoords
+            and blender_mesh.uv_layers
+        ):
+            try:
+                # Tangents must come from the layer exported as TEXCOORD_0.
+                blender_mesh.calc_tangents(uvmap=blender_mesh.uv_layers[0].name)
+                has_tangents = True
+            except RuntimeError:
+                print(f"glTF export: cannot compute tangents for '{name}' (n-gons present), skipping")
+
         # --- Extract raw data from Blender ---
 
         # Loop triangle indices (each triangle = 3 loop indices)
@@ -225,11 +248,32 @@ class MeshExporter:
         positions = positions.reshape(-1, 3)
         convert_positions(positions)
 
+        # One AABB for the whole mesh so every primitive shares the same
+        # dequantization wrapper node. Skinned meshes keep float positions:
+        # node TRS is ignored on skinned nodes, so the wrapper would be lost.
+        self._last_dequant = None
+        pos_quant = None
+        if self.settings.export_quantization and joint_data is None:
+            offset, scale = quantize.position_dequant_transform(positions)
+            pos_quant = (offset, scale)
+            self._last_dequant = (offset.tolist(), scale.tolist())
+
         # Normals (per loop/corner)
         normals = np.empty(len(blender_mesh.loops) * 3, dtype=np.float32)
         blender_mesh.corner_normals.foreach_get("vector", normals)
         normals = normals.reshape(-1, 3)
         convert_normals(normals)
+
+        # Tangents (per loop/corner), valid only after calc_tangents()
+        tangents = None
+        bitangent_signs = None
+        if has_tangents:
+            tangents = np.empty(len(blender_mesh.loops) * 3, dtype=np.float32)
+            blender_mesh.loops.foreach_get("tangent", tangents)
+            tangents = tangents.reshape(-1, 3)
+            convert_normals(tangents)
+            bitangent_signs = np.empty(len(blender_mesh.loops), dtype=np.float32)
+            blender_mesh.loops.foreach_get("bitangent_sign", bitangent_signs)
 
         # UVs (per loop, for each layer)
         uv_arrays: list[np.ndarray] = []
@@ -261,6 +305,8 @@ class MeshExporter:
 
         dot_fields: list[tuple[str, str]] = [("vertex_index", "u4")]
         dot_fields.extend([("nx", "f4"), ("ny", "f4"), ("nz", "f4")])
+        if has_tangents:
+            dot_fields.extend([("tx", "f4"), ("ty", "f4"), ("tz", "f4"), ("tw", "f4")])
         for i in range(len(uv_arrays)):
             dot_fields.extend([(f"uv{i}_u", "f4"), (f"uv{i}_v", "f4")])
         for i in range(len(color_arrays)):
@@ -275,6 +321,15 @@ class MeshExporter:
         dots["nx"] = normals[:, 0]
         dots["ny"] = normals[:, 1]
         dots["nz"] = normals[:, 2]
+        if has_tangents:
+            dots["tx"] = tangents[:, 0]
+            dots["ty"] = tangents[:, 1]
+            dots["tz"] = tangents[:, 2]
+            # bitangent_sign is used as-is: MikkTSpace works in V-down image
+            # space, which already matches glTF's UV convention, so the
+            # exporter's V-flip needs no sign compensation (same as
+            # io_scene_gltf2).
+            dots["tw"] = bitangent_signs
         for i, uvs in enumerate(uv_arrays):
             dots[f"uv{i}_u"] = uvs[:, 0]
             dots[f"uv{i}_v"] = uvs[:, 1]
@@ -310,6 +365,8 @@ class MeshExporter:
                 positions, dots, prim_loop_indices,
                 len(uv_arrays), len(color_arrays), gltf_mat_idx,
                 shape_key_data, joint_data, weight_data,
+                has_tangents=has_tangents,
+                pos_quant=pos_quant,
             )
             if prim is not None:
                 primitives.append(prim)
@@ -335,6 +392,8 @@ class MeshExporter:
         shape_key_data: list[tuple[str, np.ndarray]] | None = None,
         joint_data: np.ndarray | None = None,
         weight_data: np.ndarray | None = None,
+        has_tangents: bool = False,
+        pos_quant: tuple[np.ndarray, np.ndarray] | None = None,
     ) -> MeshPrimitive | None:
         """Deduplicate vertices and create buffer accessors for one primitive."""
         # Extract dots for this primitive's loops
@@ -365,24 +424,70 @@ class MeshExporter:
         # Add to buffer
         attributes: dict[str, int] = {}
 
-        attributes["POSITION"] = self.buffer.add_accessor(
-            prim_positions, ComponentType.FLOAT, DataType.VEC3,
-            target=BufferViewTarget.ARRAY_BUFFER, include_bounds=True,
-        )
+        quantizing = self.settings.export_quantization
 
-        attributes["NORMAL"] = self.buffer.add_accessor(
-            prim_normals, ComponentType.FLOAT, DataType.VEC3,
-            target=BufferViewTarget.ARRAY_BUFFER,
-        )
+        if pos_quant is not None:
+            offset, scale = pos_quant
+            attributes["POSITION"] = self.buffer.add_accessor(
+                quantize.quantize_positions(prim_positions, offset, scale),
+                ComponentType.UNSIGNED_SHORT, DataType.VEC3,
+                target=BufferViewTarget.ARRAY_BUFFER, include_bounds=True,
+                normalized=True, byte_stride=8,
+            )
+            self.used_quantization = True
+        else:
+            attributes["POSITION"] = self.buffer.add_accessor(
+                prim_positions, ComponentType.FLOAT, DataType.VEC3,
+                target=BufferViewTarget.ARRAY_BUFFER, include_bounds=True,
+            )
+
+        if quantizing:
+            attributes["NORMAL"] = self.buffer.add_accessor(
+                quantize.quantize_normals(prim_normals),
+                ComponentType.BYTE, DataType.VEC3,
+                target=BufferViewTarget.ARRAY_BUFFER,
+                normalized=True, byte_stride=4,
+            )
+            self.used_quantization = True
+        else:
+            attributes["NORMAL"] = self.buffer.add_accessor(
+                prim_normals, ComponentType.FLOAT, DataType.VEC3,
+                target=BufferViewTarget.ARRAY_BUFFER,
+            )
+
+        if has_tangents:
+            prim_tangents = np.column_stack([
+                unique_dots["tx"], unique_dots["ty"],
+                unique_dots["tz"], unique_dots["tw"],
+            ])
+            if quantizing:
+                attributes["TANGENT"] = self.buffer.add_accessor(
+                    quantize.quantize_tangents(prim_tangents),
+                    ComponentType.BYTE, DataType.VEC4,
+                    target=BufferViewTarget.ARRAY_BUFFER, normalized=True,
+                )
+            else:
+                attributes["TANGENT"] = self.buffer.add_accessor(
+                    prim_tangents, ComponentType.FLOAT, DataType.VEC4,
+                    target=BufferViewTarget.ARRAY_BUFFER,
+                )
 
         for i in range(num_uv_layers):
             uv_data = np.column_stack([
                 unique_dots[f"uv{i}_u"], unique_dots[f"uv{i}_v"],
             ])
-            attributes[f"TEXCOORD_{i}"] = self.buffer.add_accessor(
-                uv_data, ComponentType.FLOAT, DataType.VEC2,
-                target=BufferViewTarget.ARRAY_BUFFER,
-            )
+            if quantizing and quantize.can_quantize_uvs(uv_data):
+                attributes[f"TEXCOORD_{i}"] = self.buffer.add_accessor(
+                    quantize.quantize_uvs(uv_data),
+                    ComponentType.UNSIGNED_SHORT, DataType.VEC2,
+                    target=BufferViewTarget.ARRAY_BUFFER, normalized=True,
+                )
+                self.used_quantization = True
+            else:
+                attributes[f"TEXCOORD_{i}"] = self.buffer.add_accessor(
+                    uv_data, ComponentType.FLOAT, DataType.VEC2,
+                    target=BufferViewTarget.ARRAY_BUFFER,
+                )
 
         for i in range(num_color_layers):
             color_data = np.column_stack([
@@ -413,6 +518,10 @@ class MeshExporter:
             targets = []
             for _name, all_deltas in shape_key_data:
                 prim_deltas = all_deltas[vert_indices]
+                if pos_quant is not None:
+                    # Deltas are added to POSITION before the dequant node
+                    # scale is applied, so bring them into normalized space.
+                    prim_deltas = prim_deltas / pos_quant[1]
                 target_acc = self.buffer.add_accessor(
                     prim_deltas, ComponentType.FLOAT, DataType.VEC3,
                     target=BufferViewTarget.ARRAY_BUFFER,

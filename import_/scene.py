@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from .physics import PhysicsImporter
     from .particles import ParticleImporter
     from .interactivity import InteractivityImporter
+    from .audio import AudioImporter
     from ..importer import ImportSettings
 
 
@@ -30,6 +31,7 @@ class SceneImporter:
         physics_importer: "PhysicsImporter | None" = None,
         particle_importer: "ParticleImporter | None" = None,
         interactivity_importer: "InteractivityImporter | None" = None,
+        audio_importer: "AudioImporter | None" = None,
     ) -> None:
         self.gltf = gltf
         self.buffer_reader = buffer_reader
@@ -39,6 +41,7 @@ class SceneImporter:
         self.physics_importer = physics_importer
         self.particle_importer = particle_importer
         self.interactivity_importer = interactivity_importer
+        self.audio_importer = audio_importer
         self.node_to_blender: dict[int, "bpy.types.Object"] = {}
         self._skin_armatures: dict[int, "bpy.types.Object"] = {}
         # GPU-instancing reconstruction (Geometry Nodes "Instance on Points")
@@ -72,6 +75,10 @@ class SceneImporter:
             if gltf_scene.nodes:
                 for node_index in gltf_scene.nodes:
                     self._import_node(context, node_index, collection, parent_obj=None)
+
+            # Scene-level (global) audio emitters
+            if self.audio_importer:
+                self.audio_importer.import_global_emitters(gltf_scene, collection)
 
         # Switch to the active scene as indicated by the glTF
         if active_scene_index < len(self.gltf.scenes):
@@ -157,6 +164,11 @@ class SceneImporter:
             light_idx = node.extensions["KHR_lights_punctual"].get("light")
             if light_idx is not None:
                 obj_data = self._create_light(light_idx)
+        elif (self.audio_importer and node.extensions
+                and "KHR_audio_emitter" in node.extensions):
+            emitter_idx = node.extensions["KHR_audio_emitter"].get("emitter")
+            if emitter_idx is not None:
+                obj_data = self.audio_importer.create_speaker_data(emitter_idx)
 
         obj = bpy.data.objects.new(name, obj_data)
         collection.objects.link(obj)
@@ -226,6 +238,21 @@ class SceneImporter:
         if node.children:
             for child_index in node.children:
                 self._import_node(context, child_index, collection, parent_obj=obj)
+
+        # MSFT_lod: the referenced LOD nodes live outside the scene graph, so
+        # this is the only path that materializes them. Hide them like an
+        # artist-authored LOD set.
+        if node.extensions and "MSFT_lod" in node.extensions:
+            for lod_index in node.extensions["MSFT_lod"].get("ids", []):
+                self._import_node(context, lod_index, collection, parent_obj=obj.parent)
+                lod_obj = self.node_to_blender.get(lod_index)
+                if lod_obj is not None:
+                    lod_obj.hide_set(True)
+                    lod_obj.hide_render = True
+            if (isinstance(node.extras, dict)
+                    and "MSFT_screencoverage" in node.extras
+                    and "screencoverage" not in obj):
+                obj["screencoverage"] = node.extras["MSFT_screencoverage"]
 
     def _create_camera(self, camera_index: int) -> "bpy.types.Camera | None":
         """Create a Blender camera from a glTF camera index."""
