@@ -34,6 +34,10 @@ class AnimationImporter:
         # Actions created while importing the current animation, so
         # CUSTOM_animation_events markers land on all of them.
         self._anim_actions: set = set()
+        # (id_data pointer, animation name) -> action, so every channel of an
+        # animation targeting the same datablock shares one action even when
+        # Blender renames a new action on name collision ("Walk.001").
+        self._action_cache: dict[tuple[int, str], "bpy.types.Action"] = {}
 
     def import_all(self, context: "bpy.types.Context") -> None:
         if self.gltf.animations is None:
@@ -82,8 +86,6 @@ class AnimationImporter:
     def _import_trs_animation(
         self, target, gltf_path: str, times, values, interp: str, fps: float, anim_name: str | None,
     ) -> None:
-        import bpy
-
         node_index = target.node
 
         # Check if this is a bone animation
@@ -128,8 +130,11 @@ class AnimationImporter:
                     kp = fcurve.keyframe_points[i]
                     kp.co = (frame, val)
                     kp.interpolation = "BEZIER"
-                    kp.handle_left = (frame - 1, val + in_tan * fps)
-                    kp.handle_right = (frame + 1, val + out_tan * fps)
+                    # glTF tangents are value-units per second; over the
+                    # 1-frame handle offset the value delta is tangent / fps,
+                    # and the left handle points backwards along the curve.
+                    kp.handle_left = (frame - 1, val - in_tan / fps)
+                    kp.handle_right = (frame + 1, val + out_tan / fps)
                     kp.handle_left_type = "FREE"
                     kp.handle_right_type = "FREE"
                 fcurve.update()
@@ -159,7 +164,6 @@ class AnimationImporter:
         anim_name: str | None,
     ) -> None:
         """Import TRS animation for a bone node, converting absolute TRS to pose deltas."""
-        import bpy
         import mathutils
 
         armature_obj, bone_name = self.bone_node_to_armature[node_index]
@@ -196,6 +200,10 @@ class AnimationImporter:
 
         action = self._ensure_action(armature_obj, anim_name or "Action")
 
+        if interp == "CUBICSPLINE":
+            # CUBICSPLINE output stores (in-tangent, value, out-tangent) per
+            # keyframe; keep only the values and fall back to linear keys.
+            values = values.reshape(len(times), 3, -1)[:, 1, :]
         values = values.reshape(-1, num_components if gltf_path != "rotation" else 4)
         values = self._convert_values(values, gltf_path)
         blender_interp = "CONSTANT" if interp == "STEP" else "LINEAR"
@@ -268,8 +276,6 @@ class AnimationImporter:
     def _import_weight_animation(
         self, target, times, values, interp: str, fps: float, anim_name: str | None,
     ) -> None:
-        import bpy
-
         node_index = target.node
         obj = self.node_to_blender.get(node_index)
         if obj is None or obj.data is None:
@@ -284,14 +290,14 @@ class AnimationImporter:
         if num_targets <= 0:
             return
 
+        if interp == "CUBICSPLINE":
+            # CUBICSPLINE output stores (in-tangents, values, out-tangents)
+            # per keyframe; keep only the values and fall back to linear keys.
+            values = values.reshape(len(times), 3, -1)[:, 1, :]
         values = values.flatten()
         blender_interp = "CONSTANT" if interp == "STEP" else "LINEAR"
 
-        if shape_keys.animation_data is None:
-            shape_keys.animation_data_create()
-        action = bpy.data.actions.new(name=anim_name or "ShapeKeyAction")
-        shape_keys.animation_data.action = action
-        self._anim_actions.add(action)
+        action = self._ensure_action(shape_keys, anim_name or "ShapeKeyAction")
 
         for t in range(num_targets):
             kb = key_blocks[t + 1]
@@ -309,8 +315,6 @@ class AnimationImporter:
     def _import_pointer_animation(
         self, target, times, values, interp: str, fps: float, anim_name: str | None,
     ) -> None:
-        import bpy
-
         if not target.extensions or "KHR_animation_pointer" not in target.extensions:
             return
 
@@ -340,11 +344,12 @@ class AnimationImporter:
 
         socket_name, input_idx, num_components = socket_info
 
-        if mat.node_tree.animation_data is None:
-            mat.node_tree.animation_data_create()
-        action = bpy.data.actions.new(name=anim_name or f"{mat.name}_anim")
-        mat.node_tree.animation_data.action = action
+        action = self._ensure_action(mat.node_tree, anim_name or f"{mat.name}_anim")
 
+        if interp == "CUBICSPLINE":
+            # CUBICSPLINE output stores (in-tangent, value, out-tangent) per
+            # keyframe; keep only the values and fall back to linear keys.
+            values = values.reshape(len(times), 3, -1)[:, 1, :]
         values = values.reshape(-1, num_components)
         blender_interp = "CONSTANT" if interp == "STEP" else "LINEAR"
         bp_data_path = f'nodes["{principled.name}"].inputs[{input_idx}].default_value'
@@ -383,16 +388,26 @@ class AnimationImporter:
             return convert_scale_array(values)
         return values
 
-    def _ensure_action(self, obj, action_name: str):
+    def _ensure_action(self, id_data, action_name: str):
+        """Get (or create) the action for (datablock, animation name).
+
+        Keyed by datablock identity rather than action name, because
+        bpy.data.actions.new() may return a renamed action ("Walk.001") on
+        collision, which a name comparison would never match.
+        """
         import bpy
 
-        if obj.animation_data is None:
-            obj.animation_data_create()
-        if obj.animation_data.action and obj.animation_data.action.name == action_name:
-            self._anim_actions.add(obj.animation_data.action)
-            return obj.animation_data.action
-        action = bpy.data.actions.new(name=action_name)
-        obj.animation_data.action = action
+        if id_data.animation_data is None:
+            id_data.animation_data_create()
+        key = (id_data.as_pointer(), action_name)
+        action = self._action_cache.get(key)
+        if action is None:
+            action = bpy.data.actions.new(name=action_name)
+            # Keep earlier animations alive on save even after a later
+            # animation replaces animation_data.action.
+            action.use_fake_user = True
+            self._action_cache[key] = action
+        id_data.animation_data.action = action
         self._anim_actions.add(action)
         return action
 

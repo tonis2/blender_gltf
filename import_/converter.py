@@ -57,6 +57,44 @@ def convert_scale_array(scales: np.ndarray) -> np.ndarray:
     return result
 
 
+def matrix_from_gltf(col_major_16: list[float]):
+    """Unpack a glTF column-major 16-float matrix into a row-major
+    mathutils.Matrix. No axis conversion is applied."""
+    import mathutils
+
+    m = col_major_16
+    return mathutils.Matrix([
+        [m[0], m[4], m[8], m[12]],
+        [m[1], m[5], m[9], m[13]],
+        [m[2], m[6], m[10], m[14]],
+        [m[3], m[7], m[11], m[15]],
+    ])
+
+
+def load_packed_datablock(load_func, name: str, data: bytes, suffix: str):
+    """Write `data` to a temp file, load it via `load_func` (e.g.
+    bpy.data.images.load / bpy.data.sounds.load), pack the datablock and
+    delete the temp file. Returns the datablock, or None when the load or
+    decode fails — callers decide on a placeholder/fallback.
+    """
+    import os
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        f.write(data)
+        tmp_path = f.name
+    try:
+        datablock = load_func(tmp_path)
+        datablock.name = name
+        datablock.pack()
+    except RuntimeError as e:
+        print(f"glTF import: cannot decode '{name}': {e}")
+        datablock = None
+    finally:
+        os.unlink(tmp_path)
+    return datablock
+
+
 def convert_matrix(col_major_16: list[float]):
     """Convert glTF Y-up column-major 16-float matrix to Blender Z-up Matrix.
 

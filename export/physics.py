@@ -253,10 +253,38 @@ class PhysicsExporter:
         if len(verts) == 0:
             return None
 
+        if shape_type in ("SPHERE", "BOX"):
+            # True axis-aligned bounding box. Earlier code assumed the geometry
+            # was centered on the local origin (abs(v.co), length_squared),
+            # which oversized/misaligned colliders for off-center meshes.
+            bb_min = [float("inf")] * 3
+            bb_max = [float("-inf")] * 3
+            for v in verts:
+                for i in range(3):
+                    c = v.co[i]
+                    if c < bb_min[i]:
+                        bb_min[i] = c
+                    if c > bb_max[i]:
+                        bb_max[i] = c
+            center = [(bb_min[i] + bb_max[i]) / 2.0 for i in range(3)]
+            # The implicit-shape schema has no center field, so the collider is
+            # implicitly centered on the mesh origin. Warn when that differs
+            # meaningfully from the geometry's actual center.
+            if any(abs(center[i]) > 1e-4 for i in range(3)):
+                print(
+                    f"[glTF] {shape_type.lower()} collider geometry is offset "
+                    f"from the mesh origin (center {tuple(round(c, 4) for c in center)}); "
+                    f"the exported collider is centered on the mesh origin"
+                )
+
         if shape_type == "SPHERE":
+            # Radius = max vertex distance from the bbox center (not origin).
             max_r_sq = 0.0
             for v in verts:
-                max_r_sq = max(max_r_sq, v.co.length_squared)
+                dx = v.co[0] - center[0]
+                dy = v.co[1] - center[1]
+                dz = v.co[2] - center[2]
+                max_r_sq = max(max_r_sq, dx * dx + dy * dy + dz * dz)
             radius = max_r_sq ** 0.5
             if radius <= 0:
                 return None
@@ -266,11 +294,8 @@ class PhysicsExporter:
             }
 
         elif shape_type == "BOX":
-            max_half = [0.0, 0.0, 0.0]
-            for v in verts:
-                for i in range(3):
-                    max_half[i] = max(max_half[i], abs(v.co[i]))
-            size = convert_scale([max_half[0] * 2, max_half[1] * 2, max_half[2] * 2])
+            extents = [bb_max[i] - bb_min[i] for i in range(3)]
+            size = convert_scale(extents)
             if all(s <= 0 for s in size):
                 return None
             # Degenerate axes (e.g., flat plane mesh) get a tiny floor so the

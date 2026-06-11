@@ -92,10 +92,25 @@ class MeshExporter:
         src = blender_object.original
         key_parts = [str(src.data.as_pointer()) if src.data else str(src.as_pointer())]
         for mod in src.modifiers:
+            if not mod.show_viewport:
+                continue
             key_parts.append(mod.type)
             ng = getattr(mod, "node_group", None)
             if ng is not None:
                 key_parts.append(str(ng.as_pointer()))
+            # Editable RNA props capture per-modifier settings so that two
+            # modifiers of the same type (or one GN node group driven by
+            # different inputs) don't collide in the dedup cache. repr()
+            # stringifies non-hashable values (vectors, pointers, etc.).
+            key_parts.append(repr(tuple(
+                (p.identifier, repr(getattr(mod, p.identifier, None)))
+                for p in mod.bl_rna.properties if not p.is_readonly
+            )))
+            # GN custom-property inputs live in the modifier's mapping, not
+            # the RNA props above.
+            key_parts.append(repr(tuple(
+                (k, repr(mod[k])) for k in mod.keys()
+            )))
         cache_key = "|".join(key_parts)
         if cache_key in self._cache:
             _release_mesh()
@@ -105,6 +120,20 @@ class MeshExporter:
         shape_key_data = None
         if self.settings.export_morph_targets:
             shape_key_data = self._extract_shape_keys(blender_object)
+            # Shape-key deltas are indexed by ORIGINAL-mesh vertex indices, but
+            # the primitive's vertex_index field comes from the EVALUATED mesh.
+            # Modifiers that change vertex count (Mirror, Subsurf, ...) make the
+            # two index spaces incompatible — applying deltas would corrupt or
+            # crash. Skip morph targets for such meshes.
+            if shape_key_data is not None:
+                basis_data = blender_object.data.shape_keys.key_blocks[0].data
+                if len(blender_mesh.vertices) != len(basis_data):
+                    print(
+                        f"[glTF] '{blender_object.name}': modifiers change vertex "
+                        f"count ({len(basis_data)} -> {len(blender_mesh.vertices)}); "
+                        f"skipping morph-target export for this mesh"
+                    )
+                    shape_key_data = None
 
         # Extract vertex weights for skinning
         joint_data = None
@@ -259,10 +288,12 @@ class MeshExporter:
             self._last_dequant = (offset.tolist(), scale.tolist())
 
         # Normals (per loop/corner)
-        normals = np.empty(len(blender_mesh.loops) * 3, dtype=np.float32)
-        blender_mesh.corner_normals.foreach_get("vector", normals)
-        normals = normals.reshape(-1, 3)
-        convert_normals(normals)
+        normals = None
+        if self.settings.export_normals:
+            normals = np.empty(len(blender_mesh.loops) * 3, dtype=np.float32)
+            blender_mesh.corner_normals.foreach_get("vector", normals)
+            normals = normals.reshape(-1, 3)
+            convert_normals(normals)
 
         # Tangents (per loop/corner), valid only after calc_tangents()
         tangents = None
@@ -277,16 +308,17 @@ class MeshExporter:
 
         # UVs (per loop, for each layer)
         uv_arrays: list[np.ndarray] = []
-        for uv_layer in blender_mesh.uv_layers:
-            uvs = np.empty(len(blender_mesh.loops) * 2, dtype=np.float32)
-            uv_layer.uv.foreach_get("vector", uvs)
-            uvs = uvs.reshape(-1, 2)
-            flip_uv_v(uvs)
-            uv_arrays.append(uvs)
+        if self.settings.export_texcoords:
+            for uv_layer in blender_mesh.uv_layers:
+                uvs = np.empty(len(blender_mesh.loops) * 2, dtype=np.float32)
+                uv_layer.uv.foreach_get("vector", uvs)
+                uvs = uvs.reshape(-1, 2)
+                flip_uv_v(uvs)
+                uv_arrays.append(uvs)
 
         # Vertex colors (per loop/corner)
         color_arrays: list[np.ndarray] = []
-        for color_attr in blender_mesh.color_attributes:
+        for color_attr in (blender_mesh.color_attributes if self.settings.export_colors else []):
             if color_attr.domain == "CORNER":
                 colors = np.empty(len(blender_mesh.loops) * 4, dtype=np.float32)
                 color_attr.data.foreach_get("color", colors)
@@ -303,8 +335,10 @@ class MeshExporter:
         # Each dot represents one loop corner with all its attributes.
         # Unique dots become unique glTF vertices.
 
+        has_normals = normals is not None
         dot_fields: list[tuple[str, str]] = [("vertex_index", "u4")]
-        dot_fields.extend([("nx", "f4"), ("ny", "f4"), ("nz", "f4")])
+        if has_normals:
+            dot_fields.extend([("nx", "f4"), ("ny", "f4"), ("nz", "f4")])
         if has_tangents:
             dot_fields.extend([("tx", "f4"), ("ty", "f4"), ("tz", "f4"), ("tw", "f4")])
         for i in range(len(uv_arrays)):
@@ -318,9 +352,10 @@ class MeshExporter:
         num_loops = len(blender_mesh.loops)
         dots = np.empty(num_loops, dtype=np.dtype(dot_fields))
         dots["vertex_index"] = corner_verts
-        dots["nx"] = normals[:, 0]
-        dots["ny"] = normals[:, 1]
-        dots["nz"] = normals[:, 2]
+        if has_normals:
+            dots["nx"] = normals[:, 0]
+            dots["ny"] = normals[:, 1]
+            dots["nz"] = normals[:, 2]
         if has_tangents:
             dots["tx"] = tangents[:, 0]
             dots["ty"] = tangents[:, 1]
@@ -366,6 +401,7 @@ class MeshExporter:
                 len(uv_arrays), len(color_arrays), gltf_mat_idx,
                 shape_key_data, joint_data, weight_data,
                 has_tangents=has_tangents,
+                has_normals=has_normals,
                 pos_quant=pos_quant,
             )
             if prim is not None:
@@ -393,6 +429,7 @@ class MeshExporter:
         joint_data: np.ndarray | None = None,
         weight_data: np.ndarray | None = None,
         has_tangents: bool = False,
+        has_normals: bool = True,
         pos_quant: tuple[np.ndarray, np.ndarray] | None = None,
     ) -> MeshPrimitive | None:
         """Deduplicate vertices and create buffer accessors for one primitive."""
@@ -409,10 +446,12 @@ class MeshExporter:
         vert_indices = unique_dots["vertex_index"]
         prim_positions = all_positions[vert_indices]
 
-        # Extract normals
-        prim_normals = np.column_stack([
-            unique_dots["nx"], unique_dots["ny"], unique_dots["nz"],
-        ])
+        # Extract normals (only if emitted into the dots array)
+        prim_normals = None
+        if has_normals:
+            prim_normals = np.column_stack([
+                unique_dots["nx"], unique_dots["ny"], unique_dots["nz"],
+            ])
 
         # Default to UNSIGNED_INT (uint32) so consumers can concatenate primitives
         # into a global vertex buffer without ushort wrap. Per-primitive ubyte/ushort
@@ -441,19 +480,20 @@ class MeshExporter:
                 target=BufferViewTarget.ARRAY_BUFFER, include_bounds=True,
             )
 
-        if quantizing:
-            attributes["NORMAL"] = self.buffer.add_accessor(
-                quantize.quantize_normals(prim_normals),
-                ComponentType.BYTE, DataType.VEC3,
-                target=BufferViewTarget.ARRAY_BUFFER,
-                normalized=True, byte_stride=4,
-            )
-            self.used_quantization = True
-        else:
-            attributes["NORMAL"] = self.buffer.add_accessor(
-                prim_normals, ComponentType.FLOAT, DataType.VEC3,
-                target=BufferViewTarget.ARRAY_BUFFER,
-            )
+        if has_normals:
+            if quantizing:
+                attributes["NORMAL"] = self.buffer.add_accessor(
+                    quantize.quantize_normals(prim_normals),
+                    ComponentType.BYTE, DataType.VEC3,
+                    target=BufferViewTarget.ARRAY_BUFFER,
+                    normalized=True, byte_stride=4,
+                )
+                self.used_quantization = True
+            else:
+                attributes["NORMAL"] = self.buffer.add_accessor(
+                    prim_normals, ComponentType.FLOAT, DataType.VEC3,
+                    target=BufferViewTarget.ARRAY_BUFFER,
+                )
 
         if has_tangents:
             prim_tangents = np.column_stack([

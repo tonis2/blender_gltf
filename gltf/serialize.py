@@ -150,11 +150,16 @@ def read_gltf(path: Path) -> tuple[dict, bytes | None]:
 
 def write_gltf_embedded(path: Path, gltf_dict: dict, binary: bytes | None = None) -> None:
     """Write a single .gltf JSON file with all binary data embedded as base64 data URIs."""
-    # Embed the buffer as a data URI
-    if binary and len(binary) > 0 and "buffers" in gltf_dict:
-        for buf in gltf_dict["buffers"]:
-            encoded = base64.b64encode(binary).decode("ascii")
-            buf["uri"] = f"data:application/octet-stream;base64,{encoded}"
+    # Embed the buffer as a data URI. The exporter only ever produces a
+    # single buffer; the blob must not be duplicated into multiple buffers.
+    buffers = gltf_dict.get("buffers") or []
+    if binary and len(binary) > 0 and buffers:
+        if len(buffers) > 1:
+            raise ValueError(
+                f"Embedded glTF export supports a single buffer, got {len(buffers)}"
+            )
+        encoded = base64.b64encode(binary).decode("ascii")
+        buffers[0]["uri"] = f"data:application/octet-stream;base64,{encoded}"
 
     json_data = _encode_json(gltf_dict, pretty=True)
 

@@ -23,6 +23,7 @@ class TextureExporter:
         self.samplers: list[Sampler] = []
         self._image_cache: dict[str, int] = {}  # blender image name -> image index
         self._sampler_cache: dict[tuple, int] = {}
+        self._texture_cache: dict[tuple[int, int], int] = {}  # (image, sampler) -> texture index
         self.extensions_used: set[str] = set()
 
     def gather_texture_info(
@@ -119,12 +120,17 @@ class TextureExporter:
         sampler_index = self._gather_sampler(image_node)
         image_index = self._gather_image(image_node.image)
 
+        key = (image_index, sampler_index)
+        if key in self._texture_cache:
+            return self._texture_cache[key]
+
         tex_index = len(self.textures)
         self.textures.append(Texture(
             source=image_index,
             sampler=sampler_index,
             name=image_node.image.name,
         ))
+        self._texture_cache[key] = tex_index
         return tex_index
 
     def _gather_sampler(self, image_node: "bpy.types.ShaderNodeTexImage") -> int:
@@ -139,6 +145,12 @@ class TextureExporter:
         if image_node.extension == "REPEAT":
             wrap = TextureWrap.REPEAT
         elif image_node.extension == "EXTEND":
+            wrap = TextureWrap.CLAMP_TO_EDGE
+        elif image_node.extension == "MIRROR":
+            wrap = TextureWrap.MIRRORED_REPEAT
+        elif image_node.extension == "CLIP":
+            # glTF has no "clip to transparent black"; clamp-to-edge is the
+            # closest representable wrap mode.
             wrap = TextureWrap.CLAMP_TO_EDGE
         else:
             wrap = TextureWrap.REPEAT
@@ -161,9 +173,9 @@ class TextureExporter:
         if blender_image.name in self._image_cache:
             return self._image_cache[blender_image.name]
 
-        if self.settings.format == "GLB":
+        if self.settings.export_format == "GLB":
             image_index = self._pack_image_to_buffer(blender_image)
-        elif self.settings.format == "GLTF_EMBEDDED":
+        elif self.settings.export_format == "GLTF_EMBEDDED":
             image_index = self._embed_image_as_data_uri(blender_image)
         else:
             image_index = self._write_image_file(blender_image)

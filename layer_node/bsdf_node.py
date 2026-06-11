@@ -19,44 +19,9 @@ import bpy
 from bpy.props import CollectionProperty
 from bpy.types import ShaderNodeCustomGroup
 
+from .constants import CHANNELS, N_CH, CH_TO_IDX, CHANNEL_BY_NAME, SUBSECTIONS
 from .properties import StackLayerProperties
 from .utils import get_node_id
-
-# (name, socket_type, default, bsdf_input_name, mix_data_type, hide_value)
-# - bsdf_input_name=None: channel is control-only (not piped into BSDF)
-# - mix_data_type=None:   channel is not blended (Mask)
-# - hide_value=True:      socket exposes only a connection dot (no inline editor)
-#
-# Order matters: this defines node.inputs ordering per layer (sockets are
-# laid out depth-first across the layer panel + its sub-panels, see
-# SUBSECTIONS below).
-CHANNELS = [
-    ("Color",             "NodeSocketColor",  (1.0, 1.0, 1.0, 1.0), "Base Color",        "RGBA",   False),
-    ("Mask",              "NodeSocketFloat",  1.0,                  None,                None,     False),
-    ("Normal",            "NodeSocketVector", (0.0, 0.0, 1.0),      "Normal",            "VECTOR", True),
-    ("Roughness",         "NodeSocketFloat",  0.5,                  "Roughness",         "FLOAT",  False),
-    ("Metallic",          "NodeSocketFloat",  0.0,                  "Metallic",          "FLOAT",  False),
-    ("Alpha",             "NodeSocketFloat",  1.0,                  "Alpha",             "FLOAT",  False),
-    ("Emission Color",    "NodeSocketColor",  (0.0, 0.0, 0.0, 1.0), "Emission Color",    "RGBA",   False),
-    ("Emission Strength", "NodeSocketFloat",  0.0,                  "Emission Strength", "FLOAT",  False),
-    ("Subsurface Weight", "NodeSocketFloat",  0.0,                  "Subsurface Weight", "FLOAT",  False),
-    ("Subsurface Radius", "NodeSocketVector", (1.0, 0.2, 0.1),      "Subsurface Radius", "VECTOR", False),
-]
-
-N_CH = len(CHANNELS)
-CH_TO_IDX = {c[0]: i for i, c in enumerate(CHANNELS)}
-CHANNEL_BY_NAME = {c[0]: c for c in CHANNELS}
-
-# Sub-section grouping inside each layer panel.
-# (panel_name_or_None, [channel_names]).  None means "directly under the
-# layer panel"; otherwise the channels live in a nested sub-panel of the
-# given name that defaults to closed.
-SUBSECTIONS = [
-    (None,         ["Color", "Mask", "Normal"]),
-    ("PBR",        ["Roughness", "Metallic", "Alpha"]),
-    ("Emission",   ["Emission Color", "Emission Strength"]),
-    ("Subsurface", ["Subsurface Weight", "Subsurface Radius"]),
-]
 
 
 def _mix_socket_indices(data_type):
@@ -68,6 +33,16 @@ def _mix_socket_indices(data_type):
     if data_type == "RGBA":
         return 6, 7, 2
     raise ValueError(data_type)
+
+
+def _factor_node_name(layer_index, ch_name):
+    """Stable internal name for a layer/channel factor Math node."""
+    return f"L{layer_index} {ch_name} Factor"
+
+
+def _mix_node_name(layer_index, ch_name):
+    """Stable internal name for a layer/channel Mix node."""
+    return f"L{layer_index} {ch_name} Mix"
 
 
 def _layer_panel_name(layer, layer_index):
@@ -145,7 +120,7 @@ class BSDFStackNode(ShaderNodeCustomGroup):
         # enabled=True). Empty layer_name uses the "Layer N" panel fallback.
         self.layers.add()
         # add_layer_to_group → rebuild_group → rebuild_internals.
-        self.add_layer_to_group(0)
+        self.add_layer_to_group()
 
     def free(self):
         if self.node_tree:
@@ -163,8 +138,6 @@ class BSDFStackNode(ShaderNodeCustomGroup):
             dst.blend_mode  = src.blend_mode
             dst.opacity     = src.opacity
             dst.enabled     = src.enabled
-            dst.collapsed   = src.collapsed
-            dst.layer_index = src.layer_index
 
     def update(self):
         """Schedule a rebuild when external Normal links change.
@@ -219,7 +192,7 @@ class BSDFStackNode(ShaderNodeCustomGroup):
             return g_in.outputs[idx]
         return None
 
-    def add_layer_to_group(self, index):
+    def add_layer_to_group(self):
         """Add sockets for a new layer.
 
         Delegates to rebuild_group() so the full panel/socket interface is
@@ -237,26 +210,45 @@ class BSDFStackNode(ShaderNodeCustomGroup):
         is keyed by channel/sub-panel NAME so the restore step survives
         reorderings of CHANNELS in source.
         """
-        nt = self.node_tree
         parent_tree = self.id_data
 
-        # ---- snapshot existing state by (layer_index, channel_name) ----
         # Determine old layer count from existing input socket count (N_CH
         # sockets per layer). This avoids depending on panel structure.
         old_layer_count = len(self.inputs) // N_CH
-        saved_sockets = {}  # (li, channel_name) -> {'link_from', 'default'}
+
+        saved_sockets, old_layer_closed, old_subpanel_closed = \
+            self._snapshot_state(parent_tree, old_layer_count)
+        new_to_old = self._resolve_layer_mapping(old_to_new, old_layer_count)
+        self._clear_interface()
+        self._rebuild_panels(new_to_old, old_layer_closed, old_subpanel_closed)
+        self._restore_state(parent_tree, new_to_old, saved_sockets)
+
+        self.rebuild_internals()
+
+    def _snapshot_state(self, parent_tree, old_layer_count):
+        """Snapshot socket defaults/links and panel collapse states.
+
+        Returns (saved_sockets, old_layer_closed, old_subpanel_closed) where
+        saved_sockets maps (layer_index, channel_name) -> {'link_from', 'default'}.
+        """
+        nt = self.node_tree
+
+        # Build the to_socket -> from_socket map once instead of scanning
+        # parent_tree.links per input socket.
+        link_from_by_socket = {}
+        if parent_tree and hasattr(parent_tree, 'links'):
+            for link in parent_tree.links:
+                if link.to_node == self:
+                    link_from_by_socket[link.to_socket.as_pointer()] = link.from_socket
+
+        saved_sockets = {}
         for li in range(old_layer_count):
             for offset in range(N_CH):
                 idx = li * N_CH + offset
                 if idx >= len(self.inputs):
                     continue
                 inp = self.inputs[idx]
-                link_from = None
-                if parent_tree and hasattr(parent_tree, 'links'):
-                    for link in parent_tree.links:
-                        if link.to_node == self and link.to_socket == inp:
-                            link_from = link.from_socket
-                            break
+                link_from = link_from_by_socket.get(inp.as_pointer())
                 try:
                     default = tuple(inp.default_value)
                 except TypeError:
@@ -265,7 +257,7 @@ class BSDFStackNode(ShaderNodeCustomGroup):
                     'link_from': link_from, 'default': default,
                 }
 
-        # Snapshot collapse states per old layer: layer panel + each sub-panel
+        # Collapse states per old layer: layer panel + each sub-panel.
         old_layer_panels = [it for it in nt.interface.items_tree if _is_top_level_panel(it)]
         old_layer_closed = [bool(lp.default_closed) for lp in old_layer_panels]
         old_subpanel_closed = []  # list[dict[subpanel_name -> bool]]
@@ -276,21 +268,26 @@ class BSDFStackNode(ShaderNodeCustomGroup):
                     sub_states[child.name] = bool(child.default_closed)
             old_subpanel_closed.append(sub_states)
 
-        # ---- resolve old_to_new mapping (old layer index -> new) -----
-        if old_to_new is None:
-            new_to_old = {i: i for i in range(min(old_layer_count, len(self.layers)))}
-        else:
-            if isinstance(old_to_new, list):
-                pairs = enumerate(old_to_new)
-            else:
-                pairs = old_to_new.items()
-            new_to_old = {}
-            for old_i, new_i in pairs:
-                if new_i is None:
-                    continue
-                new_to_old[new_i] = old_i
+        return saved_sockets, old_layer_closed, old_subpanel_closed
 
-        # ---- wipe all inputs + panels (keep outputs) -----------------
+    def _resolve_layer_mapping(self, old_to_new, old_layer_count):
+        """Resolve old_to_new into a new-layer-index -> old-layer-index dict."""
+        if old_to_new is None:
+            return {i: i for i in range(min(old_layer_count, len(self.layers)))}
+        if isinstance(old_to_new, list):
+            pairs = enumerate(old_to_new)
+        else:
+            pairs = old_to_new.items()
+        new_to_old = {}
+        for old_i, new_i in pairs:
+            if new_i is None:
+                continue
+            new_to_old[new_i] = old_i
+        return new_to_old
+
+    def _clear_interface(self):
+        """Wipe all input sockets + panels (keep outputs)."""
+        nt = self.node_tree
         # Remove sockets first, then panels (leaf-up keeps the API happy).
         to_remove_sockets = [
             item for item in list(nt.interface.items_tree)
@@ -312,7 +309,9 @@ class BSDFStackNode(ShaderNodeCustomGroup):
             except Exception:
                 pass
 
-        # ---- rebuild: one layer panel + nested sub-panels per layer ---
+    def _rebuild_panels(self, new_to_old, old_layer_closed, old_subpanel_closed):
+        """Create one layer panel + nested sub-panels (and sockets) per layer."""
+        nt = self.node_tree
         for new_li, layer in enumerate(self.layers):
             old_li = new_to_old.get(new_li)
             layer_closed = (
@@ -360,7 +359,8 @@ class BSDFStackNode(ShaderNodeCustomGroup):
                     if ch[5]:
                         sock.hide_value = True
 
-        # ---- restore defaults + external links by channel name --------
+    def _restore_state(self, parent_tree, new_to_old, saved_sockets):
+        """Restore socket defaults + external links by channel name."""
         for new_li in range(len(self.layers)):
             old_li = new_to_old.get(new_li)
             base = new_li * N_CH
@@ -388,8 +388,6 @@ class BSDFStackNode(ShaderNodeCustomGroup):
                             inp.default_value = ch[2]
                         except Exception:
                             pass
-
-        self.rebuild_internals()
 
     def sync_panel_names(self):
         """Rename existing layer panels to match current layer names. Cheap, no rebuild."""
@@ -464,7 +462,10 @@ class BSDFStackNode(ShaderNodeCustomGroup):
                 factor = nt.nodes.new('ShaderNodeMath')
                 factor.operation = 'MULTIPLY'
                 factor.location = (-1000 + i * 220, y_base - 90)
-                factor.label = f"L{i} {ch_name} Factor"
+                # Stable name: update_layer_factors() looks factor nodes up
+                # by this name to adjust opacity/enabled without a rebuild.
+                factor.name = _factor_node_name(i, ch_name)
+                factor.label = factor.name
                 factor.inputs[0].default_value = (
                     layer.opacity if layer.enabled else 0.0
                 )
@@ -472,6 +473,7 @@ class BSDFStackNode(ShaderNodeCustomGroup):
 
                 mix = nt.nodes.new('ShaderNodeMix')
                 mix.data_type = mix_type
+                mix.name = _mix_node_name(i, ch_name)
                 mix.location = (-780 + i * 220, y_base)
 
                 if mix_type == "RGBA":
@@ -549,6 +551,54 @@ class BSDFStackNode(ShaderNodeCustomGroup):
 
         nt.links.new(bsdf.outputs["BSDF"], g_out.inputs[0])
         nt.update_tag()
+
+    def update_layer_factors(self, layer_index):
+        """Targeted in-place update for an opacity/enabled change.
+
+        Opacity/enabled only drive the factor Math nodes' first input (and,
+        for the Color channel, the blend_type baked in by rebuild_internals
+        while the layer was disabled). Updating those in place avoids the
+        full rebuild on every slider drag.
+
+        Returns True on success; False means the expected internal nodes
+        were not found and the caller should fall back to a full rebuild.
+        """
+        nt = self.node_tree
+        if nt is None or not (0 <= layer_index < len(self.layers)):
+            return False
+        layer = self.layers[layer_index]
+        factor_value = layer.opacity if layer.enabled else 0.0
+
+        updated = False
+        for ch_name, _sock_type, _default, _bsdf, mix_type, _hv in CHANNELS:
+            if mix_type is None:
+                continue
+            factor = nt.nodes.get(_factor_node_name(layer_index, ch_name))
+            if factor is None:
+                # Internal chain doesn't match expectations (e.g. tree built
+                # by an older version without stable names) — full rebuild.
+                return False
+            factor.inputs[0].default_value = factor_value
+            updated = True
+
+        # Keep the Color mix's blend_type in sync with rebuild_internals():
+        # a rebuild done while the layer was disabled bakes in 'MIX', which
+        # must be restored to the layer's blend mode on re-enable. Layer 0
+        # (the base layer) always uses 'MIX'.
+        if layer_index > 0:
+            mix = nt.nodes.get(_mix_node_name(layer_index, "Color"))
+            if mix is None:
+                return False
+            if layer.enabled:
+                mix.blend_type = layer.blend_mode
+                mix.label = f"L{layer_index} {layer.blend_mode}"
+            else:
+                mix.blend_type = 'MIX'
+                mix.label = f"L{layer_index} MIX"
+
+        if updated:
+            nt.update_tag()
+        return updated
 
     # ------------------------------------------------------------------
     # UI

@@ -20,13 +20,12 @@ from bpy.props import (
     BoolProperty,
     EnumProperty,
     FloatProperty,
-    IntProperty,
     StringProperty,
 )
 from bpy.types import PropertyGroup
 
 from .constants import BLEND_MODES
-from .utils import find_owner_node
+from .utils import find_owner_layer, find_owner_node
 
 
 def _on_layer_prop_changed(prop, context):
@@ -34,6 +33,20 @@ def _on_layer_prop_changed(prop, context):
     node = find_owner_node(prop)
     if node:
         node.rebuild_internals()
+
+
+def _on_layer_factor_changed(prop, context):
+    """Update factor nodes in place for opacity/enabled changes.
+
+    These properties only affect the internal factor Math nodes (and the
+    Color mix blend_type), so a full rebuild_internals() is avoided unless
+    the targeted update fails."""
+    node, layer_index = find_owner_layer(prop)
+    if node is None:
+        return
+    if hasattr(node, "update_layer_factors") and node.update_layer_factors(layer_index):
+        return
+    node.rebuild_internals()
 
 
 def _on_layer_name_changed(prop, context):
@@ -50,7 +63,7 @@ class StackLayerProperties(PropertyGroup):
         name="Layer Name",
         default="",
         description="Custom name for this layer",
-        update=lambda self, ctx: _on_layer_name_changed(self, ctx),
+        update=_on_layer_name_changed,
     )
 
     blend_mode: EnumProperty(
@@ -58,7 +71,7 @@ class StackLayerProperties(PropertyGroup):
         items=BLEND_MODES,
         default="MIX",
         description="How this layer blends with layers below",
-        update=lambda self, ctx: _on_layer_prop_changed(self, ctx),
+        update=_on_layer_prop_changed,
     )
 
     opacity: FloatProperty(
@@ -68,20 +81,12 @@ class StackLayerProperties(PropertyGroup):
         max=1.0,
         subtype='FACTOR',
         description="Layer opacity",
-        update=lambda self, ctx: _on_layer_prop_changed(self, ctx),
+        update=_on_layer_factor_changed,
     )
 
     enabled: BoolProperty(
         name="Enabled",
         default=True,
         description="Toggle this layer on/off",
-        update=lambda self, ctx: _on_layer_prop_changed(self, ctx),
+        update=_on_layer_factor_changed,
     )
-
-    collapsed: BoolProperty(
-        name="Collapsed",
-        default=False,
-        description="Collapse this layer's controls",
-    )
-
-    layer_index: IntProperty(name="Layer Index", default=0)

@@ -16,6 +16,7 @@ import bpy
 from bpy.props import EnumProperty, IntProperty, PointerProperty, StringProperty
 
 
+EXT_INTERACTIVITY = "KHR_interactivity"
 TREE_BL_IDNAME = "GLTFInteractivityTreeType"
 FLOW_SOCKET_BL_IDNAME = "GLTFFlowSocketType"
 
@@ -31,6 +32,57 @@ PREDEFINED_TYPES = [
     {"signature": "bool"},
     {"signature": "int"},
 ]
+
+
+# Single source of truth for the enum-property → JSON-pointer mapping shared
+# by the exporter (formats pointers with the resolved gltf index) and the
+# importer (derives its inverse matcher from the same templates).
+# Placeholders: {idx} = gltf array index, {sub} = sub-index (morph weight).
+POINTER_TEMPLATES: dict[str, dict[str, str]] = {
+    "OBJECT": {
+        "TRANSLATION_X": "/nodes/{idx}/translation/0",
+        "TRANSLATION_Y": "/nodes/{idx}/translation/1",
+        "TRANSLATION_Z": "/nodes/{idx}/translation/2",
+        "ROTATION_X":    "/nodes/{idx}/rotation/0",
+        "ROTATION_Y":    "/nodes/{idx}/rotation/1",
+        "ROTATION_Z":    "/nodes/{idx}/rotation/2",
+        "ROTATION_W":    "/nodes/{idx}/rotation/3",
+        "SCALE_X":       "/nodes/{idx}/scale/0",
+        "SCALE_Y":       "/nodes/{idx}/scale/1",
+        "SCALE_Z":       "/nodes/{idx}/scale/2",
+        "WEIGHT":        "/nodes/{idx}/weights/{sub}",
+        "VISIBLE":       "/nodes/{idx}/extensions/KHR_node_visibility/visible",
+    },
+    "MATERIAL": {
+        "BASE_COLOR_R":      "/materials/{idx}/pbrMetallicRoughness/baseColorFactor/0",
+        "BASE_COLOR_G":      "/materials/{idx}/pbrMetallicRoughness/baseColorFactor/1",
+        "BASE_COLOR_B":      "/materials/{idx}/pbrMetallicRoughness/baseColorFactor/2",
+        "BASE_COLOR_A":      "/materials/{idx}/pbrMetallicRoughness/baseColorFactor/3",
+        "METALLIC":          "/materials/{idx}/pbrMetallicRoughness/metallicFactor",
+        "ROUGHNESS":         "/materials/{idx}/pbrMetallicRoughness/roughnessFactor",
+        "EMISSIVE_R":        "/materials/{idx}/emissiveFactor/0",
+        "EMISSIVE_G":        "/materials/{idx}/emissiveFactor/1",
+        "EMISSIVE_B":        "/materials/{idx}/emissiveFactor/2",
+        "ALPHA_CUTOFF":      "/materials/{idx}/alphaCutoff",
+        "EMISSIVE_STRENGTH": "/materials/{idx}/extensions/KHR_materials_emissive_strength/emissiveStrength",
+    },
+    "LIGHT": {
+        "INTENSITY":  "/extensions/KHR_lights_punctual/lights/{idx}/intensity",
+        "COLOR_R":    "/extensions/KHR_lights_punctual/lights/{idx}/color/0",
+        "COLOR_G":    "/extensions/KHR_lights_punctual/lights/{idx}/color/1",
+        "COLOR_B":    "/extensions/KHR_lights_punctual/lights/{idx}/color/2",
+        "RANGE":      "/extensions/KHR_lights_punctual/lights/{idx}/range",
+        "INNER_CONE": "/extensions/KHR_lights_punctual/lights/{idx}/spot/innerConeAngle",
+        "OUTER_CONE": "/extensions/KHR_lights_punctual/lights/{idx}/spot/outerConeAngle",
+    },
+    "CAMERA": {
+        "YFOV":  "/cameras/{idx}/perspective/yfov",
+        "ZNEAR": "/cameras/{idx}/perspective/znear",
+        "ZFAR":  "/cameras/{idx}/perspective/zfar",
+        "XMAG":  "/cameras/{idx}/orthographic/xmag",
+        "YMAG":  "/cameras/{idx}/orthographic/ymag",
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +439,7 @@ class OBJECT_OT_gltf_interactivity_new(bpy.types.Operator):
         # anchor on — empty node trees default to an extreme zoom.
         seed = tree.nodes.new("GLTFNode_event_onStart")
         seed.location = (0, 0)
+        tree["gltf_seeded"] = True
         obj.gltf_interactivity = tree
 
         # Frame any open Interactivity editors on the new tree.
@@ -443,8 +496,13 @@ def _seed_empty_interactivity_trees(scene, depsgraph=None):
             continue
         if ng.nodes:
             continue
+        # Seed each tree at most once: a tree the user deliberately emptied
+        # must not have an "On Start" node resurrected on the next update.
+        if ng.get("gltf_seeded"):
+            continue
         seed = ng.nodes.new("GLTFNode_event_onStart")
         seed.location = (0, 0)
+        ng["gltf_seeded"] = True
 
 
 # ---------------------------------------------------------------------------

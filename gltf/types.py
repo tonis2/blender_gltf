@@ -276,6 +276,8 @@ class AnimationChannelTarget(GltfBase):
 class AnimationChannel(GltfBase):
     sampler: int = 0
     target: AnimationChannelTarget = field(default_factory=AnimationChannelTarget)
+    extensions: dict | None = None
+    extras: Any | None = None
 
 
 @dataclass
@@ -283,6 +285,8 @@ class AnimationSampler(GltfBase):
     input: int = 0
     output: int = 0
     interpolation: str | None = None
+    extensions: dict | None = None
+    extras: Any | None = None
 
 
 @dataclass

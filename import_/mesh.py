@@ -29,6 +29,10 @@ class MeshImporter:
         self.blender_meshes: dict[int, "bpy.types.Mesh"] = {}
         # Skin data: mesh_index -> list of (joints_array, weights_array, vertex_offset)
         self.skin_data: dict[int, list[tuple[np.ndarray, np.ndarray, int]]] = {}
+        # Meshes that already received shape keys (they are shared datablocks,
+        # so morph targets must only be applied once even when several nodes
+        # reference the same mesh).
+        self._morphed_meshes: set[int] = set()
 
     def import_all(self) -> None:
         if self.gltf.meshes is None:
@@ -45,10 +49,14 @@ class MeshImporter:
         all_verts: list[np.ndarray] = []
         all_loop_verts: list[np.ndarray] = []
         all_mat_indices: list[int] = []
+        # Entries carry the primitive's cumulative loop start so layer data can
+        # be written to the exact loop range even when primitives have
+        # heterogeneous attribute/layer sets.
         all_normals: list[tuple[int, np.ndarray, np.ndarray]] = []
         all_uvs: list[tuple[int, int, np.ndarray, np.ndarray]] = []
         all_colors: list[tuple[int, int, np.ndarray, np.ndarray]] = []
         vertex_offset = 0
+        loop_offset = 0
         num_uv_layers = 0
         num_color_layers = 0
 
@@ -77,7 +85,7 @@ class MeshImporter:
             if "NORMAL" in prim.attributes and self.settings.import_normals:
                 normals = self.buffer_reader.read_accessor(prim.attributes["NORMAL"])
                 normals = convert_normals(normals)
-                all_normals.append((vertex_offset, normals, indices))
+                all_normals.append((loop_offset, normals, indices))
 
             # UVs
             uv_idx = 0
@@ -85,7 +93,7 @@ class MeshImporter:
                 if self.settings.import_texcoords:
                     uvs = self.buffer_reader.read_accessor(prim.attributes[f"TEXCOORD_{uv_idx}"])
                     uvs = flip_uv_v(uvs)
-                    all_uvs.append((uv_idx, vertex_offset, uvs, indices))
+                    all_uvs.append((uv_idx, loop_offset, uvs, indices))
                 uv_idx += 1
             num_uv_layers = max(num_uv_layers, uv_idx)
 
@@ -94,7 +102,7 @@ class MeshImporter:
             while f"COLOR_{color_idx}" in prim.attributes:
                 if self.settings.import_colors:
                     colors = self.buffer_reader.read_accessor(prim.attributes[f"COLOR_{color_idx}"])
-                    all_colors.append((color_idx, vertex_offset, colors, indices))
+                    all_colors.append((color_idx, loop_offset, colors, indices))
                 color_idx += 1
             num_color_layers = max(num_color_layers, color_idx)
 
@@ -107,6 +115,7 @@ class MeshImporter:
                 self.skin_data[index].append((joints_acc, weights_acc, vertex_offset))
 
             vertex_offset += num_verts
+            loop_offset += len(indices)
 
         if not all_verts:
             return mesh
@@ -135,7 +144,6 @@ class MeshImporter:
             if prim.material is not None:
                 mat = self.material_importer.get_blender_material(prim.material)
             if mat is None:
-                import bpy
                 mat = bpy.data.materials.new(f"{name}_mat_{prim_idx}")
             mesh.materials.append(mat)
 
@@ -166,11 +174,8 @@ class MeshImporter:
     def _apply_normals(self, mesh, normal_data_list, num_loops: int) -> None:
         """Set custom split normals."""
         final_normals = np.zeros((num_loops, 3), dtype=np.float32)
-        loop_offset = 0
-        for _vert_offset, normals, indices in normal_data_list:
-            for i, idx in enumerate(indices):
-                final_normals[loop_offset + i] = normals[idx]
-            loop_offset += len(indices)
+        for loop_start, normals, indices in normal_data_list:
+            final_normals[loop_start : loop_start + len(indices)] = normals[indices]
 
         mesh.normals_split_custom_set(final_normals.tolist())
 
@@ -179,14 +184,10 @@ class MeshImporter:
         uv_layer = mesh.uv_layers.new(name=layer_name)
 
         loop_uvs = np.zeros((num_loops, 2), dtype=np.float32)
-        loop_offset = 0
-        for uv_layer_idx, _vert_offset, uvs, indices in all_uvs:
+        for uv_layer_idx, loop_start, uvs, indices in all_uvs:
             if uv_layer_idx != layer_idx:
-                loop_offset_skip = len(indices) if uv_layer_idx < layer_idx else 0
                 continue
-            for i, idx in enumerate(indices):
-                loop_uvs[loop_offset + i] = uvs[idx]
-            loop_offset += len(indices)
+            loop_uvs[loop_start : loop_start + len(indices)] = uvs[indices]
 
         uv_layer.uv.foreach_set("vector", loop_uvs.flatten())
 
@@ -198,18 +199,16 @@ class MeshImporter:
         )
 
         loop_colors = np.ones((num_loops, 4), dtype=np.float32)
-        loop_offset = 0
-        for color_layer_idx, _vert_offset, colors, indices in all_colors:
+        for color_layer_idx, loop_start, colors, indices in all_colors:
             if color_layer_idx != layer_idx:
                 continue
             # Handle VEC3 colors (no alpha) by padding with 1.0
             num_components = colors.shape[1] if colors.ndim > 1 else 1
-            for i, idx in enumerate(indices):
-                if num_components >= 4:
-                    loop_colors[loop_offset + i] = colors[idx]
-                elif num_components == 3:
-                    loop_colors[loop_offset + i, :3] = colors[idx]
-            loop_offset += len(indices)
+            n = len(indices)
+            if num_components >= 4:
+                loop_colors[loop_start : loop_start + n] = colors[indices, :4]
+            elif num_components == 3:
+                loop_colors[loop_start : loop_start + n, :3] = colors[indices]
 
         color_attr.data.foreach_set("color", loop_colors.flatten())
 
@@ -219,10 +218,18 @@ class MeshImporter:
         mesh_index: int,
         gltf_mesh: "GltfMesh",
     ) -> None:
-        """Apply morph targets to an object. Called after object creation."""
+        """Apply morph targets to an object. Called after object creation.
+
+        Shape keys live on the shared mesh datablock, so when several nodes
+        reference the same mesh this must only run once.
+        """
+        if mesh_index in self._morphed_meshes:
+            return
+
         first_prim = gltf_mesh.primitives[0]
         if not first_prim.targets:
             return
+        self._morphed_meshes.add(mesh_index)
 
         num_targets = len(first_prim.targets)
         mesh = obj.data

@@ -30,6 +30,8 @@ class NODE_MT_stack_custom(Menu):
 
 
 def stack_menu_draw(self, context):
-    if context.space_data.tree_type == 'ShaderNodeTree':
-        self.layout.separator()
-        self.layout.menu("NODE_MT_stack_custom", icon='NODE_COMPOSITING')
+    space = context.space_data
+    if space is None or getattr(space, "tree_type", "") != 'ShaderNodeTree':
+        return
+    self.layout.separator()
+    self.layout.menu("NODE_MT_stack_custom", icon='NODE_COMPOSITING')

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ..gltf.constants import TextureFilter, TextureWrap
+from ..layer_node.constants import N_CH, CH_TO_IDX, BLEND_MODES
 
 if TYPE_CHECKING:
     import bpy
@@ -14,18 +15,8 @@ if TYPE_CHECKING:
 EXT_MATERIALS_LAYERS = "CUSTOM_materials_layers"
 BSDF_STACK_NODE_IDNAME = "BSDFStackNodeType"
 
-# BSDFStackNode per-layer input layout — keep in sync with
-# layer_node/bsdf_node.py CHANNELS and export/material.py.
-_N_CH = 10
-_CH = {
-    "Color": 0, "Mask": 1, "Normal": 2, "Roughness": 3, "Metallic": 4,
-    "Alpha": 5, "Emission Color": 6, "Emission Strength": 7,
-    "Subsurface Weight": 8, "Subsurface Radius": 9,
-}
-_VALID_BLEND_MODES = {
-    "MIX", "MULTIPLY", "ADD", "SUBTRACT", "SCREEN", "OVERLAY",
-    "SOFT_LIGHT", "DIFFERENCE", "DARKEN", "LIGHTEN",
-}
+# Valid CUSTOM_materials_layers blend mode ids, derived from the shared table.
+_VALID_BLEND_MODES = {m[0] for m in BLEND_MODES}
 
 
 class MaterialImporter:
@@ -93,14 +84,13 @@ class MaterialImporter:
             elif gltf_mat.normal_texture:
                 self._apply_normal_texture(tree, principled, gltf_mat.normal_texture)
 
-            if gltf_mat.emissive_factor:
-                r, g, b = gltf_mat.emissive_factor
-                strength = max(r, g, b)
-                if strength > 0:
-                    principled.inputs["Emission Color"].default_value = (
-                        r / strength, g / strength, b / strength, 1.0,
-                    )
-                    principled.inputs["Emission Strength"].default_value = strength
+            split = self._split_emissive(
+                gltf_mat.emissive_factor, self._emissive_strength_mult(gltf_mat),
+            )
+            if split is not None:
+                color, strength = split
+                principled.inputs["Emission Color"].default_value = color
+                principled.inputs["Emission Strength"].default_value = strength
 
             if gltf_mat.emissive_texture:
                 self._apply_texture(tree, principled, "Emission Color", gltf_mat.emissive_texture, y_offset=-400)
@@ -204,63 +194,32 @@ class MaterialImporter:
         tree.links.new(mul.outputs["Value"], to_socket)
 
     def _apply_texture(self, tree, principled, socket_name, texture_info, y_offset=0) -> None:
-        if self.gltf.textures is None:
+        """Wire a color texture into `socket_name`. Builds the Image Texture
+        node (with sampler + KHR_texture_transform) via _make_texture_node so
+        the node-creation path is uniform across all texture slots."""
+        tex_node = self._make_texture_node(
+            tree, self._ti_to_dict(texture_info), principled, (-400, y_offset),
+        )
+        if tex_node is None:
             return
-        tex_index = texture_info.index
-        if tex_index >= len(self.gltf.textures):
-            return
-        gltf_texture = self.gltf.textures[tex_index]
-        if gltf_texture.source is None:
-            return
-
-        img = self.texture_importer.get_blender_image(gltf_texture.source)
-        if img is None:
-            return
-
-        tex_node = tree.nodes.new("ShaderNodeTexImage")
-        tex_node.image = img
-        tex_node.location = (-400, y_offset)
-
-        if gltf_texture.sampler is not None and self.gltf.samplers:
-            sampler = self.gltf.samplers[gltf_texture.sampler]
-            if sampler.mag_filter == TextureFilter.NEAREST:
-                tex_node.interpolation = "Closest"
-            else:
-                tex_node.interpolation = "Linear"
-            if sampler.wrap_s == TextureWrap.CLAMP_TO_EDGE:
-                tex_node.extension = "EXTEND"
-            else:
-                tex_node.extension = "REPEAT"
-
-        self._apply_texture_transform(tree, tex_node, texture_info)
-
         tree.links.new(tex_node.outputs["Color"], principled.inputs[socket_name])
 
     def _apply_normal_texture(self, tree, principled, normal_info) -> None:
-        if self.gltf.textures is None:
+        """Wire a normal texture through a Normal Map node into Principled.Normal.
+        Built on _make_texture_node so the sampler + KHR_texture_transform block
+        is handled uniformly (it was previously missing here)."""
+        tex_node = self._make_texture_node(
+            tree, self._ti_to_dict(normal_info), principled, (-600, -600),
+            non_color=True,
+        )
+        if tex_node is None:
             return
-        tex_index = normal_info.index
-        if tex_index >= len(self.gltf.textures):
-            return
-        gltf_texture = self.gltf.textures[tex_index]
-        if gltf_texture.source is None:
-            return
-
-        img = self.texture_importer.get_blender_image(gltf_texture.source)
-        if img is None:
-            return
-
-        tex_node = tree.nodes.new("ShaderNodeTexImage")
-        tex_node.image = img
-        tex_node.image.colorspace_settings.name = "Non-Color"
-        tex_node.location = (-600, -600)
 
         normal_map = tree.nodes.new("ShaderNodeNormalMap")
         normal_map.location = (-300, -600)
-        if normal_info.scale is not None:
-            normal_map.inputs["Strength"].default_value = normal_info.scale
-
-        self._apply_texture_transform(tree, tex_node, normal_info)
+        scale = getattr(normal_info, "scale", None)
+        if scale is not None:
+            normal_map.inputs["Strength"].default_value = scale
 
         tree.links.new(tex_node.outputs["Color"], normal_map.inputs["Color"])
         tree.links.new(normal_map.outputs["Normal"], principled.inputs["Normal"])
@@ -303,40 +262,16 @@ class MaterialImporter:
         tree.links.new(bump.outputs["Normal"], principled.inputs["Normal"])
 
     def _apply_texture_transform(self, tree, tex_node, texture_info) -> None:
-        """Create Mapping + Texture Coordinate nodes for KHR_texture_transform."""
-        if not hasattr(texture_info, "extensions") or not texture_info.extensions:
+        """Create Mapping + Texture Coordinate nodes for KHR_texture_transform,
+        extracting the transform dict off a TextureInfo dataclass and delegating
+        to the dict-based implementation."""
+        extensions = getattr(texture_info, "extensions", None)
+        if not extensions:
             return
-        transform = texture_info.extensions.get("KHR_texture_transform")
+        transform = extensions.get("KHR_texture_transform")
         if transform is None:
             return
-
-        offset = transform.get("offset", [0.0, 0.0])
-        rotation = transform.get("rotation", 0.0)
-        scale = transform.get("scale", [1.0, 1.0])
-
-        # Convert glTF UV space back to Blender UV space (V is flipped)
-        # offset_y_blender = 1 - scale_y_gltf - offset_y_gltf
-        # rotation_blender = -rotation_gltf
-        bl_offset_x = offset[0]
-        bl_offset_y = 1.0 - scale[1] - offset[1]
-        bl_rotation = -rotation
-        bl_scale_x = scale[0]
-        bl_scale_y = scale[1]
-
-        tex_x = tex_node.location[0]
-        tex_y = tex_node.location[1]
-
-        mapping = tree.nodes.new("ShaderNodeMapping")
-        mapping.location = (tex_x - 200, tex_y)
-        mapping.inputs["Location"].default_value = (bl_offset_x, bl_offset_y, 0.0)
-        mapping.inputs["Rotation"].default_value = (0.0, 0.0, bl_rotation)
-        mapping.inputs["Scale"].default_value = (bl_scale_x, bl_scale_y, 1.0)
-
-        tex_coord = tree.nodes.new("ShaderNodeTexCoord")
-        tex_coord.location = (tex_x - 400, tex_y)
-
-        tree.links.new(tex_coord.outputs["UV"], mapping.inputs["Vector"])
-        tree.links.new(mapping.outputs["Vector"], tex_node.inputs["Vector"])
+        self._apply_texture_transform_dict(tree, tex_node, transform)
 
     # ------------------------------------------------------------------
     # CUSTOM_materials_layers — rebuild a BSDFStackNode
@@ -357,9 +292,8 @@ class MaterialImporter:
         # Grow to `total`, then rebuild the whole socket interface once. These
         # rebuilds run synchronously on the main thread — that is safe here (the
         # deferred app-timer path in bsdf_node.py only guards live UI edits).
-        for j in range(1, total):
-            layer = node.layers.add()
-            layer.layer_index = j
+        for _j in range(1, total):
+            node.layers.add()
         node.rebuild_group(old_to_new=None)
 
         layer_dicts = [self._base_layer_dict(gltf_mat, ext)] + list(ext_layers)
@@ -413,6 +347,37 @@ class MaterialImporter:
         return ld
 
     @staticmethod
+    def _split_emissive(emissive_factor, strength_mult=1.0):
+        """Split a glTF emissiveFactor into a Blender (Emission Color rgba,
+        Emission Strength) pair. glTF folds intensity into the factor (which is
+        clamped <= 1 on export), so we factor the brightest channel back out as
+        the strength. KHR_materials_emissive_strength carries the part of the
+        intensity that exceeded 1; `strength_mult` (its emissiveStrength) scales
+        the recovered strength so HDR emission is restored.
+
+        Returns (color_rgba, strength) or None when there is no emission.
+        """
+        if not emissive_factor or len(emissive_factor) < 3:
+            return None
+        r, g, b = emissive_factor[0], emissive_factor[1], emissive_factor[2]
+        peak = max(r, g, b)
+        if peak > 0:
+            color = (r / peak, g / peak, b / peak, 1.0)
+            return color, peak * strength_mult
+        # All-zero factor: no light, but preserve the (zero) color.
+        return (r, g, b, 1.0), 0.0
+
+    @staticmethod
+    def _emissive_strength_mult(gltf_mat) -> float:
+        """KHR_materials_emissive_strength.emissiveStrength multiplier (1.0 when
+        the extension is absent)."""
+        ext = gltf_mat.extensions or {}
+        es = ext.get("KHR_materials_emissive_strength")
+        if es and es.get("emissiveStrength") is not None:
+            return float(es["emissiveStrength"])
+        return 1.0
+
+    @staticmethod
     def _ti_to_dict(ti):
         """Coerce a TextureInfo/NormalTextureInfo dataclass (or dict) to a
         plain textureInfo dict that _make_texture_node understands.
@@ -431,7 +396,7 @@ class MaterialImporter:
         return d
 
     def _stack_socket(self, node, i, channel_name):
-        idx = i * _N_CH + _CH[channel_name]
+        idx = i * N_CH + CH_TO_IDX[channel_name]
         if 0 <= idx < len(node.inputs):
             return node.inputs[idx]
         return None
@@ -471,20 +436,17 @@ class MaterialImporter:
             layer.get("heightTexture"), layer.get("bump"), (-500, -400),
         )
 
-        ef = layer.get("emissiveFactor")
-        if ef and len(ef) >= 3:
-            strength = max(ef[0], ef[1], ef[2])
+        # Layer emission: the exporter bakes full intensity into emissiveFactor
+        # (no per-layer KHR_materials_emissive_strength), so split with mult=1.
+        split = self._split_emissive(layer.get("emissiveFactor"))
+        if split is not None:
+            color, strength = split
             ec = self._stack_socket(node, i, "Emission Color")
             es = self._stack_socket(node, i, "Emission Strength")
-            if strength > 0:
-                if ec is not None:
-                    ec.default_value = (
-                        ef[0] / strength, ef[1] / strength, ef[2] / strength, 1.0,
-                    )
-                if es is not None:
-                    es.default_value = strength
-            elif ec is not None:
-                ec.default_value = (ef[0], ef[1], ef[2], 1.0)
+            if ec is not None:
+                ec.default_value = color
+            if es is not None:
+                es.default_value = strength
         self._link_stack_texture(
             tree, node, i, "Emission Color", layer.get("emissiveTexture"), (-500, -600),
         )
@@ -681,7 +643,10 @@ class MaterialImporter:
 
         tex_node = tree.nodes.new("ShaderNodeTexImage")
         tex_node.image = img
-        if non_color:
+        # Only force Non-Color when the image didn't carry an explicit
+        # colorspace hint on export; otherwise we'd clobber the round-tripped
+        # setting and corrupt images shared between color and non-color slots.
+        if non_color and gltf_tex.source not in self.texture_importer.hinted_images:
             tex_node.image.colorspace_settings.name = "Non-Color"
         tex_node.location = (
             anchor_node.location[0] + offset[0],

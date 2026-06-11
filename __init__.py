@@ -34,14 +34,18 @@ from .import_ import (
 
 if _needs_reload:
     import importlib
-    exporter = importlib.reload(exporter)
-    operator = importlib.reload(operator)
-    layer_node = importlib.reload(layer_node)
-    interactivity_nodes = importlib.reload(interactivity_nodes)
+
+    # Reload order matters: leaf modules first so that dependents reloaded
+    # below rebind to the fresh classes instead of stale ones.
     constants = importlib.reload(constants)
     types = importlib.reload(types)
     buffer = importlib.reload(buffer)
     serialize = importlib.reload(serialize)
+    # Shared node tables used by the export/import submodules. layer_node is
+    # a package whose __init__ deep-reloads its own submodules on re-execution.
+    interactivity_nodes = importlib.reload(interactivity_nodes)
+    layer_node = importlib.reload(layer_node)
+    # Export submodules
     converter = importlib.reload(converter)
     mesh = importlib.reload(mesh)
     material = importlib.reload(material)
@@ -54,7 +58,7 @@ if _needs_reload:
     interactivity = importlib.reload(interactivity)
     quantize = importlib.reload(quantize)
     audio = importlib.reload(audio)
-    importer = importlib.reload(importer)
+    # Import submodules
     import_converter = importlib.reload(import_converter)
     buffer_reader = importlib.reload(buffer_reader)
     import_mesh = importlib.reload(import_mesh)
@@ -67,6 +71,11 @@ if _needs_reload:
     import_particles = importlib.reload(import_particles)
     import_interactivity = importlib.reload(import_interactivity)
     import_audio = importlib.reload(import_audio)
+    # Top-level modules bind classes from the submodules above at import
+    # time, so they must reload after them. operator binds from both.
+    exporter = importlib.reload(exporter)
+    importer = importlib.reload(importer)
+    operator = importlib.reload(operator)
 
 
 def register():

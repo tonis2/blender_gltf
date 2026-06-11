@@ -151,73 +151,205 @@ class PHYSICS_PT_khr_physics(bpy.types.Panel):
         col.prop(props, "restitution_combine")
 
 
-_EXPORT_PROPS = (
-    "export_format",
-    "export_normals",
-    "export_texcoords",
-    "export_tangents",
-    "export_quantization",
-    "export_materials",
-    "export_colors",
-    "export_animations",
-    "export_animation_events",
-    "export_morph_targets",
-    "export_gpu_instancing",
-    "export_lods",
-    "export_skinning",
-    "export_physics",
-    "export_extras",
-    "export_particles",
-    "export_interactivity",
-    "export_audio",
-    "export_only_visible",
-    "export_all_scenes",
-    "export_camera_y_up",
-    "image_format",
+# Single source of truth for every export option shared between the operator
+# and the per-scene settings group. bpy property definitions are one-shot
+# descriptors, so each class gets fresh instances built from these
+# (constructor, kwargs) pairs — see the __annotations__ injection below.
+_EXPORT_PROP_DEFS: dict[str, tuple] = {
+    "export_format": (EnumProperty, dict(
+        name="Format",
+        items=[
+            ("GLB", "glTF Binary (.glb)", "Export as a single binary file"),
+            ("GLTF_SEPARATE", "glTF Separate (.gltf + .bin)", "Export as separate JSON and binary files"),
+            ("GLTF_EMBEDDED", "glTF Embedded (.gltf)", "Export as a single .gltf with binary data embedded as base64"),
+        ],
+        default="GLB",
+    )),
+    "export_normals": (BoolProperty, dict(
+        name="Normals",
+        description="Export vertex normals",
+        default=True,
+    )),
+    "export_texcoords": (BoolProperty, dict(
+        name="UVs",
+        description="Export UV coordinates",
+        default=True,
+    )),
+    "export_tangents": (BoolProperty, dict(
+        name="Tangents",
+        description="Export MikkTSpace vertex tangents (requires Normals and UVs)",
+        default=False,
+    )),
+    "export_quantization": (BoolProperty, dict(
+        name="Quantize Attributes",
+        description=(
+            "Compress vertex data with KHR_mesh_quantization (16-bit "
+            "positions/UVs, 8-bit normals/tangents). Smaller files and "
+            "less GPU memory; slight precision loss on very glossy surfaces"
+        ),
+        default=False,
+    )),
+    "export_materials": (BoolProperty, dict(
+        name="Materials",
+        description="Export PBR materials",
+        default=True,
+    )),
+    "export_colors": (BoolProperty, dict(
+        name="Vertex Colors",
+        description="Export vertex colors",
+        default=True,
+    )),
+    "export_animations": (BoolProperty, dict(
+        name="Animations",
+        description="Export keyframe animations",
+        default=True,
+    )),
+    "export_animation_events": (BoolProperty, dict(
+        name="Animation Events",
+        description="Export action pose markers as timed events (CUSTOM_animation_events)",
+        default=True,
+    )),
+    "export_morph_targets": (BoolProperty, dict(
+        name="Shape Keys",
+        description="Export shape keys as morph targets",
+        default=True,
+    )),
+    "export_gpu_instancing": (BoolProperty, dict(
+        name="GPU Instancing",
+        description="Export collection instances using EXT_mesh_gpu_instancing",
+        default=True,
+    )),
+    "export_lods": (BoolProperty, dict(
+        name="LODs (MSFT_lod)",
+        description=(
+            "Group sibling objects named Base_LOD0, Base_LOD1, ... into "
+            "MSFT_lod levels of detail on the LOD0 node"
+        ),
+        default=True,
+    )),
+    "export_skinning": (BoolProperty, dict(
+        name="Skinning",
+        description="Export armatures and bone weights",
+        default=True,
+    )),
+    "export_physics": (BoolProperty, dict(
+        name="Physics",
+        description="Export rigid bodies and collision shapes",
+        default=True,
+    )),
+    "export_extras": (BoolProperty, dict(
+        name="Custom Properties",
+        description="Export object custom properties as glTF node extras",
+        default=True,
+    )),
+    "export_particles": (BoolProperty, dict(
+        name="Particles",
+        description="Export particle system settings as CUSTOM_particle_emitter",
+        default=True,
+    )),
+    "export_interactivity": (BoolProperty, dict(
+        name="Interactivity",
+        description="Export per-object behavior graphs as KHR_interactivity",
+        default=True,
+    )),
+    "export_audio": (BoolProperty, dict(
+        name="Audio",
+        description="Export speaker objects as KHR_audio_emitter",
+        default=True,
+    )),
+    "export_only_visible": (BoolProperty, dict(
+        name="Only Visible",
+        description="Only export objects that are visible in the viewport",
+        default=False,
+    )),
+    "export_all_scenes": (BoolProperty, dict(
+        name="All Scenes",
+        description="Export all Blender scenes into a single glTF file",
+        default=False,
+    )),
+    "export_camera_y_up": (BoolProperty, dict(
+        name="Cameras Y-Up",
+        description=(
+            "Apply a -90° X-axis fix-up to camera nodes so their forward "
+            "direction matches the glTF Y-up convention. Disable for tools "
+            "that expect Blender's raw camera orientation"
+        ),
+        default=True,
+    )),
+    "image_format": (EnumProperty, dict(
+        name="Image Format",
+        description="Format for exported textures",
+        items=[
+            ("AUTO", "Auto", "Keep the original image format"),
+            ("JPEG", "JPEG", "Export all textures as JPEG"),
+            ("PNG", "PNG", "Export all textures as PNG"),
+        ],
+        default="AUTO",
+    )),
+}
+
+_EXPORT_PROPS = tuple(_EXPORT_PROP_DEFS)
+
+
+def _make_export_props() -> dict:
+    """Build fresh property instances (definitions must not be shared across classes)."""
+    return {name: ctor(**kwargs) for name, (ctor, kwargs) in _EXPORT_PROP_DEFS.items()}
+
+
+# Collapsible panel layout for the export/import file browser sidebars:
+# (panel_id, label, prop_names). Panel ids persist open/closed state.
+_EXPORT_PANELS = (
+    ("GLTF_export_mesh", "Mesh", (
+        "export_normals",
+        "export_texcoords",
+        "export_tangents",
+        "export_colors",
+        "export_quantization",
+    )),
+    ("GLTF_export_material", "Material", ("export_materials", "image_format")),
+    ("GLTF_export_animation", "Animation", (
+        "export_animations",
+        "export_animation_events",
+        "export_morph_targets",
+    )),
+    ("GLTF_export_skinning", "Skinning", ("export_skinning",)),
+    ("GLTF_export_instancing", "Instancing", ("export_gpu_instancing",)),
+    ("GLTF_export_lod", "LOD", ("export_lods",)),
+    ("GLTF_export_cameras", "Cameras", ("export_camera_y_up",)),
+    ("GLTF_export_physics", "Physics", ("export_physics",)),
+    ("GLTF_export_particles", "Particles", ("export_particles",)),
+    ("GLTF_export_interactivity", "Interactivity", ("export_interactivity",)),
+    ("GLTF_export_audio", "Audio", ("export_audio",)),
+    ("GLTF_export_extras", "Extras", ("export_extras",)),
+)
+
+_IMPORT_PANELS = (
+    ("GLTF_import_mesh", "Mesh", ("import_normals", "import_texcoords", "import_colors")),
+    ("GLTF_import_material", "Material", ("import_materials",)),
+    ("GLTF_import_animation", "Animation", ("import_animations", "import_morph_targets")),
+    ("GLTF_import_skinning", "Skinning", ("import_skinning",)),
+    ("GLTF_import_physics", "Physics", ("import_physics",)),
+    ("GLTF_import_particles", "Particles", ("import_particles",)),
+    ("GLTF_import_interactivity", "Interactivity", ("import_interactivity",)),
+    ("GLTF_import_audio", "Audio", ("import_audio",)),
 )
 
 
-class GltfExportSceneSettings(bpy.types.PropertyGroup):
-    """Export settings stored per scene, persisted with the .blend file."""
+def _draw_panels(layout, owner, panels):
+    """Draw collapsible panels from a (panel_id, label, prop_names) table."""
+    for panel_id, label, prop_names in panels:
+        header, body = layout.panel(panel_id, default_closed=True)
+        header.label(text=label)
+        if body:
+            for prop in prop_names:
+                body.prop(owner, prop)
 
-    export_format: EnumProperty(
-        name="Format",
-        items=[
-            ("GLB", "glTF Binary (.glb)", ""),
-            ("GLTF_SEPARATE", "glTF Separate (.gltf + .bin)", ""),
-            ("GLTF_EMBEDDED", "glTF Embedded (.gltf)", ""),
-        ],
-        default="GLB",
-    )
-    export_normals: BoolProperty(name="Normals", default=True)
-    export_texcoords: BoolProperty(name="UVs", default=True)
-    export_tangents: BoolProperty(name="Tangents", default=False)
-    export_quantization: BoolProperty(name="Quantize Attributes", default=False)
-    export_materials: BoolProperty(name="Materials", default=True)
-    export_colors: BoolProperty(name="Vertex Colors", default=True)
-    export_animations: BoolProperty(name="Animations", default=True)
-    export_animation_events: BoolProperty(name="Animation Events", default=True)
-    export_morph_targets: BoolProperty(name="Shape Keys", default=True)
-    export_gpu_instancing: BoolProperty(name="GPU Instancing", default=True)
-    export_lods: BoolProperty(name="LODs (MSFT_lod)", default=True)
-    export_skinning: BoolProperty(name="Skinning", default=True)
-    export_physics: BoolProperty(name="Physics", default=True)
-    export_extras: BoolProperty(name="Custom Properties", default=True)
-    export_particles: BoolProperty(name="Particles", default=True)
-    export_interactivity: BoolProperty(name="Interactivity", default=True)
-    export_audio: BoolProperty(name="Audio", default=True)
-    export_only_visible: BoolProperty(name="Only Visible", default=False)
-    export_all_scenes: BoolProperty(name="All Scenes", default=False)
-    export_camera_y_up: BoolProperty(name="Cameras Y-Up", default=True)
-    image_format: EnumProperty(
-        name="Image Format",
-        items=[
-            ("AUTO", "Auto", ""),
-            ("JPEG", "JPEG", ""),
-            ("PNG", "PNG", ""),
-        ],
-        default="AUTO",
-    )
+
+class GltfExportSceneSettings(bpy.types.PropertyGroup):
+    """Export settings stored per scene, persisted with the .blend file.
+
+    Export properties are injected from _EXPORT_PROP_DEFS below.
+    """
 
 
 class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
@@ -233,157 +365,7 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         options={"HIDDEN"},
     )
 
-    export_format: EnumProperty(
-        name="Format",
-        items=[
-            ("GLB", "glTF Binary (.glb)", "Export as a single binary file"),
-            ("GLTF_SEPARATE", "glTF Separate (.gltf + .bin)", "Export as separate JSON and binary files"),
-            ("GLTF_EMBEDDED", "glTF Embedded (.gltf)", "Export as a single .gltf with binary data embedded as base64"),
-        ],
-        default="GLB",
-    )
-
-    export_normals: BoolProperty(
-        name="Normals",
-        description="Export vertex normals",
-        default=True,
-    )
-
-    export_texcoords: BoolProperty(
-        name="UVs",
-        description="Export UV coordinates",
-        default=True,
-    )
-
-    export_tangents: BoolProperty(
-        name="Tangents",
-        description="Export MikkTSpace vertex tangents (requires Normals and UVs)",
-        default=False,
-    )
-
-    export_quantization: BoolProperty(
-        name="Quantize Attributes",
-        description=(
-            "Compress vertex data with KHR_mesh_quantization (16-bit "
-            "positions/UVs, 8-bit normals/tangents). Smaller files and "
-            "less GPU memory; slight precision loss on very glossy surfaces"
-        ),
-        default=False,
-    )
-
-    export_materials: BoolProperty(
-        name="Materials",
-        description="Export PBR materials",
-        default=True,
-    )
-
-    export_colors: BoolProperty(
-        name="Vertex Colors",
-        description="Export vertex colors",
-        default=True,
-    )
-
-    export_animations: BoolProperty(
-        name="Animations",
-        description="Export keyframe animations",
-        default=True,
-    )
-
-    export_animation_events: BoolProperty(
-        name="Animation Events",
-        description="Export action pose markers as timed events (CUSTOM_animation_events)",
-        default=True,
-    )
-
-    export_morph_targets: BoolProperty(
-        name="Shape Keys",
-        description="Export shape keys as morph targets",
-        default=True,
-    )
-
-    export_gpu_instancing: BoolProperty(
-        name="GPU Instancing",
-        description="Export collection instances using EXT_mesh_gpu_instancing",
-        default=True,
-    )
-
-    export_lods: BoolProperty(
-        name="LODs (MSFT_lod)",
-        description=(
-            "Group sibling objects named Base_LOD0, Base_LOD1, ... into "
-            "MSFT_lod levels of detail on the LOD0 node"
-        ),
-        default=True,
-    )
-
-    export_skinning: BoolProperty(
-        name="Skinning",
-        description="Export armatures and bone weights",
-        default=True,
-    )
-
-    export_physics: BoolProperty(
-        name="Physics",
-        description="Export rigid bodies and collision shapes",
-        default=True,
-    )
-
-    export_extras: BoolProperty(
-        name="Custom Properties",
-        description="Export object custom properties as glTF node extras",
-        default=True,
-    )
-
-    export_particles: BoolProperty(
-        name="Particles",
-        description="Export particle system settings as CUSTOM_particle_emitter",
-        default=True,
-    )
-
-    export_interactivity: BoolProperty(
-        name="Interactivity",
-        description="Export per-object behavior graphs as KHR_interactivity",
-        default=True,
-    )
-
-    export_audio: BoolProperty(
-        name="Audio",
-        description="Export speaker objects as KHR_audio_emitter",
-        default=True,
-    )
-
-    export_only_visible: BoolProperty(
-        name="Only Visible",
-        description="Only export objects that are visible in the viewport",
-        default=False,
-    )
-
-    export_all_scenes: BoolProperty(
-        name="All Scenes",
-        description="Export all Blender scenes into a single glTF file",
-        default=False,
-    )
-
-    export_camera_y_up: BoolProperty(
-        name="Cameras Y-Up",
-        description=(
-            "Apply a -90° X-axis fix-up to camera nodes so their forward "
-            "direction matches the glTF Y-up convention. Disable for tools "
-            "that expect Blender's raw camera orientation"
-        ),
-        default=True,
-    )
-
-    image_format: EnumProperty(
-        name="Image Format",
-        description="Format for exported textures",
-        items=[
-            ("AUTO", "Auto", "Keep the original image format"),
-            ("JPEG", "JPEG", "Export all textures as JPEG"),
-            ("PNG", "PNG", "Export all textures as PNG"),
-        ],
-        default="AUTO",
-    )
+    # Export properties are injected from _EXPORT_PROP_DEFS below.
 
     def invoke(self, context, event):
         # Load saved settings from the scene
@@ -400,28 +382,7 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
 
         settings = ExportSettings(
             filepath=self.filepath,
-            format=self.export_format,
-            export_normals=self.export_normals,
-            export_texcoords=self.export_texcoords,
-            export_tangents=self.export_tangents,
-            export_quantization=self.export_quantization,
-            export_materials=self.export_materials,
-            export_colors=self.export_colors,
-            export_animations=self.export_animations,
-            export_animation_events=self.export_animation_events,
-            export_morph_targets=self.export_morph_targets,
-            export_gpu_instancing=self.export_gpu_instancing,
-            export_lods=self.export_lods,
-            export_skinning=self.export_skinning,
-            export_physics=self.export_physics,
-            export_extras=self.export_extras,
-            export_particles=self.export_particles,
-            export_interactivity=self.export_interactivity,
-            export_audio=self.export_audio,
-            export_only_visible=self.export_only_visible,
-            export_all_scenes=self.export_all_scenes,
-            export_camera_y_up=self.export_camera_y_up,
-            image_format=self.image_format,
+            **{prop: getattr(self, prop) for prop in _EXPORT_PROPS},
         )
 
         try:
@@ -443,72 +404,7 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         layout.prop(self, "export_only_visible")
         layout.prop(self, "export_all_scenes")
 
-        header, body = layout.panel("GLTF_export_mesh", default_closed=True)
-        header.label(text="Mesh")
-        if body:
-            body.prop(self, "export_normals")
-            body.prop(self, "export_texcoords")
-            body.prop(self, "export_tangents")
-            body.prop(self, "export_colors")
-            body.prop(self, "export_quantization")
-
-        header, body = layout.panel("GLTF_export_material", default_closed=True)
-        header.label(text="Material")
-        if body:
-            body.prop(self, "export_materials")
-            body.prop(self, "image_format")
-
-        header, body = layout.panel("GLTF_export_animation", default_closed=True)
-        header.label(text="Animation")
-        if body:
-            body.prop(self, "export_animations")
-            body.prop(self, "export_animation_events")
-            body.prop(self, "export_morph_targets")
-
-        header, body = layout.panel("GLTF_export_skinning", default_closed=True)
-        header.label(text="Skinning")
-        if body:
-            body.prop(self, "export_skinning")
-
-        header, body = layout.panel("GLTF_export_instancing", default_closed=True)
-        header.label(text="Instancing")
-        if body:
-            body.prop(self, "export_gpu_instancing")
-
-        header, body = layout.panel("GLTF_export_lod", default_closed=True)
-        header.label(text="LOD")
-        if body:
-            body.prop(self, "export_lods")
-
-        header, body = layout.panel("GLTF_export_cameras", default_closed=True)
-        header.label(text="Cameras")
-        if body:
-            body.prop(self, "export_camera_y_up")
-
-        header, body = layout.panel("GLTF_export_physics", default_closed=True)
-        header.label(text="Physics")
-        if body:
-            body.prop(self, "export_physics")
-
-        header, body = layout.panel("GLTF_export_particles", default_closed=True)
-        header.label(text="Particles")
-        if body:
-            body.prop(self, "export_particles")
-
-        header, body = layout.panel("GLTF_export_interactivity", default_closed=True)
-        header.label(text="Interactivity")
-        if body:
-            body.prop(self, "export_interactivity")
-
-        header, body = layout.panel("GLTF_export_audio", default_closed=True)
-        header.label(text="Audio")
-        if body:
-            body.prop(self, "export_audio")
-
-        header, body = layout.panel("GLTF_export_extras", default_closed=True)
-        header.label(text="Extras")
-        if body:
-            body.prop(self, "export_extras")
+        _draw_panels(layout, self, _EXPORT_PANELS)
 
     def check(self, context):
         # Update file extension based on format
@@ -526,6 +422,16 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
                 self.filepath = base + self.filename_ext
                 return True
         return False
+
+
+# Inject the shared export properties into both classes. Must run at module
+# level, before register(); each class gets its own fresh instances.
+for _cls in (GltfExportSceneSettings, EXPORT_SCENE_OT_gltf):
+    _cls.__annotations__ = {
+        **vars(_cls).get("__annotations__", {}),
+        **_make_export_props(),
+    }
+del _cls
 
 
 class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
@@ -638,48 +544,7 @@ class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
         layout.use_property_split = True
         layout.use_property_decorate = False
 
-        header, body = layout.panel("GLTF_import_mesh", default_closed=True)
-        header.label(text="Mesh")
-        if body:
-            body.prop(self, "import_normals")
-            body.prop(self, "import_texcoords")
-            body.prop(self, "import_colors")
-
-        header, body = layout.panel("GLTF_import_material", default_closed=True)
-        header.label(text="Material")
-        if body:
-            body.prop(self, "import_materials")
-
-        header, body = layout.panel("GLTF_import_animation", default_closed=True)
-        header.label(text="Animation")
-        if body:
-            body.prop(self, "import_animations")
-            body.prop(self, "import_morph_targets")
-
-        header, body = layout.panel("GLTF_import_skinning", default_closed=True)
-        header.label(text="Skinning")
-        if body:
-            body.prop(self, "import_skinning")
-
-        header, body = layout.panel("GLTF_import_physics", default_closed=True)
-        header.label(text="Physics")
-        if body:
-            body.prop(self, "import_physics")
-
-        header, body = layout.panel("GLTF_import_particles", default_closed=True)
-        header.label(text="Particles")
-        if body:
-            body.prop(self, "import_particles")
-
-        header, body = layout.panel("GLTF_import_interactivity", default_closed=True)
-        header.label(text="Interactivity")
-        if body:
-            body.prop(self, "import_interactivity")
-
-        header, body = layout.panel("GLTF_import_audio", default_closed=True)
-        header.label(text="Audio")
-        if body:
-            body.prop(self, "import_audio")
+        _draw_panels(layout, self, _IMPORT_PANELS)
 
 
 def menu_func_export(self, context):

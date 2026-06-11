@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 @dataclass
 class ExportSettings:
     filepath: str = ""
-    format: str = "GLB"  # "GLB", "GLTF_SEPARATE", or "GLTF_EMBEDDED"
+    export_format: str = "GLB"  # "GLB", "GLTF_SEPARATE", or "GLTF_EMBEDDED"
     export_normals: bool = True
     export_texcoords: bool = True
     export_tangents: bool = False
@@ -97,7 +97,7 @@ class GltfExporter:
                 self.buffer,
                 self.settings,
                 self.scene_exporter.object_to_node_index,
-                self.material_exporter._cache,
+                self.material_exporter.material_index_by_name,
                 bone_to_node_index=self.skin_exporter.bone_to_node_index if self.skin_exporter else None,
             )
             if self.settings.export_all_scenes:
@@ -113,7 +113,7 @@ class GltfExporter:
         accessors, buffer_views, buffer_desc, binary = self.buffer.finalize()
 
         # 4. Handle .bin URI for separate format
-        if buffer_desc and self.settings.format == "GLTF_SEPARATE":
+        if buffer_desc and self.settings.export_format == "GLTF_SEPARATE":
             bin_filename = Path(self.settings.filepath).stem + ".bin"
             buffer_desc.uri = bin_filename
 
@@ -140,14 +140,14 @@ class GltfExporter:
         extensions_used = sorted(all_extensions) or None
 
         # 5b. Collect root-level extensions
-        root_extensions = None
+        root_extensions: dict = {}
         if self.physics_exporter:
-            root_extensions = self.physics_exporter.get_root_extensions()
+            physics_root = self.physics_exporter.get_root_extensions()
+            if physics_root:
+                root_extensions.update(physics_root)
 
         # 5c. KHR_lights_punctual root extension
         if self.scene_exporter.lights:
-            if root_extensions is None:
-                root_extensions = {}
             root_extensions["KHR_lights_punctual"] = {
                 "lights": self.scene_exporter.lights,
             }
@@ -156,16 +156,12 @@ class GltfExporter:
         if self.interactivity_exporter:
             interactivity_root = self.interactivity_exporter.get_root_extension()
             if interactivity_root:
-                if root_extensions is None:
-                    root_extensions = {}
                 root_extensions.update(interactivity_root)
 
         # 5e. KHR_audio_emitter root extension
         if self.audio_exporter:
             audio_root = self.audio_exporter.get_root_extension()
             if audio_root:
-                if root_extensions is None:
-                    root_extensions = {}
                 root_extensions.update(audio_root)
 
         # 6. Assemble glTF
@@ -185,7 +181,7 @@ class GltfExporter:
             cameras=self.scene_exporter.cameras or None,
             animations=animations,
             skins=self.skin_exporter.skins if self.skin_exporter and self.skin_exporter.skins else None,
-            extensions=root_extensions,
+            extensions=root_extensions or None,
             extensions_used=extensions_used,
             extensions_required=extensions_required,
         )
@@ -194,9 +190,9 @@ class GltfExporter:
         gltf_dict = gltf.to_dict()
         path = Path(self.settings.filepath)
 
-        if self.settings.format == "GLB":
+        if self.settings.export_format == "GLB":
             write_glb(path, gltf_dict, binary)
-        elif self.settings.format == "GLTF_EMBEDDED":
+        elif self.settings.export_format == "GLTF_EMBEDDED":
             write_gltf_embedded(path, gltf_dict, binary)
         else:
             write_gltf(path, gltf_dict, binary)

@@ -10,8 +10,9 @@ from ..gltf.buffer import BufferBuilder
 from ..gltf.constants import ComponentType, DataType
 from ..gltf.types import Scene, Node, Camera, CameraPerspective, CameraOrthographic
 from .converter import (
-    convert_location, convert_rotation, convert_scale, convert_rotation_camera,
+    convert_location, convert_rotation, convert_scale,
     convert_location_array, convert_rotation_array, convert_scale_array,
+    trs_to_node_fields, gather_material_map,
 )
 from .mesh import MeshExporter
 from .material import MaterialExporter
@@ -69,9 +70,9 @@ class SceneExporter:
         self.object_to_node_index: dict[str, int] = {}
         self.extensions_used: set[str] = set()
         self.cameras: list[Camera] = []
-        self._camera_cache: dict[str, int] = {}  # blender camera data name -> gltf index
+        self.camera_index_by_name: dict[str, int] = {}  # blender camera data name -> gltf index
         self.lights: list[dict] = []
-        self._light_cache: dict[str, int] = {}  # blender light data name -> gltf index
+        self.light_index_by_name: dict[str, int] = {}  # blender light data name -> gltf index
         self._lod_skip_names: set[str] = set()  # LOD1+ objects, excluded from the graph
 
     def gather(self, context: "bpy.types.Context") -> tuple[list[Scene], int]:
@@ -83,7 +84,7 @@ class SceneExporter:
         else:
             blender_scenes = [context.scene]
 
-        self._fps = context.scene.render.fps
+        self._fps = context.scene.render.fps / context.scene.render.fps_base
         active_scene_index = 0
         original_scene = context.window.scene
         gltf_scenes: list[Scene] = []
@@ -286,15 +287,7 @@ class SceneExporter:
         # For armatures, create bone nodes as children
         if obj.type == "ARMATURE" and self.skin_exporter and self.settings.export_skinning:
             # Create armature node first so we have its index
-            loc, rot, scale = obj.matrix_local.decompose()
-            translation = convert_location(loc)
-            rotation = convert_rotation(rot)
-            gltf_scale = convert_scale(scale)
-
-            is_identity_t = all(abs(v) < 1e-6 for v in translation)
-            is_identity_r = (abs(rotation[0]) < 1e-6 and abs(rotation[1]) < 1e-6 and
-                             abs(rotation[2]) < 1e-6 and abs(rotation[3] - 1.0) < 1e-6)
-            is_identity_s = all(abs(v - 1.0) < 1e-6 for v in gltf_scale)
+            translation, rotation, gltf_scale = trs_to_node_fields(obj.matrix_local)
 
             extensions = None
             if not is_visible:
@@ -303,14 +296,17 @@ class SceneExporter:
 
             node = Node(
                 name=obj.name,
-                translation=translation if not is_identity_t else None,
-                rotation=rotation if not is_identity_r else None,
-                scale=gltf_scale if not is_identity_s else None,
+                translation=translation,
+                rotation=rotation,
+                scale=gltf_scale,
                 extensions=extensions,
             )
             index = len(self.nodes)
             self.nodes.append(node)
             self.object_to_node_index[obj.name] = index
+
+            # Armatures get the same extension/extras decoration as other nodes
+            self._decorate_node(node, obj, None)
 
             # Create bone child nodes
             root_bone_indices = self.skin_exporter.gather_armature(obj, index, self.nodes)
@@ -330,26 +326,17 @@ class SceneExporter:
             if child_index is not None:
                 children.append(child_index)
 
-        # Convert transform (Blender Z-up -> glTF Y-up)
-        loc, rot, scale = obj.matrix_local.decompose()
-
-        translation = convert_location(loc)
-        if obj.type in {"LIGHT", "SPEAKER"} or (obj.type == "CAMERA" and self.settings.export_camera_y_up):
-            # Blender lights and speakers point along local -Z (same as glTF
-            # KHR_lights_punctual / KHR_audio_emitter cones). After the Z-up ->
-            # Y-up axis swap, that direction lands along glTF local +Y, so the
-            # same Rx(-90°) post-rotation we apply to cameras restores the
-            # glTF -Z forward convention for them as well.
-            rotation = convert_rotation_camera(rot)
-        else:
-            rotation = convert_rotation(rot)
-        gltf_scale = convert_scale(scale)
-
-        # Omit identity transforms
-        is_identity_t = all(abs(v) < 1e-6 for v in translation)
-        is_identity_r = (abs(rotation[0]) < 1e-6 and abs(rotation[1]) < 1e-6 and
-                         abs(rotation[2]) < 1e-6 and abs(rotation[3] - 1.0) < 1e-6)
-        is_identity_s = all(abs(v - 1.0) < 1e-6 for v in gltf_scale)
+        # Convert transform (Blender Z-up -> glTF Y-up). Lights and speakers
+        # point along local -Z (same as glTF KHR_lights_punctual /
+        # KHR_audio_emitter cones); after the Z-up -> Y-up axis swap that lands
+        # along glTF local +Y, so the same Rx(-90°) post-rotation we apply to
+        # cameras restores the glTF -Z forward convention for them too.
+        camera_fix = obj.type in {"LIGHT", "SPEAKER"} or (
+            obj.type == "CAMERA" and self.settings.export_camera_y_up
+        )
+        translation, rotation, gltf_scale = trs_to_node_fields(
+            obj.matrix_local, camera_fix=camera_fix,
+        )
 
         # KHR_node_visibility: only add extension when hidden (visible=true is default)
         extensions = None
@@ -371,12 +358,26 @@ class SceneExporter:
             camera=camera_index,
             skin=skin_index,
             children=children if children else None,
-            translation=translation if not is_identity_t else None,
-            rotation=rotation if not is_identity_r else None,
-            scale=gltf_scale if not is_identity_s else None,
+            translation=translation,
+            rotation=rotation,
+            scale=gltf_scale,
             extensions=extensions,
         )
 
+        self._decorate_node(node, obj, mesh_index)
+
+        self._wrap_dequant(node)
+
+        index = len(self.nodes)
+        self.nodes.append(node)
+        self.object_to_node_index[obj.name] = index
+        return index
+
+    def _decorate_node(
+        self, node: Node, obj: "bpy.types.Object", mesh_index: int | None,
+    ) -> None:
+        """Attach physics / particle / interactivity / audio extensions and
+        custom-property extras to a node. Shared by regular and armature nodes."""
         # Physics extension (rigid body / collider)
         if self.physics_exporter:
             physics_ext = self.physics_exporter.gather_node(obj, mesh_index)
@@ -415,13 +416,6 @@ class SceneExporter:
             if extras:
                 node.extras = extras
 
-        self._wrap_dequant(node)
-
-        index = len(self.nodes)
-        self.nodes.append(node)
-        self.object_to_node_index[obj.name] = index
-        return index
-
     def _wrap_dequant(self, node: Node) -> None:
         """Move a quantized mesh onto a child node carrying the dequantization
         translation/scale. Keeps the parent's own TRS (and any instancing
@@ -454,13 +448,9 @@ class SceneExporter:
 
     def _gather_materials_for_object(self, obj: "bpy.types.Object") -> dict[int, int]:
         """Gather materials and return mapping: Blender slot index -> glTF material index."""
-        material_map: dict[int, int] = {}
-        for i, slot in enumerate(obj.material_slots):
-            if slot.material is not None:
-                gltf_idx = self.material_exporter.gather(slot.material)
-                if gltf_idx is not None:
-                    material_map[i] = gltf_idx
-        return material_map
+        if not self.settings.export_materials:
+            return {}
+        return gather_material_map(obj, self.material_exporter)
 
     # --- Custom properties as extras ---
 
@@ -515,8 +505,8 @@ class SceneExporter:
             return None
 
         # Deduplicate by camera data name
-        if cam.name in self._camera_cache:
-            return self._camera_cache[cam.name]
+        if cam.name in self.camera_index_by_name:
+            return self.camera_index_by_name[cam.name]
 
         if cam.type == "PERSP":
             # Blender stores the vertical FOV in angle_y for VERTICAL sensor fit,
@@ -548,7 +538,7 @@ class SceneExporter:
 
         index = len(self.cameras)
         self.cameras.append(gltf_cam)
-        self._camera_cache[cam.name] = index
+        self.camera_index_by_name[cam.name] = index
         return index
 
     def _gather_light(self, obj: "bpy.types.Object") -> dict | None:
@@ -563,8 +553,8 @@ class SceneExporter:
             return None
 
         # Deduplicate by light data name
-        if light.name in self._light_cache:
-            return {"light": self._light_cache[light.name]}
+        if light.name in self.light_index_by_name:
+            return {"light": self.light_index_by_name[light.name]}
 
         gltf_light: dict = {
             "name": light.name,
@@ -577,16 +567,21 @@ class SceneExporter:
         if gltf_type in ("point", "spot") and light.use_custom_distance:
             gltf_light["range"] = light.cutoff_distance
 
-        # Spot lights have cone angles
+        # Spot lights have cone angles. Blender's spot_blend is a softness
+        # fraction (0 = sharp edge), so the inner cone is the outer cone scaled
+        # by (1 - blend), not by blend. Clamp inner strictly below outer.
         if gltf_type == "spot":
+            outer = light.spot_size / 2.0
+            inner = (1.0 - light.spot_blend) * light.spot_size / 2.0
+            inner = min(inner, outer - 1e-6)
             gltf_light["spot"] = {
-                "innerConeAngle": light.spot_blend * light.spot_size / 2.0,
-                "outerConeAngle": light.spot_size / 2.0,
+                "innerConeAngle": inner,
+                "outerConeAngle": outer,
             }
 
         index = len(self.lights)
         self.lights.append(gltf_light)
-        self._light_cache[light.name] = index
+        self.light_index_by_name[light.name] = index
         self.extensions_used.add(EXT_LIGHTS_PUNCTUAL)
         return {"light": index}
 
@@ -744,6 +739,23 @@ class SceneExporter:
         transforms: list[tuple[list[float], list[float], list[float]]],
     ) -> int | None:
         """Create instanced node(s) with EXT_mesh_gpu_instancing."""
+        # Gather the source mesh(es) FIRST. If none produce geometry we must
+        # not write instance-transform accessors into the buffer or register
+        # EXT_mesh_gpu_instancing — that would leave orphaned buffer data and a
+        # spurious extensionsUsed entry. Collect (mesh_name, mesh_index) so the
+        # single-mesh fast path can still attach instancing directly.
+        gathered: list[tuple[str, int]] = []
+        for mesh_name in mesh_names:
+            obj = source_objects[mesh_name]
+            material_map = self._gather_materials_for_object(obj)
+            mesh_index = self.mesh_exporter.gather(obj, material_map)
+            if mesh_index is not None:
+                gathered.append((mesh_name, mesh_index))
+
+        if not gathered:
+            return None
+
+        # Now that we know ≥1 mesh exists, write instance transform accessors.
         num_instances = len(transforms)
         translations = np.empty((num_instances, 3), dtype=np.float32)
         rotations = np.empty((num_instances, 4), dtype=np.float32)
@@ -759,7 +771,6 @@ class SceneExporter:
         rotations = convert_rotation_array(rotations)
         scales = convert_scale_array(scales)
 
-        # Write instance transform accessors
         trans_acc = self.buffer.add_accessor(
             translations, ComponentType.FLOAT, DataType.VEC3,
         )
@@ -781,35 +792,28 @@ class SceneExporter:
         }
         self.extensions_used.add(EXT_GPU_INSTANCING)
 
-        # Export mesh(es)
-        children: list[int] = []
-        for mesh_name in mesh_names:
-            obj = source_objects[mesh_name]
-            material_map = self._gather_materials_for_object(obj)
-            mesh_index = self.mesh_exporter.gather(obj, material_map)
-            if mesh_index is not None:
-                if len(mesh_names) == 1:
-                    # Single mesh: put instancing directly on mesh node
-                    node = Node(
-                        name=f"{mesh_name}_instances",
-                        mesh=mesh_index,
-                        extensions=instancing_ext,
-                    )
-                    idx = len(self.nodes)
-                    self.nodes.append(node)
-                    self._wrap_dequant(node)
-                    return idx
-                else:
-                    child_node = Node(name=mesh_name, mesh=mesh_index)
-                    child_idx = len(self.nodes)
-                    self.nodes.append(child_node)
-                    self._wrap_dequant(child_node)
-                    children.append(child_idx)
-
-        if not children:
-            return None
+        # Single mesh: put instancing directly on the mesh node
+        if len(gathered) == 1:
+            mesh_name, mesh_index = gathered[0]
+            node = Node(
+                name=f"{mesh_name}_instances",
+                mesh=mesh_index,
+                extensions=instancing_ext,
+            )
+            idx = len(self.nodes)
+            self.nodes.append(node)
+            self._wrap_dequant(node)
+            return idx
 
         # Multiple meshes: parent node with instancing + child nodes
+        children: list[int] = []
+        for mesh_name, mesh_index in gathered:
+            child_node = Node(name=mesh_name, mesh=mesh_index)
+            child_idx = len(self.nodes)
+            self.nodes.append(child_node)
+            self._wrap_dequant(child_node)
+            children.append(child_idx)
+
         node = Node(
             name=f"{mesh_names[0]}_instances",
             children=children,

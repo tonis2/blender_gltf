@@ -38,14 +38,13 @@ class STACK_OT_add_layer(Operator):
 
         layer = node.layers.add()
         idx = len(node.layers) - 1
-        layer.layer_index = idx
+        # blend_mode/opacity/enabled keep their property defaults. The name
+        # is set first: its update callback only syncs panel headers (cheap,
+        # no rebuild), and the single full rebuild happens below.
         layer.layer_name = f"Layer {idx}"
-        layer.blend_mode = "MIX"
-        layer.opacity = 1.0
-        layer.enabled = True
 
-        node.add_layer_to_group(idx)
-        node.rebuild_internals()
+        # add_layer_to_group → rebuild_group → rebuild_internals.
+        node.add_layer_to_group()
         return {'FINISHED'}
 
 
@@ -81,8 +80,6 @@ class STACK_OT_remove_layer(Operator):
                 old_to_new[old_i] = old_i - 1
 
         node.layers.remove(removed)
-        for i, layer in enumerate(node.layers):
-            layer.layer_index = i
 
         node.rebuild_group(old_to_new=old_to_new)
         return {'FINISHED'}
@@ -119,9 +116,6 @@ class STACK_OT_move_layer(Operator):
         old_to_new[new_idx] = idx
 
         node.layers.move(idx, new_idx)
-
-        for i, layer in enumerate(node.layers):
-            layer.layer_index = i
 
         node.rebuild_group(old_to_new=old_to_new)
         return {'FINISHED'}

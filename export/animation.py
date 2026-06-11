@@ -116,7 +116,7 @@ class AnimationExporter:
         settings: "ExportSettings",
         object_to_node_index: dict[str, int],
         material_to_index: dict[str, int],
-        bone_to_node_index: dict[str, int] | None = None,
+        bone_to_node_index: dict[tuple[str, str], int] | None = None,
     ) -> None:
         self.buffer = buffer
         self.settings = settings
@@ -244,6 +244,82 @@ class AnimationExporter:
                         f_min = kp.co[0]
         return f_min if f_min is not None else 0.0
 
+    # --- Shared channel-building helpers ---
+
+    @staticmethod
+    def _collect_frames(
+        fcurves: dict[int, "bpy.types.FCurve"], data_path: str | None = None,
+    ) -> list[float] | None:
+        """Collect sorted unique keyframe frames across the fcurves, or None.
+
+        rotation_euler stores angles, but glTF only carries quaternions. With
+        sparse keyframes (e.g. 0° and 360° at endpoints) both convert to the
+        identity quaternion and the rotation is lost on export. Densify
+        rotation_euler at whole frames so Blender's per-component angle LERP
+        is preserved through the conversion."""
+        frames: set[float] = set()
+        for fcurve in fcurves.values():
+            for kp in fcurve.keyframe_points:
+                frames.add(kp.co[0])
+
+        if not frames:
+            return None
+
+        if data_path == "rotation_euler" and len(frames) >= 2:
+            f_min = min(frames)
+            f_max = max(frames)
+            for f in range(int(f_min), int(f_max) + 1):
+                frames.add(float(f))
+
+        return sorted(frames)
+
+    @staticmethod
+    def _frames_to_times(
+        sorted_frames: list[float], f_origin: float, fps: float,
+    ) -> np.ndarray:
+        """Rebase frames to a shared t=0 origin and convert to seconds.
+        Runtime samplers (e.g. scene bake loops) walk t from 0..duration; if
+        min_time > 0 they extrapolate past the first keyframe and emit garbage
+        poses."""
+        return np.array(
+            [(f - f_origin) / fps for f in sorted_frames], dtype=np.float32,
+        )
+
+    @staticmethod
+    def _detect_interpolation(
+        fcurves: dict[int, "bpy.types.FCurve"], data_path: str | None = None,
+    ) -> str:
+        """glTF interpolation from the first keyframe of the first fcurve.
+        Densified rotation_euler frames don't carry tangent data, so they fall
+        back to LINEAR."""
+        first_fcurve = next(iter(fcurves.values()))
+        blender_interp = (
+            first_fcurve.keyframe_points[0].interpolation
+            if first_fcurve.keyframe_points else "LINEAR"
+        )
+        gltf_interp = _INTERPOLATION_MAP.get(blender_interp, "LINEAR")
+        if data_path == "rotation_euler" and gltf_interp == "CUBICSPLINE":
+            gltf_interp = "LINEAR"
+        return gltf_interp
+
+    @staticmethod
+    def _evaluate_frames(
+        fcurves: dict[int, "bpy.types.FCurve"],
+        sorted_frames: list[float],
+        num_components: int,
+        defaults: list[float],
+    ) -> np.ndarray:
+        """Evaluate every component at every frame; missing components use
+        `defaults`."""
+        values = np.empty((len(sorted_frames), num_components), dtype=np.float32)
+        for i, frame in enumerate(sorted_frames):
+            for c in range(num_components):
+                if c in fcurves:
+                    values[i, c] = fcurves[c].evaluate(frame)
+                else:
+                    values[i, c] = defaults[c]
+        return values
+
     def _gather_trs_channel(
         self,
         obj: "bpy.types.Object",
@@ -257,38 +333,14 @@ class AnimationExporter:
         gltf_path, data_type = _TRS_PATH_MAP[data_path]
         num_components = _PATH_COMPONENTS[data_path]
 
-        # Collect all unique keyframe frame numbers
-        frames: set[float] = set()
-        for fcurve in fcurves.values():
-            for kp in fcurve.keyframe_points:
-                frames.add(kp.co[0])
-
-        if not frames:
+        sorted_frames = self._collect_frames(fcurves, data_path)
+        if sorted_frames is None:
             return None
 
-        # rotation_euler stores angles, but glTF only carries quaternions. With sparse
-        # keyframes (e.g. 0° and 360° at endpoints) both convert to identity quaternion
-        # and the rotation is lost on export. Densify rotation_euler at scene fps so
-        # Blender's per-component angle LERP is preserved through the conversion.
-        if data_path == "rotation_euler" and len(frames) >= 2:
-            f_min = min(frames)
-            f_max = max(frames)
-            for f in range(int(f_min), int(f_max) + 1):
-                frames.add(float(f))
+        # Rebase to action-shared t=0 origin.
+        times = self._frames_to_times(sorted_frames, f_origin, fps)
 
-        sorted_frames = sorted(frames)
-        # Rebase to action-shared t=0 origin. Runtime samplers (e.g. scene bake
-        # loops) walk t from 0..duration; if min_time > 0 they extrapolate past
-        # the first keyframe and emit garbage poses.
-        times = np.array([(f - f_origin) / fps for f in sorted_frames], dtype=np.float32)
-
-        # Determine interpolation from first keyframe of first fcurve
-        first_fcurve = next(iter(fcurves.values()))
-        blender_interp = first_fcurve.keyframe_points[0].interpolation if first_fcurve.keyframe_points else "LINEAR"
-        gltf_interp = _INTERPOLATION_MAP.get(blender_interp, "LINEAR")
-        # Densified frames don't carry tangent data, so fall back to LINEAR for them.
-        if data_path == "rotation_euler" and gltf_interp == "CUBICSPLINE":
-            gltf_interp = "LINEAR"
+        gltf_interp = self._detect_interpolation(fcurves, data_path)
 
         # Get rest values for missing components
         rest_values = self._get_rest_values(obj, data_path, num_components)
@@ -298,31 +350,19 @@ class AnimationExporter:
                 fcurves, sorted_frames, num_components, rest_values, fps,
             )
         else:
-            # Evaluate at each keyframe
-            values = np.empty((len(sorted_frames), num_components), dtype=np.float32)
-            for i, frame in enumerate(sorted_frames):
-                for c in range(num_components):
-                    if c in fcurves:
-                        values[i, c] = fcurves[c].evaluate(frame)
-                    else:
-                        values[i, c] = rest_values[c]
+            values = self._evaluate_frames(
+                fcurves, sorted_frames, num_components, rest_values,
+            )
 
         # Handle euler -> quaternion conversion
         if data_path == "rotation_euler":
             import mathutils
             rotation_mode = obj.rotation_mode
             quats = np.empty((len(values), 4), dtype=np.float32)
-            if gltf_interp == "CUBICSPLINE":
-                # For cubicspline, convert each triple (in_tangent, value, out_tangent)
-                for i in range(len(values)):
-                    euler = mathutils.Euler(values[i], rotation_mode)
-                    q = euler.to_quaternion()
-                    quats[i] = [q.w, q.x, q.y, q.z]
-            else:
-                for i in range(len(values)):
-                    euler = mathutils.Euler(values[i], rotation_mode)
-                    q = euler.to_quaternion()
-                    quats[i] = [q.w, q.x, q.y, q.z]
+            for i in range(len(values)):
+                euler = mathutils.Euler(values[i], rotation_mode)
+                q = euler.to_quaternion()
+                quats[i] = [q.w, q.x, q.y, q.z]
             values = quats
 
         # Apply coordinate conversion. Lights and (optionally) cameras need the
@@ -333,21 +373,13 @@ class AnimationExporter:
             obj.type in {"LIGHT", "SPEAKER"}
             or (obj.type == "CAMERA" and self.settings.export_camera_y_up)
         )
-        if gltf_interp == "CUBICSPLINE":
-            # For cubicspline, values are interleaved: [in_tangent, value, out_tangent] x N
-            # Reshape to (N*3, components), convert, reshape back
-            n_keyframes = len(sorted_frames)
-            flat = values.reshape(n_keyframes * 3, -1)
-            if needs_camera_fix:
-                flat = convert_rotation_camera_array(flat)
-            else:
-                flat = self._convert_values(flat, gltf_path)
-            values = flat.reshape(n_keyframes * 3, -1)
+        # For cubicspline, values are interleaved rows
+        # [in_tangent, value, out_tangent] x N — already (N*3, components), so
+        # the same row-wise conversion applies.
+        if needs_camera_fix:
+            values = convert_rotation_camera_array(values)
         else:
-            if needs_camera_fix:
-                values = convert_rotation_camera_array(values)
-            else:
-                values = self._convert_values(values, gltf_path)
+            values = self._convert_values(values, gltf_path)
 
         # Write accessors
         input_acc = self.buffer.add_accessor(
@@ -387,9 +419,18 @@ class AnimationExporter:
                     # Find the keyframe point at this frame
                     kp = self._find_keyframe_at(fc, frame)
                     if kp is not None:
-                        # Convert tangent handles from frame-space to time-space
-                        in_tangent = kp.handle_left[1] / fps
-                        out_tangent = kp.handle_right[1] / fps
+                        # handle_left/right are absolute (frame, value) points,
+                        # not slopes. glTF cubic-spline tangents are slopes in
+                        # value-units per second: rise / run, with the run
+                        # converted from frames to seconds.
+                        dxl = (kp.co[0] - kp.handle_left[0]) / fps  # seconds
+                        in_tangent = (
+                            (kp.co[1] - kp.handle_left[1]) / dxl if dxl > 1e-9 else 0.0
+                        )
+                        dxr = (kp.handle_right[0] - kp.co[0]) / fps
+                        out_tangent = (
+                            (kp.handle_right[1] - kp.co[1]) / dxr if dxr > 1e-9 else 0.0
+                        )
                         values[i * 3 + 0, c] = in_tangent
                         values[i * 3 + 1, c] = kp.co[1]
                         values[i * 3 + 2, c] = out_tangent
@@ -466,8 +507,6 @@ class AnimationExporter:
         fps: float,
     ) -> "Animation | None":
         """Gather bone animation channels from an armature action."""
-        import mathutils
-
         channels: list[AnimationChannel] = []
         samplers: list[AnimationSampler] = []
 
@@ -484,7 +523,7 @@ class AnimationExporter:
         f_origin = self._earliest_keyframe([(armature_obj, action)])
 
         for (bone_name, data_path), fc_dict in bone_fcurves.items():
-            if bone_name not in self.bone_to_node_index:
+            if (armature_obj.name, bone_name) not in self.bone_to_node_index:
                 continue
             # Skip rotation_euler if quaternion also exists
             if data_path == "rotation_euler" and (bone_name, "rotation_quaternion") in bone_fcurves:
@@ -530,7 +569,7 @@ class AnimationExporter:
         bone = armature_obj.data.bones.get(bone_name)
         if bone is None:
             return None
-        node_index = self.bone_to_node_index[bone_name]
+        node_index = self.bone_to_node_index[(armature_obj.name, bone_name)]
 
         # Compute rest local matrix (bone relative to parent)
         if bone.parent:
@@ -538,33 +577,14 @@ class AnimationExporter:
         else:
             rest_local = bone.matrix_local.copy()
 
-        # Collect all unique keyframe times
-        frames: set[float] = set()
-        for fcurve in fcurves.values():
-            for kp in fcurve.keyframe_points:
-                frames.add(kp.co[0])
-
-        if not frames:
+        sorted_frames = self._collect_frames(fcurves, data_path)
+        if sorted_frames is None:
             return None
 
-        # See _gather_trs_channel: rotation_euler must be densified at scene fps so
-        # Blender's per-component angle LERP survives the quaternion conversion.
-        if data_path == "rotation_euler" and len(frames) >= 2:
-            f_min = min(frames)
-            f_max = max(frames)
-            for f in range(int(f_min), int(f_max) + 1):
-                frames.add(float(f))
+        # Rebase to action-shared t=0 origin.
+        times = self._frames_to_times(sorted_frames, f_origin, fps)
 
-        sorted_frames = sorted(frames)
-        # See _gather_trs_channel: rebase to action-shared t=0 origin.
-        times = np.array([(f - f_origin) / fps for f in sorted_frames], dtype=np.float32)
-
-        # Determine interpolation
-        first_fcurve = next(iter(fcurves.values()))
-        blender_interp = first_fcurve.keyframe_points[0].interpolation if first_fcurve.keyframe_points else "LINEAR"
-        gltf_interp = _INTERPOLATION_MAP.get(blender_interp, "LINEAR")
-        if data_path == "rotation_euler" and gltf_interp == "CUBICSPLINE":
-            gltf_interp = "LINEAR"
+        gltf_interp = self._detect_interpolation(fcurves, data_path)
 
         # Rest values for pose bone deltas (identity)
         if data_path in ("location",):
@@ -580,13 +600,9 @@ class AnimationExporter:
 
         # Evaluate delta values at each keyframe
         n_keyframes = len(sorted_frames)
-        delta_values = np.empty((n_keyframes, num_components), dtype=np.float32)
-        for i, frame in enumerate(sorted_frames):
-            for c in range(num_components):
-                if c in fcurves:
-                    delta_values[i, c] = fcurves[c].evaluate(frame)
-                else:
-                    delta_values[i, c] = rest_delta[c]
+        delta_values = self._evaluate_frames(
+            fcurves, sorted_frames, num_components, rest_delta,
+        )
 
         # Handle euler -> quaternion conversion for deltas
         if data_path == "rotation_euler":
@@ -745,28 +761,48 @@ class AnimationExporter:
         import bpy
 
         for mat in bpy.data.materials:
-            if mat.animation_data is None or mat.animation_data.action is None:
-                continue
             if mat.name not in self.material_to_index:
                 continue
 
-            mat_index = self.material_to_index[mat.name]
-            action = mat.animation_data.action
+            # Keyframing shader-node inputs stores fcurves on the node tree's
+            # own animation data, not the material's. Check the node tree
+            # first; keep mat.animation_data as a secondary source.
+            anim_sources: list["bpy.types.AnimData"] = []
+            node_tree = mat.node_tree
+            if (
+                node_tree is not None
+                and node_tree.animation_data is not None
+                and node_tree.animation_data.action is not None
+            ):
+                anim_sources.append(node_tree.animation_data)
+            if mat.animation_data is not None and mat.animation_data.action is not None:
+                anim_sources.append(mat.animation_data)
 
-            channels, samplers = self._gather_material_action(mat, mat_index, action, fps)
-            if channels:
-                anim = Animation(
-                    name=f"{mat.name}_material",
-                    channels=channels,
-                    samplers=samplers,
+            mat_index = self.material_to_index[mat.name]
+            seen_actions: set[str] = set()
+            for anim_data in anim_sources:
+                action = anim_data.action
+                if action.name in seen_actions:
+                    continue
+                seen_actions.add(action.name)
+
+                channels, samplers = self._gather_material_action(
+                    mat, mat_index, action, anim_data, fps,
                 )
-                self.animations.append(anim)
+                if channels:
+                    anim = Animation(
+                        name=f"{mat.name}_material",
+                        channels=channels,
+                        samplers=samplers,
+                    )
+                    self.animations.append(anim)
 
     def _gather_material_action(
         self,
         mat: "bpy.types.Material",
         mat_index: int,
         action: "bpy.types.Action",
+        anim_data: "bpy.types.AnimData",
         fps: float,
     ) -> tuple[list[AnimationChannel], list[AnimationSampler]]:
         """Extract animation channels from a material action."""
@@ -778,7 +814,7 @@ class AnimationExporter:
 
         # Group fcurves by (node_name, input_index)
         grouped: dict[tuple[str, int], dict[int, "bpy.types.FCurve"]] = defaultdict(dict)
-        for fcurve in _get_fcurves(action, mat.animation_data):
+        for fcurve in _get_fcurves(action, anim_data):
             match = _MAT_FCURVE_RE.match(fcurve.data_path)
             if match:
                 node_name = match.group(1)
@@ -801,17 +837,12 @@ class AnimationExporter:
             pointer = f"/materials/{mat_index}/{pointer_suffix}"
 
             # Collect keyframe times
-            all_frames: set[float] = set()
-            for fc in fc_dict.values():
-                for kp in fc.keyframe_points:
-                    all_frames.add(kp.co[0])
-
-            if not all_frames:
+            sorted_frames = self._collect_frames(fc_dict)
+            if sorted_frames is None:
                 continue
 
-            sorted_frames = sorted(all_frames)
             f_origin = sorted_frames[0]
-            times = np.array([(f - f_origin) / fps for f in sorted_frames], dtype=np.float32)
+            times = self._frames_to_times(sorted_frames, f_origin, fps)
 
             # Evaluate values
             # Get default value for missing components
@@ -821,13 +852,9 @@ class AnimationExporter:
             else:
                 defaults = [float(default_val)] * num_components
 
-            values = np.empty((len(sorted_frames), num_components), dtype=np.float32)
-            for i, frame in enumerate(sorted_frames):
-                for c in range(num_components):
-                    if c in fc_dict:
-                        values[i, c] = fc_dict[c].evaluate(frame)
-                    else:
-                        values[i, c] = defaults[c]
+            values = self._evaluate_frames(
+                fc_dict, sorted_frames, num_components, defaults,
+            )
 
             input_acc = self.buffer.add_accessor(
                 times, ComponentType.FLOAT, DataType.SCALAR, include_bounds=True,

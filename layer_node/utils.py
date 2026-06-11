@@ -19,21 +19,23 @@
 import bpy
 
 
+def _iter_candidate_nodes():
+    """Yield every node of every material node tree and node group."""
+    for mat in bpy.data.materials:
+        if mat.node_tree:
+            yield from mat.node_tree.nodes
+    for tree in bpy.data.node_groups:
+        yield from tree.nodes
+
+
 def find_node_by_group(group_name):
     """Find a StackNode by its internal node group name.
     Each Stack instance creates a unique group (e.g. '.stack_140234567'),
     so this is an unambiguous lookup even across multiple materials."""
-    for mat in bpy.data.materials:
-        if mat.node_tree:
-            for node in mat.node_tree.nodes:
-                if hasattr(node, "node_tree") and node.node_tree:
-                    if node.node_tree.name == group_name:
-                        return node
-    for tree in bpy.data.node_groups:
-        for node in tree.nodes:
-            if hasattr(node, "node_tree") and node.node_tree:
-                if node.node_tree.name == group_name:
-                    return node
+    for node in _iter_candidate_nodes():
+        if hasattr(node, "node_tree") and node.node_tree:
+            if node.node_tree.name == group_name:
+                return node
     return None
 
 
@@ -45,20 +47,20 @@ def get_node_id(node):
     return ""
 
 
+def find_owner_layer(prop):
+    """Find the StackNode and layer index owning a layer property.
+
+    Returns (node, layer_index), or (None, None) if not found."""
+    ptr = prop.as_pointer()
+    for node in _iter_candidate_nodes():
+        if hasattr(node, "layers") and hasattr(node, "rebuild_internals"):
+            for i, layer in enumerate(node.layers):
+                if layer.as_pointer() == ptr:
+                    return node, i
+    return None, None
+
+
 def find_owner_node(prop):
     """Find the StackNode that owns a layer property."""
-    ptr = prop.as_pointer()
-    for mat in bpy.data.materials:
-        if mat.node_tree:
-            for node in mat.node_tree.nodes:
-                if hasattr(node, "layers") and hasattr(node, "rebuild_internals"):
-                    for layer in node.layers:
-                        if layer.as_pointer() == ptr:
-                            return node
-    for tree in bpy.data.node_groups:
-        for node in tree.nodes:
-            if hasattr(node, "layers") and hasattr(node, "rebuild_internals"):
-                for layer in node.layers:
-                    if layer.as_pointer() == ptr:
-                        return node
-    return None
+    node, _ = find_owner_layer(prop)
+    return node

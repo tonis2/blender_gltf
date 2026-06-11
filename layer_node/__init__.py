@@ -64,6 +64,12 @@ def register():
 
 
 def unregister():
+    # Drop any queued deferred rebuilds and their flush timer so a stale
+    # timer can't fire after the addon is disabled/reloaded.
+    if bpy.app.timers.is_registered(bsdf_node._flush_pending_rebuilds):
+        bpy.app.timers.unregister(bsdf_node._flush_pending_rebuilds)
+    bsdf_node._pending_rebuilds.clear()
+
     bpy.types.NODE_MT_add.remove(stack_menu_draw)
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

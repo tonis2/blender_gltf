@@ -96,6 +96,45 @@ def convert_scale_array(scales: np.ndarray) -> np.ndarray:
     return result
 
 
+def trs_to_node_fields(
+    matrix, camera_fix: bool = False,
+) -> tuple[list[float] | None, list[float] | None, list[float] | None]:
+    """Decompose a Blender local matrix, convert TRS to glTF Y-up, and return
+    (translation, rotation, scale) for node assignment, with identity
+    components replaced by None so they're omitted from the output.
+
+    `camera_fix` applies the Rx(-90°) post-rotation cameras/lights/speakers
+    need so their local -Z forward survives the axis swap.
+    """
+    loc, rot, scl = matrix.decompose()
+    translation = convert_location(loc)
+    rotation = convert_rotation_camera(rot) if camera_fix else convert_rotation(rot)
+    scale = convert_scale(scl)
+
+    is_identity_t = all(abs(v) < 1e-6 for v in translation)
+    is_identity_r = (abs(rotation[0]) < 1e-6 and abs(rotation[1]) < 1e-6 and
+                     abs(rotation[2]) < 1e-6 and abs(rotation[3] - 1.0) < 1e-6)
+    is_identity_s = all(abs(v - 1.0) < 1e-6 for v in scale)
+
+    return (
+        translation if not is_identity_t else None,
+        rotation if not is_identity_r else None,
+        scale if not is_identity_s else None,
+    )
+
+
+def gather_material_map(obj, material_exporter) -> dict[int, int]:
+    """Gather an object's materials and return the mapping:
+    Blender material slot index -> glTF material index."""
+    material_map: dict[int, int] = {}
+    for i, slot in enumerate(obj.material_slots):
+        if slot.material is not None:
+            gltf_idx = material_exporter.gather(slot.material)
+            if gltf_idx is not None:
+                material_map[i] = gltf_idx
+    return material_map
+
+
 def convert_matrix(mat) -> list[float]:
     """Convert a Blender Z-up 4x4 matrix to glTF Y-up, column-major 16-float list.
 

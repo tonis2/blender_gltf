@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from .converter import gather_material_map
+
 if TYPE_CHECKING:
     import bpy
     from ..exporter import ExportSettings
@@ -73,16 +75,16 @@ class ParticleExporter:
             emitter["name"] = ps.name
 
         # --- Emission ---
+        # frame span is clamped to >= 1 and fps > 0, so duration_sec is always
+        # positive — no zero-guard / fallback needed.
         duration_frames = max(s.frame_end - s.frame_start, 1)
         duration_sec = duration_frames / fps
-        rate = s.count / duration_sec if duration_sec > 0 else float(s.count)
 
         emission: dict = {
             "count": s.count,
-            "rate": round(rate, 4),
+            "rate": round(s.count / duration_sec, 4),
+            "duration": round(duration_sec, 4),
         }
-        if duration_sec > 0:
-            emission["duration"] = round(duration_sec, 4)
 
         emit_from = getattr(s, "emit_from", "FACE")
         emission["emitFrom"] = emit_from.lower()
@@ -211,10 +213,6 @@ class ParticleExporter:
     def _gather_instance_materials(
         self, obj: "bpy.types.Object",
     ) -> dict[int, int]:
-        material_map: dict[int, int] = {}
-        for i, slot in enumerate(obj.material_slots):
-            if slot.material is not None:
-                gltf_idx = self.material_exporter.gather(slot.material)
-                if gltf_idx is not None:
-                    material_map[i] = gltf_idx
-        return material_map
+        if not self.settings.export_materials:
+            return {}
+        return gather_material_map(obj, self.material_exporter)

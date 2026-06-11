@@ -34,40 +34,90 @@ class BufferReader:
         return data
 
     def read_accessor(self, accessor_index: int) -> np.ndarray:
-        """Read accessor data as a numpy array shaped (count, num_components)."""
+        """Read accessor data as a numpy array shaped (count, num_components)
+        (scalar accessors are returned 1-D, shaped (count,))."""
         acc = self.gltf.accessors[accessor_index]
         component_type = ComponentType(acc.component_type)
         data_type = DataType(acc.type)
         dtype = component_type.numpy_dtype
         num_components = data_type.num_components
 
-        bv = self.gltf.buffer_views[acc.buffer_view]
-        buffer_data = self._resolve_buffer(bv.buffer)
-
-        bv_offset = bv.byte_offset or 0
-        acc_offset = acc.byte_offset or 0
-        start = bv_offset + acc_offset
-        element_size = num_components * dtype.itemsize
-
-        if bv.byte_stride and bv.byte_stride != element_size:
-            # Strided / interleaved buffer view
-            result = np.empty((acc.count, num_components), dtype=dtype)
-            for i in range(acc.count):
-                elem_start = start + i * bv.byte_stride
-                result[i] = np.frombuffer(
-                    buffer_data, dtype=dtype, count=num_components, offset=elem_start,
-                )
+        if acc.buffer_view is None:
+            # Legal in glTF: an accessor without a bufferView is zero-filled
+            # (usually the base of a sparse accessor).
+            result = np.zeros((acc.count, num_components), dtype=dtype)
         else:
-            # Tightly packed
-            total = acc.count * num_components
-            data = np.frombuffer(buffer_data, dtype=dtype, count=total, offset=start)
-            if num_components > 1:
-                data = data.reshape(acc.count, num_components)
-            result = data.copy()
+            result = self._read_buffer_view_elements(
+                acc.buffer_view, acc.byte_offset or 0,
+                acc.count, num_components, dtype,
+            )
+
+        if acc.sparse is not None:
+            result = self._apply_sparse(result, acc.sparse, num_components)
 
         if acc.normalized:
             result = self._dequantize(result, component_type)
+        if num_components == 1:
+            result = result.reshape(-1)
         return result
+
+    def _read_buffer_view_elements(
+        self,
+        buffer_view_index: int,
+        acc_offset: int,
+        count: int,
+        num_components: int,
+        dtype: np.dtype,
+    ) -> np.ndarray:
+        """Read `count` elements from a buffer view as a writable (count,
+        num_components) array, handling interleaved (strided) layouts."""
+        bv = self.gltf.buffer_views[buffer_view_index]
+        buffer_data = self._resolve_buffer(bv.buffer)
+        start = (bv.byte_offset or 0) + acc_offset
+        element_size = num_components * dtype.itemsize
+
+        if bv.byte_stride and bv.byte_stride != element_size:
+            # Strided / interleaved buffer view: read the whole span once,
+            # then slice each element out of its stride window.
+            stride = bv.byte_stride
+            span = stride * (count - 1) + element_size
+            raw = np.frombuffer(buffer_data, dtype=np.uint8, count=span, offset=start)
+            # Pad to a full (count, stride) grid; the tail past the last
+            # element is never part of any element.
+            padded = np.zeros(count * stride, dtype=np.uint8)
+            padded[:span] = raw
+            elems = padded.reshape(count, stride)[:, :element_size]
+            return np.ascontiguousarray(elems).view(dtype).reshape(count, num_components)
+
+        # Tightly packed
+        total = count * num_components
+        data = np.frombuffer(buffer_data, dtype=dtype, count=total, offset=start)
+        return data.reshape(count, num_components).copy()
+
+    def _apply_sparse(
+        self, base: np.ndarray, sparse, num_components: int,
+    ) -> np.ndarray:
+        """Scatter sparse accessor substitutions into the base data."""
+        idx_info = sparse.indices or {}
+        val_info = sparse.values or {}
+        count = sparse.count or 0
+        if count <= 0 or "bufferView" not in idx_info or "bufferView" not in val_info:
+            return base
+
+        idx_dtype = ComponentType(idx_info["componentType"]).numpy_dtype
+        indices = self._read_buffer_view_elements(
+            idx_info["bufferView"], idx_info.get("byteOffset") or 0,
+            count, 1, idx_dtype,
+        ).reshape(-1).astype(np.int64)
+
+        values = self._read_buffer_view_elements(
+            val_info["bufferView"], val_info.get("byteOffset") or 0,
+            count, num_components, base.dtype,
+        )
+
+        # `base` is always a private writable copy (zeros or a fresh read).
+        base[indices] = values
+        return base
 
     @staticmethod
     def _dequantize(data: np.ndarray, component_type: ComponentType) -> np.ndarray:

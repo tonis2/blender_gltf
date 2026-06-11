@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ..gltf.types import Material, MaterialPBRMetallicRoughness, NormalTextureInfo
+from ..layer_node.constants import N_CH, CH_TO_IDX, BLEND_MODES
 from .texture import TextureExporter
 
 if TYPE_CHECKING:
@@ -12,22 +13,11 @@ if TYPE_CHECKING:
 
 EXT_MATERIALS_UNLIT = "KHR_materials_unlit"
 EXT_MATERIALS_LAYERS = "CUSTOM_materials_layers"
+EXT_EMISSIVE_STRENGTH = "KHR_materials_emissive_strength"
 BSDF_STACK_NODE_IDNAME = "BSDFStackNodeType"
 # All Blender ShaderNodeMix blend types the BSDFStackNode exposes per layer.
-_VALID_BLEND_MODES = {
-    "MIX", "MULTIPLY", "ADD", "SUBTRACT", "SCREEN", "OVERLAY",
-    "SOFT_LIGHT", "DIFFERENCE", "DARKEN", "LIGHTEN",
-}
+_VALID_BLEND_MODES = {m[0] for m in BLEND_MODES}
 _VALID_MASK_CHANNELS = {"R", "G", "B", "A"}
-
-# BSDFStackNode per-layer input layout: N_CH sockets per layer, ordered as below.
-# Keep in sync with layer_node/bsdf_node.py CHANNELS.
-_N_CH = 10
-_CH = {
-    "Color": 0, "Mask": 1, "Normal": 2, "Roughness": 3, "Metallic": 4,
-    "Alpha": 5, "Emission Color": 6, "Emission Strength": 7,
-    "Subsurface Weight": 8, "Subsurface Radius": 9,
-}
 
 
 class MaterialExporter:
@@ -35,7 +25,7 @@ class MaterialExporter:
         self.texture_exporter = texture_exporter
         self.settings = settings
         self.materials: list[Material] = []
-        self._cache: dict[str, int] = {}
+        self.material_index_by_name: dict[str, int] = {}
         self.extensions_used: set[str] = set()
 
     def gather(self, blender_material: "bpy.types.Material") -> int | None:
@@ -43,13 +33,13 @@ class MaterialExporter:
         if blender_material is None:
             return None
 
-        if blender_material.name in self._cache:
-            return self._cache[blender_material.name]
+        if blender_material.name in self.material_index_by_name:
+            return self.material_index_by_name[blender_material.name]
 
         material = self._extract(blender_material)
         index = len(self.materials)
         self.materials.append(material)
-        self._cache[blender_material.name] = index
+        self.material_index_by_name[blender_material.name] = index
         return index
 
     def _extract(self, blender_material: "bpy.types.Material") -> Material:
@@ -57,6 +47,7 @@ class MaterialExporter:
         normal_texture = None
         emissive_texture = None
         emissive_factor = None
+        emissive_strength = None
         alpha_mode = None
         alpha_cutoff = None
         double_sided = None
@@ -79,7 +70,9 @@ class MaterialExporter:
             if principled is not None:
                 pbr = self._gather_pbr(principled)
                 normal_texture = self._gather_normal(principled)
-                emissive_texture, emissive_factor = self._gather_emission(principled)
+                emissive_texture, emissive_factor, emissive_strength = (
+                    self._gather_emission(principled)
+                )
                 alpha_mode, alpha_cutoff = self._gather_alpha(blender_material, principled)
 
                 # A Bump node feeding Normal may carry a Height (displacement)
@@ -118,6 +111,16 @@ class MaterialExporter:
                 ext_dict["base"] = base_extra
             extensions[EXT_MATERIALS_LAYERS] = ext_dict
             self.extensions_used.add(EXT_MATERIALS_LAYERS)
+
+        # KHR_materials_emissive_strength: emission beyond [0,1] is carried by
+        # the extension while emissiveFactor stays clamped.
+        if emissive_strength is not None:
+            if extensions is None:
+                extensions = {}
+            extensions[EXT_EMISSIVE_STRENGTH] = {
+                "emissiveStrength": emissive_strength,
+            }
+            self.extensions_used.add(EXT_EMISSIVE_STRENGTH)
 
         return Material(
             name=blender_material.name,
@@ -325,50 +328,102 @@ class MaterialExporter:
 
     def _gather_emission(
         self, principled: "bpy.types.ShaderNodeBsdfPrincipled"
-    ) -> tuple["TextureInfo | None", list[float] | None]:
-        emission_color = self._get_socket_default(principled, "Emission Color")
+    ) -> tuple["TextureInfo | None", list[float] | None, float | None]:
+        """Returns (emissive_texture, emissive_factor, emissive_strength).
+        `emissive_strength` is set (> 1.0) when the material needs the
+        KHR_materials_emissive_strength extension."""
         emission_strength = self._get_socket_default(principled, "Emission Strength")
-
-        if emission_color is None:
-            return None, None
-
         strength = float(emission_strength) if emission_strength is not None else 1.0
+
+        # Textured emission: the texture carries the color; the socket default
+        # is stale once linked, so only the strength scales the factor.
+        image_node = self._get_connected_image_node(principled, "Emission Color")
+        if image_node is not None:
+            emissive_texture = self.texture_exporter.gather_texture_info(image_node)
+            if emissive_texture is not None:
+                if strength == 0.0:
+                    return None, None, None
+                factor = [min(strength, 1.0)] * 3
+                return (
+                    emissive_texture,
+                    factor,
+                    strength if strength > 1.0 else None,
+                )
+
+        emission_color = self._get_socket_default(principled, "Emission Color")
+        if emission_color is None:
+            return None, None, None
 
         # Check if emission is effectively zero
         r, g, b = float(emission_color[0]), float(emission_color[1]), float(emission_color[2])
         if (r * strength == 0 and g * strength == 0 and b * strength == 0):
-            return None, None
+            return None, None, None
 
         emissive_factor = [r * strength, g * strength, b * strength]
+        peak = max(emissive_factor)
+        if peak > 1.0:
+            # emissiveFactor must stay within [0,1]; move the scale into the
+            # KHR_materials_emissive_strength extension.
+            emissive_factor = [c / peak for c in emissive_factor]
+            return None, emissive_factor, peak
 
-        # Emission texture
-        emissive_texture = None
-        image_node = self._get_connected_image_node(principled, "Emission Color")
-        if image_node:
-            emissive_texture = self.texture_exporter.gather_texture_info(image_node)
+        return None, emissive_factor, None
 
-        return emissive_texture, emissive_factor
+    @staticmethod
+    def _alpha_socket_used(socket) -> bool:
+        """Whether an Alpha socket actually affects the material: linked, or
+        carrying a non-1.0 constant."""
+        if socket is None:
+            return False
+        if socket.is_linked:
+            return True
+        try:
+            return float(socket.default_value) < 1.0
+        except (TypeError, ValueError):
+            return False
+
+    def _alpha_mode_for_material(
+        self,
+        blender_material: "bpy.types.Material",
+        alpha_socket,
+    ) -> tuple[str | None, float | None]:
+        """Resolve (alpha_mode, alpha_cutoff) from the material's render method
+        and the shader's Alpha socket. Returns (None, None) for OPAQUE.
+
+        Blender 4.2+ only exposes surface_render_method ("DITHERED"/"BLENDED"),
+        so whether alpha is used at all must come from the Alpha socket itself.
+        """
+        if not self._alpha_socket_used(alpha_socket):
+            return None, None  # OPAQUE
+
+        render_method = getattr(blender_material, "surface_render_method", None)
+        if render_method is not None:
+            if render_method == "BLENDED":
+                return "BLEND", None
+            # "DITHERED" maps closest to MASK
+            threshold = getattr(blender_material, "alpha_threshold", 0.5)
+            # 0.5 is the glTF spec default for alphaCutoff
+            cutoff = float(threshold) if threshold != 0.5 else None
+            return "MASK", cutoff
+
+        # Legacy fallback (Blender < 4.2): blend_method
+        blend_method = getattr(blender_material, "blend_method", "OPAQUE")
+        if blend_method == "OPAQUE":
+            return None, None
+        if blend_method in ("CLIP", "HASHED"):
+            threshold = getattr(blender_material, "alpha_threshold", 0.5)
+            cutoff = float(threshold) if threshold != 0.5 else None
+            return "MASK", cutoff
+        return "BLEND", None
 
     def _gather_alpha(
         self,
         blender_material: "bpy.types.Material",
         principled: "bpy.types.ShaderNodeBsdfPrincipled",
     ) -> tuple[str | None, float | None]:
-        blend_method = blender_material.surface_render_method if hasattr(
-            blender_material, "surface_render_method"
-        ) else getattr(blender_material, "blend_method", "OPAQUE")
-
-        if blend_method == "OPAQUE":
-            return None, None
-
-        alpha = self._get_socket_default(principled, "Alpha")
-
-        if blend_method == "CLIP" or blend_method == "HASHED":
-            threshold = getattr(blender_material, "alpha_threshold", 0.5)
-            cutoff = float(threshold) if threshold != 0.5 else None
-            return "MASK", cutoff
-
-        return "BLEND", None
+        return self._alpha_mode_for_material(
+            blender_material, principled.inputs.get("Alpha"),
+        )
 
     # Common input names that custom shader groups use for the diffuse/base
     # color and alpha sockets. Ordered by preference.
@@ -417,18 +472,7 @@ class MaterialExporter:
             a = group_node.inputs.get(name)
             if a is None:
                 continue
-            blend_method = (
-                blender_material.surface_render_method
-                if hasattr(blender_material, "surface_render_method")
-                else getattr(blender_material, "blend_method", "OPAQUE")
-            )
-            if blend_method in ("CLIP", "HASHED"):
-                threshold = getattr(blender_material, "alpha_threshold", 0.5)
-                alpha_mode, alpha_cutoff = "MASK", (
-                    float(threshold) if threshold != 0.5 else None
-                )
-            elif blend_method != "OPAQUE":
-                alpha_mode = "BLEND"
+            alpha_mode, alpha_cutoff = self._alpha_mode_for_material(blender_material, a)
             break
 
         if bc_factor is None and bc_tex is None:
@@ -465,7 +509,7 @@ class MaterialExporter:
 
     def _layer_socket(self, node, layer_index, channel_name):
         """Look up a BSDFStackNode input socket by (layer, channel name)."""
-        idx = layer_index * _N_CH + _CH[channel_name]
+        idx = layer_index * N_CH + CH_TO_IDX[channel_name]
         if 0 <= idx < len(node.inputs):
             return node.inputs[idx]
         return None
@@ -657,7 +701,9 @@ class MaterialExporter:
         )
         normal_texture = self._layer_normal_info(node, 0)
         emissive_factor, emissive_texture = self._layer_emission(node, 0)
-        alpha_mode, alpha_cutoff = self._gather_alpha(blender_material, node)
+        alpha_mode, alpha_cutoff = self._alpha_mode_for_material(
+            blender_material, self._layer_socket(node, 0, "Alpha"),
+        )
 
         # Base height/bump has no core glTF slot -> extension.base.
         base_extra: dict = {}
@@ -727,10 +773,6 @@ class MaterialExporter:
 
         return layer
 
-    def _image_node_from_socket(self, socket):
-        """Like _get_connected_image_node but takes a socket directly."""
-        return self._walk_to_image(socket)
-
     def _read_color_socket(self, socket):
         """Resolve a color socket to (factor, TextureInfo).
 
@@ -747,7 +789,7 @@ class MaterialExporter:
         if socket is None:
             return None, None
 
-        image_node = self._image_node_from_socket(socket)
+        image_node = self._walk_to_image(socket)
         if image_node is not None:
             v = socket.default_value
             tex_info = self.texture_exporter.gather_texture_info(image_node)
@@ -768,6 +810,16 @@ class MaterialExporter:
         v = socket.default_value
         return [v[0], v[1], v[2], v[3]], None
 
+    @staticmethod
+    def _tex_info_to_dict(ti) -> dict:
+        """Convert a TextureInfo to the plain dict form used by mask textures."""
+        tex: dict = {"index": ti.index}
+        if ti.tex_coord is not None:
+            tex["texCoord"] = ti.tex_coord
+        if ti.extensions:
+            tex["extensions"] = ti.extensions
+        return tex
+
     def _gather_layer_mask(self, socket) -> dict | None:
         if socket is None or not socket.is_linked:
             return None
@@ -780,12 +832,7 @@ class MaterialExporter:
             ti = self.texture_exporter.gather_texture_info(src)
             if ti is None:
                 return None
-            tex: dict = {"index": ti.index}
-            if ti.tex_coord is not None:
-                tex["texCoord"] = ti.tex_coord
-            if ti.extensions:
-                tex["extensions"] = ti.extensions
-            mask = {"source": "TEXTURE", "texture": tex}
+            mask = {"source": "TEXTURE", "texture": self._tex_info_to_dict(ti)}
             channel = "A" if from_socket_name == "Alpha" else "R"
             if channel != "R":
                 mask["channel"] = channel
@@ -801,12 +848,7 @@ class MaterialExporter:
                     ti = self.texture_exporter.gather_texture_info(inner)
                     if ti is None:
                         return None
-                    tex = {"index": ti.index}
-                    if ti.tex_coord is not None:
-                        tex["texCoord"] = ti.tex_coord
-                    if ti.extensions:
-                        tex["extensions"] = ti.extensions
-                    mask = {"source": "TEXTURE", "texture": tex}
+                    mask = {"source": "TEXTURE", "texture": self._tex_info_to_dict(ti)}
                     if channel != "R":
                         mask["channel"] = channel
                     return mask

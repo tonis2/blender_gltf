@@ -37,14 +37,17 @@ class SkinImporter:
         # skin_index -> joint_to_bone_name mapping (for deferred weight application)
         self._skin_joint_names: dict[int, dict[int, str]] = {}
 
-        if gltf.skins and gltf.nodes:
-            # Build parent map
-            parent_map: dict[int, int] = {}
+        # child_node_index -> parent_node_index, built once and reused (e.g. by
+        # _compute_node_world_transform) instead of rebuilt per call.
+        self._parent_map: dict[int, int] = {}
+        if gltf.nodes:
             for i, node in enumerate(gltf.nodes):
                 if node.children:
                     for child in node.children:
-                        parent_map[child] = i
+                        self._parent_map[child] = i
 
+        if gltf.skins and gltf.nodes:
+            parent_map = self._parent_map
             for skin_idx, skin in enumerate(gltf.skins):
                 joint_set = set(skin.joints)
                 for j in skin.joints:
@@ -159,16 +162,22 @@ class SkinImporter:
         mesh_obj: "bpy.types.Object",
         skin_index: int,
         armature_obj: "bpy.types.Object",
+        mesh_index: "int | None" = None,
     ) -> None:
-        """Apply vertex weights and armature modifier to a mesh object."""
+        """Apply vertex weights and armature modifier to a mesh object.
+
+        `mesh_index` is the glTF mesh index of the skinned node, passed by the
+        scene importer (which already has the node in hand). This replaces the
+        old reverse lookup by object name, which broke on Blender's rename
+        collisions.
+        """
         skin = self.gltf.skins[skin_index]
         joint_to_bone_name = self._skin_joint_names.get(skin_index, {})
 
         if mesh_obj and mesh_obj.data:
-            node = self._find_mesh_node(mesh_obj.name)
-            if node is not None and node.mesh is not None:
+            if mesh_index is not None:
                 self._apply_vertex_weights(
-                    mesh_obj, node.mesh, skin.joints, joint_to_bone_name,
+                    mesh_obj, mesh_index, skin.joints, joint_to_bone_name,
                 )
             mod = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
             mod.object = armature_obj
@@ -180,10 +189,11 @@ class SkinImporter:
         mesh_obj: "bpy.types.Object",
         collection: "bpy.types.Collection",
         armature_world=None,
+        mesh_index: "int | None" = None,
     ) -> "bpy.types.Object":
         """Create an armature from a glTF skin, apply vertex weights, return armature object."""
         armature_obj = self.create_armature(context, skin_index, collection, armature_world)
-        self.apply_skin_to_mesh(mesh_obj, skin_index, armature_obj)
+        self.apply_skin_to_mesh(mesh_obj, skin_index, armature_obj, mesh_index)
         return armature_obj
 
     def _compute_bone_length(
@@ -212,13 +222,8 @@ class SkinImporter:
         """Compute a node's world transform by walking up the parent chain."""
         import mathutils
 
-        # Build parent map
-        parent_map: dict[int, int] = {}
-        if self.gltf.nodes:
-            for i, node in enumerate(self.gltf.nodes):
-                if node.children:
-                    for child in node.children:
-                        parent_map[child] = i
+        # Reuse the parent map built once in __init__.
+        parent_map = self._parent_map
 
         # Accumulate transforms from root to this node
         chain = []
@@ -267,14 +272,6 @@ class SkinImporter:
 
         return result
 
-    def _find_mesh_node(self, obj_name: str):
-        """Find a glTF node by name."""
-        if self.gltf.nodes:
-            for node in self.gltf.nodes:
-                if node.name == obj_name:
-                    return node
-        return None
-
     def _apply_vertex_weights(
         self,
         mesh_obj: "bpy.types.Object",
@@ -287,13 +284,15 @@ class SkinImporter:
         if not skin_data:
             return
 
-        # Create vertex groups for all joints
-        joint_idx_to_group: dict[int, str] = {}
+        # Create vertex groups for all joints, caching the group objects so the
+        # inner weight loop doesn't re-resolve them by name per vertex.
+        joint_local_to_group: dict[int, "bpy.types.VertexGroup"] = {}
         for i, joint_idx in enumerate(joints):
             bone_name = joint_to_bone_name.get(joint_idx, f"Joint_{i}")
-            if bone_name not in mesh_obj.vertex_groups:
-                mesh_obj.vertex_groups.new(name=bone_name)
-            joint_idx_to_group[i] = bone_name
+            vg = mesh_obj.vertex_groups.get(bone_name)
+            if vg is None:
+                vg = mesh_obj.vertex_groups.new(name=bone_name)
+            joint_local_to_group[i] = vg
 
         # Apply weights from each primitive's data
         for joint_array, weight_array, vert_offset in skin_data:
@@ -303,7 +302,6 @@ class SkinImporter:
                     w = float(weight_array[v_local, k])
                     if w > 0:
                         j = int(joint_array[v_local, k])
-                        group_name = joint_idx_to_group.get(j)
-                        if group_name:
-                            vg = mesh_obj.vertex_groups[group_name]
+                        vg = joint_local_to_group.get(j)
+                        if vg is not None:
                             vg.add([v_global], w, "REPLACE")

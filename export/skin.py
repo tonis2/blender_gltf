@@ -7,7 +7,7 @@ import numpy as np
 from ..gltf.buffer import BufferBuilder
 from ..gltf.constants import ComponentType, DataType
 from ..gltf.types import Node, Skin
-from .converter import convert_location, convert_rotation, convert_scale, convert_matrix
+from .converter import convert_matrix, trs_to_node_fields
 
 if TYPE_CHECKING:
     import bpy
@@ -19,8 +19,9 @@ class SkinExporter:
         self.buffer = buffer
         self.settings = settings
         self.skins: list[Skin] = []
-        # bone_name -> node_index (for animation export)
-        self.bone_to_node_index: dict[str, int] = {}
+        # (armature_object_name, bone_name) -> node_index (for animation export).
+        # Keyed per armature so equal bone names across armatures can't collide.
+        self.bone_to_node_index: dict[tuple[str, str], int] = {}
         # armature_name -> {bone_name: joint_index_in_skin}
         self.armature_joint_maps: dict[str, dict[str, int]] = {}
         # armature_name -> skin_index
@@ -52,29 +53,20 @@ class SkinExporter:
             else:
                 local_mat = bone.matrix_local
 
-            loc, rot, scl = local_mat.decompose()
-            translation = convert_location(loc)
-            rotation = convert_rotation(rot)
-            gltf_scale = convert_scale(scl)
-
-            # Omit identity transforms
-            is_id_t = all(abs(v) < 1e-6 for v in translation)
-            is_id_r = (abs(rotation[0]) < 1e-6 and abs(rotation[1]) < 1e-6 and
-                       abs(rotation[2]) < 1e-6 and abs(rotation[3] - 1.0) < 1e-6)
-            is_id_s = all(abs(v - 1.0) < 1e-6 for v in gltf_scale)
+            translation, rotation, gltf_scale = trs_to_node_fields(local_mat)
 
             node = Node(
                 name=bone.name,
-                translation=translation if not is_id_t else None,
-                rotation=rotation if not is_id_r else None,
-                scale=gltf_scale if not is_id_s else None,
+                translation=translation,
+                rotation=rotation,
+                scale=gltf_scale,
             )
 
             node_index = len(nodes)
             nodes.append(node)
             bone_node_indices[bone.name] = node_index
             joint_indices.append(node_index)
-            self.bone_to_node_index[bone.name] = node_index
+            self.bone_to_node_index[(armature_obj.name, bone.name)] = node_index
 
         # Wire children
         for bone in bones:

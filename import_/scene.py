@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 from .converter import (
     convert_location, convert_rotation, convert_scale,
     convert_location_array, convert_rotation_array, convert_scale_array,
+    matrix_from_gltf,
 )
 
 if TYPE_CHECKING:
@@ -44,10 +45,12 @@ class SceneImporter:
         self.audio_importer = audio_importer
         self.node_to_blender: dict[int, "bpy.types.Object"] = {}
         self._skin_armatures: dict[int, "bpy.types.Object"] = {}
-        # GPU-instancing reconstruction (Geometry Nodes "Instance on Points")
+        # GPU-instancing reconstruction (Geometry Nodes "Instance on Points").
+        # Instances/Sources collections are per parent collection (keyed by
+        # as_pointer) so multi-scene files get one pair per scene.
         self._instance_node_group: "bpy.types.NodeTree | None" = None
-        self._instances_coll: "bpy.types.Collection | None" = None
-        self._sources_coll: "bpy.types.Collection | None" = None
+        self._instances_colls: dict[int, "bpy.types.Collection"] = {}
+        self._sources_colls: dict[int, "bpy.types.Collection"] = {}
 
     def import_scene(self, context: "bpy.types.Context") -> dict[int, "bpy.types.Object"]:
         """Import all glTF scenes, creating Blender scenes as needed."""
@@ -59,6 +62,10 @@ class SceneImporter:
         active_scene_index = self.gltf.scene if self.gltf.scene is not None else 0
         original_scene = context.window.scene
 
+        # Track the Blender scene created for each glTF scene so the active
+        # scene can be selected by index rather than by fragile name matching.
+        bl_scenes: list["bpy.types.Scene"] = []
+
         for scene_idx, gltf_scene in enumerate(self.gltf.scenes):
             if scene_idx == 0:
                 # Use the existing active scene for the first glTF scene
@@ -69,6 +76,7 @@ class SceneImporter:
             if gltf_scene.name:
                 bl_scene.name = gltf_scene.name
 
+            bl_scenes.append(bl_scene)
             context.window.scene = bl_scene
             collection = bl_scene.collection
 
@@ -80,16 +88,10 @@ class SceneImporter:
             if self.audio_importer:
                 self.audio_importer.import_global_emitters(gltf_scene, collection)
 
-        # Switch to the active scene as indicated by the glTF
-        if active_scene_index < len(self.gltf.scenes):
-            target_name = self.gltf.scenes[active_scene_index].name
-            if target_name:
-                for sc in bpy.data.scenes:
-                    if sc.name == target_name or sc.name.startswith(target_name):
-                        context.window.scene = sc
-                        break
-            else:
-                context.window.scene = original_scene
+        # Switch to the active scene as indicated by the glTF, indexing the
+        # scenes we just created rather than matching by name.
+        if 0 <= active_scene_index < len(bl_scenes):
+            context.window.scene = bl_scenes[active_scene_index]
         else:
             context.window.scene = original_scene
 
@@ -192,13 +194,16 @@ class SceneImporter:
             if node.skin in self._skin_armatures:
                 # Armature was already created at its wrapper node
                 armature_obj = self._skin_armatures[node.skin]
-                self.skin_importer.apply_skin_to_mesh(obj, node.skin, armature_obj)
+                self.skin_importer.apply_skin_to_mesh(
+                    obj, node.skin, armature_obj, node.mesh,
+                )
             else:
                 # Fallback: create armature at the mesh node
                 context.view_layer.update()
                 arm_world = self._get_node_world_matrix(node, parent_obj)
                 armature_obj = self.skin_importer.import_skin(
                     context, node.skin, obj, collection, arm_world,
+                    mesh_index=node.mesh,
                 )
                 self._apply_transform(armature_obj, node)
                 if parent_obj:
@@ -261,30 +266,25 @@ class SceneImporter:
         if camera_index >= len(self.gltf.cameras):
             return None
         gltf_cam = self.gltf.cameras[camera_index]
-        cam_name = gltf_cam.name if hasattr(gltf_cam, 'name') and gltf_cam.name else f"Camera_{camera_index}"
+        cam_name = gltf_cam.name or f"Camera_{camera_index}"
+        cam = bpy.data.cameras.new(cam_name)
 
-        if hasattr(gltf_cam, 'type') and gltf_cam.type == "orthographic":
-            cam = bpy.data.cameras.new(cam_name)
+        if gltf_cam.type == "orthographic":
             cam.type = "ORTHO"
-            ortho = gltf_cam.orthographic if hasattr(gltf_cam, 'orthographic') else None
-            if ortho:
-                xmag = ortho.xmag if hasattr(ortho, 'xmag') else ortho.get("xmag", 1.0)
-                ymag = ortho.ymag if hasattr(ortho, 'ymag') else ortho.get("ymag", 1.0)
-                cam.ortho_scale = max(xmag, ymag) * 2.0
-                cam.clip_start = ortho.znear if hasattr(ortho, 'znear') else ortho.get("znear", 0.01)
-                cam.clip_end = ortho.zfar if hasattr(ortho, 'zfar') else ortho.get("zfar", 1000.0)
+            ortho = gltf_cam.orthographic
+            if ortho is not None:
+                cam.ortho_scale = max(ortho.xmag, ortho.ymag) * 2.0
+                cam.clip_start = ortho.znear
+                cam.clip_end = ortho.zfar
         else:
-            cam = bpy.data.cameras.new(cam_name)
             cam.type = "PERSP"
-            persp = gltf_cam.perspective if hasattr(gltf_cam, 'perspective') else None
-            if persp:
-                yfov = persp.yfov if hasattr(persp, 'yfov') else persp.get("yfov", 0.5)
-                cam.angle_y = yfov
+            persp = gltf_cam.perspective
+            if persp is not None:
+                cam.angle_y = persp.yfov
                 cam.lens_unit = "FOV"
-                cam.clip_start = persp.znear if hasattr(persp, 'znear') else persp.get("znear", 0.01)
-                zfar = persp.zfar if hasattr(persp, 'zfar') else persp.get("zfar", None)
-                if zfar is not None:
-                    cam.clip_end = zfar
+                cam.clip_start = persp.znear
+                if persp.zfar is not None:
+                    cam.clip_end = persp.zfar
         return cam
 
     _GLTF_LIGHT_TYPE_MAP = {
@@ -322,7 +322,9 @@ class SceneImporter:
             outer = spot.get("outerConeAngle", 0.7854)
             inner = spot.get("innerConeAngle", 0.0)
             light.spot_size = outer * 2.0
-            light.spot_blend = inner / outer if outer > 0 else 0.0
+            light.spot_blend = (
+                max(0.0, min(1.0, 1.0 - inner / outer)) if outer > 0 else 0.0
+            )
 
         return light
 
@@ -400,7 +402,15 @@ class SceneImporter:
         if scales is not None:
             scales = convert_scale_array(scales)
 
-        num_instances = len(trans) if trans is not None else 1
+        # The number of instances is the length of whichever of
+        # translation/rotation/scale is present (any single one suffices; a
+        # file may carry only ROTATION or only SCALE). Default to 1 so a
+        # degenerate node with no attributes still yields one instance.
+        num_instances = 1
+        for arr in (trans, rots, scales):
+            if arr is not None:
+                num_instances = len(arr)
+                break
 
         # Gather source meshes (the node's own mesh plus any mesh children that
         # share these instance transforms).
@@ -418,7 +428,12 @@ class SceneImporter:
         # Build the shared point cloud (one point per instance) carrying the
         # per-instance rotation/scale as attributes the node group reads.
         points_mesh = bpy.data.meshes.new(f"{node.name or f'Instance_{node_index}'}_points")
-        verts = [tuple(t) for t in trans] if trans is not None else [(0.0, 0.0, 0.0)]
+        # Default absent translation to zeros at every instance, mirroring the
+        # identity-quat / unit-scale tiling done below for rotation/scale.
+        if trans is not None:
+            verts = [tuple(t) for t in trans]
+        else:
+            verts = [(0.0, 0.0, 0.0)] * num_instances
         points_mesh.from_pydata(verts, [], [])
         points_mesh.update()
 
@@ -514,19 +529,27 @@ class SceneImporter:
     def _get_instances_collection(
         self, parent: "bpy.types.Collection",
     ) -> "bpy.types.Collection":
-        """Collection holding the visible GN instancer objects."""
+        """Collection holding the visible GN instancer objects, cached per
+        parent collection so multi-scene files get one per scene."""
         import bpy
-        if self._instances_coll is None:
-            self._instances_coll = bpy.data.collections.new("Instances")
-            parent.children.link(self._instances_coll)
-        return self._instances_coll
+        key = parent.as_pointer()
+        coll = self._instances_colls.get(key)
+        if coll is None:
+            coll = bpy.data.collections.new("Instances")
+            parent.children.link(coll)
+            self._instances_colls[key] = coll
+        return coll
 
     def _get_sources_collection(
         self, parent: "bpy.types.Collection",
     ) -> "bpy.types.Collection":
-        """Collection holding the hidden source objects that get instanced."""
+        """Collection holding the hidden source objects that get instanced,
+        cached per parent collection (one per scene)."""
         import bpy
-        if self._sources_coll is None:
-            self._sources_coll = bpy.data.collections.new("Instance Sources")
-            parent.children.link(self._sources_coll)
-        return self._sources_coll
+        key = parent.as_pointer()
+        coll = self._sources_colls.get(key)
+        if coll is None:
+            coll = bpy.data.collections.new("Instance Sources")
+            parent.children.link(coll)
+            self._sources_colls[key] = coll
+        return coll

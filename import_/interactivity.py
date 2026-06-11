@@ -8,7 +8,15 @@ Round-trips the layout produced by `export.interactivity.InteractivityExporter`.
 """
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
+
+from ..interactivity_nodes import (
+    EXT_INTERACTIVITY,
+    FLOW_SOCKET_BL_IDNAME,
+    POINTER_TEMPLATES,
+    TREE_BL_IDNAME,
+)
 
 if TYPE_CHECKING:
     import bpy
@@ -16,133 +24,78 @@ if TYPE_CHECKING:
     from ..importer import ImportSettings
 
 
-EXT_INTERACTIVITY = "KHR_interactivity"
-TREE_BL_IDNAME = "GLTFInteractivityTreeType"
-FLOW_SOCKET_BL_IDNAME = "GLTFFlowSocketType"
+def _build_pointer_matchers():
+    """Derive pointer-path matchers from the shared POINTER_TEMPLATES.
+
+    Each template path (with `{idx}`/`{sub}` placeholders) becomes an anchored
+    regex. `{idx}` and `{sub}` capture integer components. The match yields the
+    same (kind, idx, property, sub_idx) tuple the importer needs, with sub_idx
+    populated only for templates carrying a `{sub}` placeholder (morph WEIGHT).
+    """
+    matchers = []
+    for kind, props in POINTER_TEMPLATES.items():
+        for prop, template in props.items():
+            has_sub = "{sub}" in template
+            pattern = "^" + re.escape(template) + "$"
+            pattern = pattern.replace(re.escape("{idx}"), r"(\d+)")
+            pattern = pattern.replace(re.escape("{sub}"), r"(\d+)")
+            matchers.append((re.compile(pattern), kind, prop, has_sub))
+    return matchers
 
 
-_TRS_TO_PROP = {
-    ("translation", 0): "TRANSLATION_X", ("translation", 1): "TRANSLATION_Y",
-    ("translation", 2): "TRANSLATION_Z",
-    ("rotation", 0): "ROTATION_X", ("rotation", 1): "ROTATION_Y",
-    ("rotation", 2): "ROTATION_Z", ("rotation", 3): "ROTATION_W",
-    ("scale", 0): "SCALE_X", ("scale", 1): "SCALE_Y", ("scale", 2): "SCALE_Z",
-}
-_BASE_COLOR_PROP = {
-    0: "BASE_COLOR_R", 1: "BASE_COLOR_G", 2: "BASE_COLOR_B", 3: "BASE_COLOR_A",
-}
-_EMISSIVE_PROP = {0: "EMISSIVE_R", 1: "EMISSIVE_G", 2: "EMISSIVE_B"}
-_LIGHT_COLOR_PROP = {0: "COLOR_R", 1: "COLOR_G", 2: "COLOR_B"}
+_POINTER_MATCHERS = _build_pointer_matchers()
 
 
 def _parse_pointer(p: str):
     """Parse a JSON pointer into (kind, idx, property, sub_idx) or None."""
     if not isinstance(p, str) or not p.startswith("/"):
         return None
-    parts = p.strip("/").split("/")
-    try:
-        if parts[0] == "nodes" and len(parts) >= 3:
-            idx = int(parts[1])
-            if len(parts) == 4 and parts[2] in ("translation", "rotation", "scale"):
-                comp = int(parts[3])
-                key = (parts[2], comp)
-                if key in _TRS_TO_PROP:
-                    return ("OBJECT", idx, _TRS_TO_PROP[key], None)
-            if len(parts) == 4 and parts[2] == "weights":
-                return ("OBJECT", idx, "WEIGHT", int(parts[3]))
-            if len(parts) == 5 and parts[2] == "extensions" \
-                    and parts[3] == "KHR_node_visibility" and parts[4] == "visible":
-                return ("OBJECT", idx, "VISIBLE", None)
-        if parts[0] == "materials" and len(parts) >= 3:
-            idx = int(parts[1])
-            if len(parts) == 5 and parts[2] == "pbrMetallicRoughness" \
-                    and parts[3] == "baseColorFactor":
-                comp = int(parts[4])
-                if comp in _BASE_COLOR_PROP:
-                    return ("MATERIAL", idx, _BASE_COLOR_PROP[comp], None)
-            if len(parts) == 4 and parts[2] == "pbrMetallicRoughness":
-                if parts[3] == "metallicFactor":
-                    return ("MATERIAL", idx, "METALLIC", None)
-                if parts[3] == "roughnessFactor":
-                    return ("MATERIAL", idx, "ROUGHNESS", None)
-            if len(parts) == 4 and parts[2] == "emissiveFactor":
-                comp = int(parts[3])
-                if comp in _EMISSIVE_PROP:
-                    return ("MATERIAL", idx, _EMISSIVE_PROP[comp], None)
-            if len(parts) == 3 and parts[2] == "alphaCutoff":
-                return ("MATERIAL", idx, "ALPHA_CUTOFF", None)
-            if len(parts) == 5 and parts[2] == "extensions" \
-                    and parts[3] == "KHR_materials_emissive_strength" \
-                    and parts[4] == "emissiveStrength":
-                return ("MATERIAL", idx, "EMISSIVE_STRENGTH", None)
-        if (len(parts) >= 5 and parts[0] == "extensions"
-                and parts[1] == "KHR_lights_punctual" and parts[2] == "lights"):
-            idx = int(parts[3])
-            if len(parts) == 5:
-                if parts[4] == "intensity":
-                    return ("LIGHT", idx, "INTENSITY", None)
-                if parts[4] == "range":
-                    return ("LIGHT", idx, "RANGE", None)
-            if len(parts) == 6 and parts[4] == "color":
-                comp = int(parts[5])
-                if comp in _LIGHT_COLOR_PROP:
-                    return ("LIGHT", idx, _LIGHT_COLOR_PROP[comp], None)
-            if len(parts) == 6 and parts[4] == "spot":
-                if parts[5] == "innerConeAngle":
-                    return ("LIGHT", idx, "INNER_CONE", None)
-                if parts[5] == "outerConeAngle":
-                    return ("LIGHT", idx, "OUTER_CONE", None)
-        if parts[0] == "cameras" and len(parts) == 4:
-            idx = int(parts[1])
-            if parts[2] == "perspective":
-                if parts[3] == "yfov":
-                    return ("CAMERA", idx, "YFOV", None)
-                if parts[3] == "znear":
-                    return ("CAMERA", idx, "ZNEAR", None)
-                if parts[3] == "zfar":
-                    return ("CAMERA", idx, "ZFAR", None)
-            if parts[2] == "orthographic":
-                if parts[3] == "xmag":
-                    return ("CAMERA", idx, "XMAG", None)
-                if parts[3] == "ymag":
-                    return ("CAMERA", idx, "YMAG", None)
-    except (ValueError, IndexError):
-        return None
+    for regex, kind, prop, has_sub in _POINTER_MATCHERS:
+        m = regex.match(p)
+        if m is None:
+            continue
+        idx = int(m.group(1))
+        sub_idx = int(m.group(2)) if has_sub else None
+        return (kind, idx, prop, sub_idx)
+    return None
+
+
+def _find_obj_data_by_index(gltf, node_to_blender, idx: int, matcher, obj_type: str):
+    """Find the Blender object-data datablock backing a gltf array element.
+
+    `matcher(gltf_node)` returns True when that gltf node references the wanted
+    gltf array index; `obj_type` is the expected Blender `obj.type`. Returns the
+    matched datablock or None (no bpy.data fallback: alphabetical index ordering
+    would bind unrelated datablocks when importing into a non-empty .blend).
+    """
+    if gltf.nodes is not None:
+        for i, gn in enumerate(gltf.nodes):
+            if not matcher(gn):
+                continue
+            obj = node_to_blender.get(i)
+            if obj is not None and obj.data is not None and obj.type == obj_type:
+                return obj.data
     return None
 
 
 def _find_light_by_index(gltf, node_to_blender, light_idx: int):
     """Find the Blender Light datablock for KHR_lights_punctual lights[idx]."""
-    import bpy
-    if gltf.nodes is not None:
-        for i, gn in enumerate(gltf.nodes):
-            ext = gn.extensions
-            if ext is None:
-                continue
-            lp = ext.get("KHR_lights_punctual")
-            if lp is None:
-                continue
-            if lp.get("light") == light_idx:
-                obj = node_to_blender.get(i)
-                if obj is not None and obj.data is not None and obj.type == "LIGHT":
-                    return obj.data
-    if 0 <= light_idx < len(bpy.data.lights):
-        return bpy.data.lights[light_idx]
-    return None
+    def matcher(gn):
+        ext = gn.extensions
+        if ext is None:
+            return False
+        lp = ext.get("KHR_lights_punctual")
+        return lp is not None and lp.get("light") == light_idx
+
+    return _find_obj_data_by_index(gltf, node_to_blender, light_idx, matcher, "LIGHT")
 
 
 def _find_camera_by_index(gltf, node_to_blender, camera_idx: int):
     """Find the Blender Camera datablock for gltf cameras[camera_idx]."""
-    import bpy
-    if gltf.nodes is not None:
-        for i, gn in enumerate(gltf.nodes):
-            if gn.camera == camera_idx:
-                obj = node_to_blender.get(i)
-                if obj is not None and obj.data is not None and obj.type == "CAMERA":
-                    return obj.data
-    if 0 <= camera_idx < len(bpy.data.cameras):
-        return bpy.data.cameras[camera_idx]
-    return None
+    return _find_obj_data_by_index(
+        gltf, node_to_blender, camera_idx,
+        lambda gn: gn.camera == camera_idx, "CAMERA",
+    )
 
 
 class InteractivityImporter:
@@ -177,7 +130,7 @@ class InteractivityImporter:
         if ext is None:
             return
         graph_idx = ext.get("graph")
-        if graph_idx is None or graph_idx >= len(self._graphs):
+        if not isinstance(graph_idx, int) or not (0 <= graph_idx < len(self._graphs)):
             return
 
         tree = self._cached_trees.get(graph_idx)
@@ -216,7 +169,7 @@ class InteractivityImporter:
         obj_name: str,
     ) -> "bpy.types.NodeTree":
         import bpy
-        from ..interactivity_nodes import OP_TO_BLIDNAME, BLIDNAME_TO_CLASS
+        from ..interactivity_nodes import OP_TO_BLIDNAME
 
         graph = self._graphs[graph_idx]
         tree = bpy.data.node_groups.new(

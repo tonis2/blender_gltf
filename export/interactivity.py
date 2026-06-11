@@ -24,29 +24,28 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ..interactivity_nodes import (
+    EXT_INTERACTIVITY,
+    FLOW_SOCKET_BL_IDNAME,
+    POINTER_TEMPLATES,
+    PREDEFINED_TYPES,
+    TREE_BL_IDNAME,
+    TYPE_BOOL,
+    TYPE_FLOAT,
+    TYPE_INT,
+)
+
 if TYPE_CHECKING:
     import bpy
     from ..exporter import ExportSettings
 
 
-EXT_INTERACTIVITY = "KHR_interactivity"
-TREE_BL_IDNAME = "GLTFInteractivityTreeType"
-FLOW_SOCKET_BL_IDNAME = "GLTFFlowSocketType"
-
-# Predefined types — these match interactivity_nodes.PREDEFINED_TYPES.
-_TYPES = [
-    {"signature": "float"},
-    {"signature": "bool"},
-    {"signature": "int"},
-]
-_TYPE_FLOAT, _TYPE_BOOL, _TYPE_INT = 0, 1, 2
-
 # Map a Blender socket bl_idname to (typeIndex, value-coercer).
 _SOCKET_TYPE: dict[str, tuple[int, callable]] = {
-    "NodeSocketFloat":      (_TYPE_FLOAT, lambda v: [float(v)]),
-    "NodeSocketFloatFactor":(_TYPE_FLOAT, lambda v: [float(v)]),
-    "NodeSocketBool":       (_TYPE_BOOL,  lambda v: [bool(v)]),
-    "NodeSocketInt":        (_TYPE_INT,   lambda v: [int(v)]),
+    "NodeSocketFloat":      (TYPE_FLOAT, lambda v: [float(v)]),
+    "NodeSocketFloatFactor":(TYPE_FLOAT, lambda v: [float(v)]),
+    "NodeSocketBool":       (TYPE_BOOL,  lambda v: [bool(v)]),
+    "NodeSocketInt":        (TYPE_INT,   lambda v: [int(v)]),
 }
 
 
@@ -98,7 +97,7 @@ class InteractivityExporter:
             return None
         return {
             EXT_INTERACTIVITY: {
-                "types":        list(_TYPES),
+                "types":        list(PREDEFINED_TYPES),
                 "declarations": list(self._declarations),
                 "graphs":       self._graphs,
             }
