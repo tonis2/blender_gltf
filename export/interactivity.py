@@ -196,7 +196,7 @@ class InteractivityExporter:
     def _resolve_material_pointer(self, n) -> str | None:
         if self.material_exporter is None or n.target_material is None:
             return None
-        idx = self.material_exporter._cache.get(n.target_material.name)
+        idx = self.material_exporter.material_index_by_name.get(n.target_material.name)
         if idx is None:
             return None
         prop = n.material_property
@@ -217,8 +217,7 @@ class InteractivityExporter:
     def _resolve_light_pointer(self, n) -> str | None:
         if self.scene_exporter is None or n.target_light is None:
             return None
-        cache = getattr(self.scene_exporter, "_light_cache", {})
-        idx = cache.get(n.target_light.name)
+        idx = self.scene_exporter.light_index_by_name.get(n.target_light.name)
         if idx is None:
             return None
         prop = n.light_property
@@ -238,8 +237,7 @@ class InteractivityExporter:
     def _resolve_camera_pointer(self, n) -> str | None:
         if self.scene_exporter is None or n.target_camera is None:
             return None
-        cache = getattr(self.scene_exporter, "_camera_cache", {})
-        idx = cache.get(n.target_camera.name)
+        idx = self.scene_exporter.camera_index_by_name.get(n.target_camera.name)
         if idx is None:
             return None
         prop = n.camera_property

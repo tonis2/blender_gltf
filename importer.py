@@ -22,6 +22,30 @@ if TYPE_CHECKING:
     import bpy
 
 
+# Extensions this importer understands. Anything listed in a file's
+# `extensionsRequired` but absent here means the file cannot be imported
+# faithfully — we warn rather than silently producing wrong geometry/data.
+# KHR_mesh_quantization has no dedicated module: it is handled transparently
+# in BufferReader (normalized integer accessors), hence it is listed here.
+SUPPORTED_EXTENSIONS = frozenset({
+    "CUSTOM_animation_events",
+    "CUSTOM_materials_layers",
+    "CUSTOM_particle_emitter",
+    "EXT_mesh_gpu_instancing",
+    "KHR_audio_emitter",
+    "KHR_implicit_shapes",
+    "KHR_interactivity",
+    "KHR_lights_punctual",
+    "KHR_materials_emissive_strength",
+    "KHR_materials_unlit",
+    "KHR_mesh_quantization",
+    "KHR_node_visibility",
+    "KHR_physics_rigid_bodies",
+    "KHR_texture_transform",
+    "MSFT_lod",
+})
+
+
 @dataclass
 class ImportSettings:
     filepath: str = ""
@@ -58,6 +82,17 @@ class GltfImporter:
 
         # 2. Deserialize
         gltf = Gltf.from_dict(gltf_dict)
+
+        # 2b. Warn about required extensions we don't support — the resulting
+        # import may be incomplete or visually wrong.
+        required = set(gltf.extensions_required or [])
+        unsupported = sorted(required - SUPPORTED_EXTENSIONS)
+        if unsupported:
+            print(
+                "[glTF import] WARNING: file requires unsupported extension(s): "
+                + ", ".join(unsupported)
+                + ". Import may be incomplete or incorrect."
+            )
 
         # 3. Buffer reader
         buffer_reader = BufferReader(gltf, binary or b"", path.parent)

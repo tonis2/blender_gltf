@@ -80,6 +80,10 @@ class PhysicsImporter:
         """Post-pass: create rigid body constraints for joint nodes."""
         import bpy
 
+        # Parenting/transforms are set during node import; flush them so that
+        # matrix_world reflects the final world-space placement of each object.
+        context.view_layer.update()
+
         for node_index, joint_data, node_ext in self._joint_nodes:
             connected_node_idx = joint_data.get("connectedNode")
             joint_desc_idx = joint_data.get("joint")
@@ -99,13 +103,15 @@ class PhysicsImporter:
             if body_a_obj is None or body_b_obj is None:
                 continue
 
-            # Get joint world position from the joint node
+            # Get joint world position from the joint node. matrix_world is used
+            # (not .location, which is parent-relative) because the empty is
+            # linked into the scene collection in world space.
             joint_obj = node_to_blender.get(node_index)
             if joint_obj is None:
                 # Joint pivot node might not be a real object — use body A's position
-                joint_loc = body_a_obj.location
+                joint_loc = body_a_obj.matrix_world.translation.copy()
             else:
-                joint_loc = joint_obj.location
+                joint_loc = joint_obj.matrix_world.translation.copy()
 
             # Create constraint empty
             empty = bpy.data.objects.new(f"Joint_{node_index}", None)

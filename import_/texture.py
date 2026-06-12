@@ -65,14 +65,21 @@ class TextureImporter:
                 return self._load_from_bytes(name, data, mime)
             else:
                 filepath = self.base_dir / gltf_image.uri
-                img = bpy.data.images.load(str(filepath))
+                try:
+                    img = bpy.data.images.load(str(filepath))
+                except RuntimeError as e:
+                    print(f"[glTF import] Could not load image '{gltf_image.uri}': {e}")
+                    return self._placeholder(name)
                 img.name = name
                 return img
 
-        # Fallback: create a placeholder
+        # No buffer view or URI: create a placeholder
+        return self._placeholder(name)
+
+    def _placeholder(self, name: str) -> "bpy.types.Image":
+        """1x1 stand-in so a missing/undecodable image never aborts the import."""
         import bpy
-        img = bpy.data.images.new(name, width=1, height=1)
-        return img
+        return bpy.data.images.new(name, width=1, height=1)
 
     def _load_from_bytes(self, name: str, data: bytes, mime_type: str | None) -> "bpy.types.Image":
         import bpy
@@ -85,6 +92,9 @@ class TextureImporter:
             img = bpy.data.images.load(tmp_path)
             img.name = name
             img.pack()
+        except RuntimeError as e:
+            print(f"[glTF import] Could not decode embedded image '{name}': {e}")
+            return self._placeholder(name)
         finally:
             os.unlink(tmp_path)
         return img
