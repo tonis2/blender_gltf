@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .gltf.serialize import read_glb, read_gltf
+from .gltf.serialize import read_glb, read_gltf, parse_glb
 from .gltf.types import Gltf
 from .import_.buffer_reader import BufferReader
 from .import_.texture import TextureImporter
@@ -60,6 +60,8 @@ class ImportSettings:
     import_particles: bool = True
     import_interactivity: bool = True
     import_audio: bool = True
+    import_uids: bool = True
+    import_external_assets: bool = True
 
 
 class GltfImporter:
@@ -83,6 +85,23 @@ class GltfImporter:
         # 2. Deserialize
         gltf = Gltf.from_dict(gltf_dict)
 
+        self._run_pipeline(gltf, binary, path.parent)
+
+    def _run_pipeline(
+        self,
+        gltf: "Gltf",
+        binary: bytes | None,
+        base_dir: Path,
+        *,
+        target_collection: "bpy.types.Collection | None" = None,
+        external_depth: int = 0,
+    ) -> dict:
+        """Run the import pipeline for a deserialized glTF.
+
+        When ``target_collection`` is given, all nodes are imported into that
+        collection instead of creating Blender scenes — used when instantiating
+        a glTF 2.1 [DRAFT] external/packaged sub-asset. Returns node->object map.
+        """
         # 2b. Warn about required extensions we don't support — the resulting
         # import may be incomplete or visually wrong.
         required = set(gltf.extensions_required or [])
@@ -95,10 +114,15 @@ class GltfImporter:
             )
 
         # 3. Buffer reader
-        buffer_reader = BufferReader(gltf, binary or b"", path.parent)
+        buffer_reader = BufferReader(gltf, binary or b"", base_dir)
+
+        # 3b. External-asset resolver (glTF 2.1 [DRAFT] files array)
+        file_resolver = None
+        if gltf.files and self.settings.import_external_assets:
+            file_resolver = FileResolver(gltf, buffer_reader, base_dir)
 
         # 4. Import textures
-        texture_importer = TextureImporter(gltf, buffer_reader, self.settings, path.parent)
+        texture_importer = TextureImporter(gltf, buffer_reader, self.settings, base_dir)
         if self.settings.import_materials:
             texture_importer.import_all()
 
@@ -140,7 +164,7 @@ class GltfImporter:
         # 7e. Prepare audio importer
         audio_importer = None
         if self.settings.import_audio:
-            audio_importer = AudioImporter(gltf, buffer_reader, self.settings, path.parent)
+            audio_importer = AudioImporter(gltf, buffer_reader, self.settings, base_dir)
             if not audio_importer.has_audio():
                 audio_importer = None
 
@@ -152,6 +176,9 @@ class GltfImporter:
             particle_importer=particle_importer,
             interactivity_importer=interactivity_importer,
             audio_importer=audio_importer,
+            file_resolver=file_resolver,
+            target_collection=target_collection,
+            external_depth=external_depth,
         )
         node_to_blender = scene_importer.import_scene(self.context)
 
@@ -171,3 +198,66 @@ class GltfImporter:
                 bone_node_to_armature=bone_mapping,
             )
             anim_importer.import_all(self.context)
+
+        return node_to_blender
+
+
+# Max external-asset nesting depth — a backstop against malformed self-references.
+MAX_EXTERNAL_DEPTH = 8
+
+
+class FileResolver:
+    """Resolves glTF 2.1 [DRAFT] ``files`` entries to (gltf_dict, binary).
+
+    A file entry is either an external ``uri`` (relative path or data: URI) or
+    an embedded GLB blob referenced by ``bufferView`` (packaging — the host
+    file acts as a virtual filesystem)."""
+
+    def __init__(self, gltf: "Gltf", buffer_reader: "BufferReader", base_dir: Path) -> None:
+        self.gltf = gltf
+        self.buffer_reader = buffer_reader
+        self.base_dir = base_dir
+
+    def load(self, file_index: int) -> tuple[dict, bytes | None]:
+        f = self.gltf.files[file_index]
+        if f.buffer_view is not None:
+            blob = self.buffer_reader.read_buffer_view_bytes(f.buffer_view)
+            return self._parse_blob(bytes(blob))
+        if f.uri:
+            if f.uri.startswith("data:"):
+                import base64
+                blob = base64.b64decode(f.uri.split(",", 1)[1])
+                return self._parse_blob(blob)
+            p = self.base_dir / f.uri
+            data = p.read_bytes()
+            if data[:4] == b"glTF":
+                return parse_glb(data)
+            return read_gltf(p)
+        raise ValueError(f"File {file_index} has neither uri nor bufferView")
+
+    @staticmethod
+    def _parse_blob(blob: bytes) -> tuple[dict, bytes | None]:
+        if blob[:4] == b"glTF":
+            return parse_glb(blob)
+        import json
+        return json.loads(blob), None
+
+
+def import_subasset(
+    context: "bpy.types.Context",
+    gltf_dict: dict,
+    binary: bytes | None,
+    base_dir: Path,
+    target_collection: "bpy.types.Collection",
+    settings: "ImportSettings",
+    *,
+    external_depth: int,
+) -> None:
+    """Import a glTF 2.1 [DRAFT] sub-asset into ``target_collection``."""
+    gltf = Gltf.from_dict(gltf_dict)
+    importer = GltfImporter(context, settings)
+    importer._run_pipeline(
+        gltf, binary, base_dir,
+        target_collection=target_collection,
+        external_depth=external_depth,
+    )

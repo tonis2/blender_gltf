@@ -129,6 +129,19 @@ class Buffer(GltfBase):
 
 
 @dataclass
+class File(GltfBase):
+    """glTF 2.1 [DRAFT] external-asset reference. Either a ``uri`` to an
+    external glTF/GLB, or an embedded GLB blob referenced by ``buffer_view``
+    (packaging — the host file acts as a virtual filesystem)."""
+    uri: str | None = None
+    buffer_view: int | None = None
+    mime_type: str | None = None
+    name: str | None = None
+    extensions: dict | None = None
+    extras: Any | None = None
+
+
+@dataclass
 class MeshPrimitive(GltfBase):
     attributes: dict[str, int] = field(default_factory=dict)
     indices: int | None = None
@@ -151,6 +164,9 @@ class Mesh(GltfBase):
 @dataclass
 class Node(GltfBase):
     name: str | None = None
+    # glTF 2.1 [DRAFT] unique identifier: a per-file stable handle for the
+    # object. Must not collide with any other uid or name in the same file.
+    uid: str | None = None
     children: list[int] | None = None
     mesh: int | None = None
     camera: int | None = None
@@ -160,6 +176,9 @@ class Node(GltfBase):
     rotation: list[float] | None = None
     scale: list[float] | None = None
     weights: list[float] | None = None
+    # glTF 2.1 [DRAFT] external-asset reference: index into Gltf.files. The node
+    # carries the transform; the referenced asset is instantiated here.
+    file: int | None = None
     extensions: dict | None = None
     extras: Any | None = None
 
@@ -349,6 +368,8 @@ class Gltf(GltfBase):
     extensions_used: list[str] | None = None
     extensions_required: list[str] | None = None
     extras: Any | None = None
+    # glTF 2.1 [DRAFT] external-asset / packaging table.
+    files: list[File] | None = None
 
 
 # --- Nested type registry for deserialization ---
@@ -360,6 +381,7 @@ _NESTED_TYPES.update({
     (Gltf, "accessors"): Accessor,
     (Gltf, "buffer_views"): BufferView,
     (Gltf, "buffers"): Buffer,
+    (Gltf, "files"): File,
     (Gltf, "materials"): Material,
     (Gltf, "textures"): Texture,
     (Gltf, "images"): Image,

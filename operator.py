@@ -286,6 +286,42 @@ _EXPORT_PROP_DEFS: dict[str, tuple] = {
         ],
         default="AUTO",
     )),
+    "force_64bit": (BoolProperty, dict(
+        name="Force 64-bit GLB",
+        description=(
+            "Always write the glTF 2.1 [DRAFT] version-3 (64-bit) GLB "
+            "container, even below 4 GiB. Version 3 is used automatically when "
+            "a GLB exceeds the 4 GiB limit of the version-2 container"
+        ),
+        default=False,
+    )),
+    "export_uids": (BoolProperty, dict(
+        name="Unique IDs",
+        description=(
+            "Write a glTF 2.1 [DRAFT] unique 'uid' on every object node, "
+            "reusing an object's gltf_uid custom property or generating a "
+            "stable one. Gives the engine dependable per-object handles"
+        ),
+        default=True,
+    )),
+    "export_external_assets": (BoolProperty, dict(
+        name="External Assets",
+        description=(
+            "Export collection-instance empties as glTF 2.1 [DRAFT] external "
+            "asset references (files array). Each unique instanced collection "
+            "becomes its own sub-asset"
+        ),
+        default=False,
+    )),
+    "external_assets_mode": (EnumProperty, dict(
+        name="External Mode",
+        description="How external sub-assets are stored",
+        items=[
+            ("PACKAGED", "Packaged", "Embed sub-assets inside this file (self-contained)"),
+            ("REFERENCES", "References", "Write sub-assets as separate sibling .glb files"),
+        ],
+        default="PACKAGED",
+    )),
 }
 
 _EXPORT_PROPS = tuple(_EXPORT_PROP_DEFS)
@@ -320,7 +356,12 @@ _EXPORT_PANELS = (
     ("GLTF_export_particles", "Particles", ("export_particles",)),
     ("GLTF_export_interactivity", "Interactivity", ("export_interactivity",)),
     ("GLTF_export_audio", "Audio", ("export_audio",)),
-    ("GLTF_export_extras", "Extras", ("export_extras",)),
+    ("GLTF_export_extras", "Extras", ("export_extras", "export_uids")),
+    ("GLTF_export_external", "External Assets", (
+        "export_external_assets",
+        "external_assets_mode",
+    )),
+    ("GLTF_export_binary", "Binary", ("force_64bit",)),
 )
 
 _IMPORT_PANELS = (
@@ -332,6 +373,8 @@ _IMPORT_PANELS = (
     ("GLTF_import_particles", "Particles", ("import_particles",)),
     ("GLTF_import_interactivity", "Interactivity", ("import_interactivity",)),
     ("GLTF_import_audio", "Audio", ("import_audio",)),
+    ("GLTF_import_external", "External Assets", ("import_external_assets",)),
+    ("GLTF_import_extras", "Extras", ("import_uids",)),
 )
 
 
@@ -513,6 +556,21 @@ class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
         default=True,
     )
 
+    import_uids: BoolProperty(
+        name="Unique IDs",
+        description="Restore glTF 2.1 [DRAFT] node uids as gltf_uid custom properties",
+        default=True,
+    )
+
+    import_external_assets: BoolProperty(
+        name="External Assets",
+        description=(
+            "Instantiate glTF 2.1 [DRAFT] external/packaged asset references "
+            "as Blender collection instances"
+        ),
+        default=True,
+    )
+
     def execute(self, context):
         settings = ImportSettings(
             filepath=self.filepath,
@@ -527,6 +585,8 @@ class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
             import_particles=self.import_particles,
             import_interactivity=self.import_interactivity,
             import_audio=self.import_audio,
+            import_uids=self.import_uids,
+            import_external_assets=self.import_external_assets,
         )
 
         try:

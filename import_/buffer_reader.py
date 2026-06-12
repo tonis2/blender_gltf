@@ -130,6 +130,12 @@ class BufferReader:
             return np.maximum(data.astype(np.float32) / 32767.0, -1.0)
         if component_type == ComponentType.UNSIGNED_SHORT:
             return data.astype(np.float32) / 65535.0
+        if component_type == ComponentType.UNSIGNED_INT:
+            return data.astype(np.float32) / 4294967295.0
+        if component_type == ComponentType.SIGNED_INT:
+            return np.maximum(data.astype(np.float32) / 2147483647.0, -1.0)
+        # DOUBLE/HALF_FLOAT are already floating point; INT64/UINT64 have no
+        # defined normalized form here — pass them through unchanged.
         return data
 
     def read_buffer_view_bytes(self, buffer_view_index: int) -> bytes:

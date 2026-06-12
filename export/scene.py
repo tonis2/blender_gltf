@@ -74,10 +74,24 @@ class SceneExporter:
         self.lights: list[dict] = []
         self.light_index_by_name: dict[str, int] = {}  # blender light data name -> gltf index
         self._lod_skip_names: set[str] = set()  # LOD1+ objects, excluded from the graph
+        # glTF 2.1 [DRAFT] external assets: collection-instance empties routed to
+        # the files array, plus the resulting File entries (built via an injected
+        # callback the host exporter supplies).
+        self.files: list = []
+        self.file_index_by_collection: dict[str, int] = {}
+        self.external_asset_builder = None  # Callable[[Collection], File | None]
+        self._external_empty_names: set[str] = set()
 
     def gather(self, context: "bpy.types.Context") -> tuple[list[Scene], int]:
         """Traverse scene(s) and return (scenes, active_scene_index)."""
         import bpy
+
+        # Sub-asset export (glTF 2.1 [DRAFT] external assets): gather a single
+        # collection at its local transforms, without scene switching.
+        scope = getattr(self.settings, "collection_scope", None)
+        if scope is not None:
+            self._fps = context.scene.render.fps / context.scene.render.fps_base
+            return [self._gather_single_collection(scope)], 0
 
         if self.settings.export_all_scenes:
             blender_scenes = list(bpy.data.scenes)
@@ -107,6 +121,13 @@ class SceneExporter:
     def _gather_single_scene(self, scene: "bpy.types.Scene") -> Scene:
         """Process a single Blender scene into a glTF Scene."""
         root_nodes: list[int] = []
+
+        # External-asset pre-pass: collection-instance empties become file
+        # references (not flattened into GPU instances). Set before the
+        # instancing pre-pass, which reads this to suppress their instances.
+        self._external_empty_names = set()
+        if self.settings.export_external_assets:
+            self._external_empty_names = self._collect_external_empty_names(scene.objects)
 
         # Pre-pass: detect instances via depsgraph (GN, collection instances, particles)
         skip_objects: set[str] = set()
@@ -157,6 +178,59 @@ class SceneExporter:
             name=scene.name,
             nodes=root_nodes if root_nodes else None,
         )
+
+    # --- glTF 2.1 [DRAFT] external assets ---
+
+    @staticmethod
+    def _collect_external_empty_names(objects) -> set[str]:
+        """Names of empties that instance a collection (-> external asset refs)."""
+        return {
+            obj.name for obj in objects
+            if obj.type == "EMPTY"
+            and obj.instance_type == "COLLECTION"
+            and obj.instance_collection is not None
+        }
+
+    def _ensure_external_file(self, collection) -> int | None:
+        """Return the files[] index for a collection, building its sub-asset once
+        via the injected builder. Returns None on cycle/missing builder."""
+        key = collection.name
+        if key in self.file_index_by_collection:
+            return self.file_index_by_collection[key]
+        if self.external_asset_builder is None:
+            return None
+        entry = self.external_asset_builder(collection)
+        if entry is None:
+            return None
+        idx = len(self.files)
+        self.files.append(entry)
+        self.file_index_by_collection[key] = idx
+        return idx
+
+    def _gather_single_collection(self, collection) -> Scene:
+        """Gather one collection as a standalone sub-asset scene. Nested
+        collection-instance empties recurse into their own external assets;
+        GPU instancing and LOD grouping are not applied at this level."""
+        self._external_empty_names = set()
+        if self.settings.export_external_assets:
+            self._external_empty_names = self._collect_external_empty_names(
+                collection.all_objects,
+            )
+
+        member_names = {o.name for o in collection.all_objects}
+        roots = [
+            o for o in collection.all_objects
+            if o.parent is None or o.parent.name not in member_names
+        ]
+        roots.sort(key=lambda o: (0 if o.type == "ARMATURE" else 1))
+
+        root_nodes: list[int] = []
+        for obj in roots:
+            node_index = self._gather_node(obj)
+            if node_index is not None:
+                root_nodes.append(node_index)
+
+        return Scene(name=collection.name, nodes=root_nodes if root_nodes else None)
 
     def _lod_pre_pass(
         self, scene: "bpy.types.Scene",
@@ -244,7 +318,13 @@ class SceneExporter:
         if obj.name in self.object_to_node_index:
             return self.object_to_node_index[obj.name]
 
-        is_visible = obj.visible_get()
+        # visible_get() is view-layer based and meaningless for a scoped
+        # sub-asset export (the collection isn't in any view layer), so treat
+        # sub-asset objects as visible unless render-hidden.
+        if getattr(self.settings, "collection_scope", None) is not None:
+            is_visible = not obj.hide_render
+        else:
+            is_visible = obj.visible_get()
 
         # Skip hidden objects entirely when "only visible" is enabled
         if self.settings.export_only_visible and not is_visible:
@@ -255,6 +335,14 @@ class SceneExporter:
         skin_index = None
         camera_index = None
         light_ext = None
+
+        # glTF 2.1 [DRAFT] external asset: collection-instance empty -> file ref.
+        file_index = None
+        if (self.settings.export_external_assets
+                and obj.type == "EMPTY"
+                and obj.name in self._external_empty_names
+                and obj.instance_collection is not None):
+            file_index = self._ensure_external_file(obj.instance_collection)
 
         if obj.type == "MESH":
             # Check for armature modifier (skinned mesh)
@@ -361,6 +449,7 @@ class SceneExporter:
             translation=translation,
             rotation=rotation,
             scale=gltf_scale,
+            file=file_index,
             extensions=extensions,
         )
 
@@ -456,6 +545,7 @@ class SceneExporter:
 
     _SKIP_KEYS = frozenset({
         "khr_physics", "cycles", "gltf_export_settings", "gltf_props",
+        "gltf_uid",  # surfaced as Node.uid (glTF 2.1), not as an extra
     })
 
     @classmethod
@@ -603,6 +693,12 @@ class SceneExporter:
 
         for inst in depsgraph.object_instances:
             if not inst.is_instance:
+                continue
+            # Collection-instance empties routed to the glTF 2.1 [DRAFT] files
+            # array are emitted as references; don't flatten their contents into
+            # the host buffer.
+            if (inst.parent is not None
+                    and inst.parent.original.name in self._external_empty_names):
                 continue
             obj = inst.object.original
             if obj.type != "MESH":

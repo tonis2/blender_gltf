@@ -33,6 +33,9 @@ class SceneImporter:
         particle_importer: "ParticleImporter | None" = None,
         interactivity_importer: "InteractivityImporter | None" = None,
         audio_importer: "AudioImporter | None" = None,
+        file_resolver=None,
+        target_collection: "bpy.types.Collection | None" = None,
+        external_depth: int = 0,
     ) -> None:
         self.gltf = gltf
         self.buffer_reader = buffer_reader
@@ -43,6 +46,11 @@ class SceneImporter:
         self.particle_importer = particle_importer
         self.interactivity_importer = interactivity_importer
         self.audio_importer = audio_importer
+        # glTF 2.1 [DRAFT] external assets: resolver + per-file collection cache.
+        self.file_resolver = file_resolver
+        self.target_collection = target_collection
+        self.external_depth = external_depth
+        self._imported_files: dict[int, "bpy.types.Collection"] = {}
         self.node_to_blender: dict[int, "bpy.types.Object"] = {}
         self._skin_armatures: dict[int, "bpy.types.Object"] = {}
         # GPU-instancing reconstruction (Geometry Nodes "Instance on Points").
@@ -57,6 +65,18 @@ class SceneImporter:
         import bpy
 
         if not self.gltf.scenes:
+            return self.node_to_blender
+
+        # Sub-asset import: drop every node into one collection (no new Blender
+        # scenes, no active-scene switching) so the host can instance it.
+        if self.target_collection is not None:
+            coll = self.target_collection
+            for gltf_scene in self.gltf.scenes:
+                if gltf_scene.nodes:
+                    for node_index in gltf_scene.nodes:
+                        self._import_node(context, node_index, coll, parent_obj=None)
+                if self.audio_importer:
+                    self.audio_importer.import_global_emitters(gltf_scene, coll)
             return self.node_to_blender
 
         active_scene_index = self.gltf.scene if self.gltf.scene is not None else 0
@@ -96,6 +116,38 @@ class SceneImporter:
             context.window.scene = original_scene
 
         return self.node_to_blender
+
+    def _resolve_external_collection(
+        self, context: "bpy.types.Context", file_index: int,
+    ) -> "bpy.types.Collection | None":
+        """Import a glTF 2.1 [DRAFT] external/packaged asset once into a fresh,
+        unlinked collection that host nodes instance. Cached per file index."""
+        import bpy
+        from ..importer import import_subasset, MAX_EXTERNAL_DEPTH
+
+        if file_index in self._imported_files:
+            return self._imported_files[file_index]
+        if self.external_depth >= MAX_EXTERNAL_DEPTH:
+            print(
+                f"[glTF import] external-asset nesting exceeded depth "
+                f"{MAX_EXTERNAL_DEPTH}; skipping file {file_index}"
+            )
+            return None
+
+        files = self.gltf.files or []
+        if file_index >= len(files):
+            return None
+        name = files[file_index].name or f"ExternalAsset_{file_index}"
+        coll = bpy.data.collections.new(name)
+        # Cache before recursing so a self-referential file can't loop forever.
+        self._imported_files[file_index] = coll
+
+        sub_dict, sub_binary = self.file_resolver.load(file_index)
+        import_subasset(
+            context, sub_dict, sub_binary, self.file_resolver.base_dir,
+            coll, self.settings, external_depth=self.external_depth + 1,
+        )
+        return coll
 
     def _import_node(
         self,
@@ -183,10 +235,23 @@ class SceneImporter:
         if node.extensions and "KHR_node_visibility" in node.extensions:
             vis = node.extensions["KHR_node_visibility"]
             if not vis.get("visible", True):
-                obj.hide_set(True)
                 obj.hide_render = True
+                # hide_set is view-layer based; an object imported into an
+                # unlinked sub-asset collection isn't in the view layer.
+                try:
+                    obj.hide_set(True)
+                except RuntimeError:
+                    obj.hide_viewport = True
 
         self.node_to_blender[node_index] = obj
+
+        # glTF 2.1 [DRAFT] external asset: turn this node into a Blender
+        # collection instance pointing at the (recursively) imported sub-asset.
+        if getattr(node, "file", None) is not None and self.file_resolver is not None:
+            sub_coll = self._resolve_external_collection(context, node.file)
+            if sub_coll is not None:
+                obj.instance_type = "COLLECTION"
+                obj.instance_collection = sub_coll
 
         # Handle skinned mesh: apply weights to pre-created armature or create one
         if (node.skin is not None and self.skin_importer
@@ -227,6 +292,10 @@ class SceneImporter:
             for key, value in node.extras.items():
                 obj[key] = value
 
+        # glTF 2.1 [DRAFT] unique ID -> custom property (round-trips on re-export)
+        if getattr(node, "uid", None) and self.settings.import_uids:
+            obj["gltf_uid"] = node.uid
+
         # Physics (rigid body / collider)
         if self.physics_importer and self.settings.import_physics:
             self.physics_importer.import_node(context, obj, node, node_index)
@@ -252,8 +321,11 @@ class SceneImporter:
                 self._import_node(context, lod_index, collection, parent_obj=obj.parent)
                 lod_obj = self.node_to_blender.get(lod_index)
                 if lod_obj is not None:
-                    lod_obj.hide_set(True)
                     lod_obj.hide_render = True
+                    try:
+                        lod_obj.hide_set(True)
+                    except RuntimeError:
+                        lod_obj.hide_viewport = True
             if (isinstance(node.extras, dict)
                     and "MSFT_screencoverage" in node.extras
                     and "screencoverage" not in obj):

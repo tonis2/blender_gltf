@@ -4,9 +4,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from dataclasses import replace
+
 from .gltf.buffer import BufferBuilder
-from .gltf.serialize import write_glb, write_gltf, write_gltf_embedded
-from .gltf.types import Asset, Gltf
+from .gltf.serialize import write_glb, write_gltf, write_gltf_embedded, serialize_glb
+from .gltf.types import Asset, Gltf, File
 from .export.animation import AnimationExporter
 from .export.texture import TextureExporter
 from .export.material import MaterialExporter
@@ -47,12 +49,28 @@ class ExportSettings:
     export_all_scenes: bool = False
     export_camera_y_up: bool = True
     image_format: str = "AUTO"  # "AUTO", "JPEG", or "PNG"
+    force_64bit: bool = False
+    export_uids: bool = True
+    export_external_assets: bool = False
+    external_assets_mode: str = "PACKAGED"  # "PACKAGED" or "REFERENCES"
+    # Internal: set on nested sub-exports to scope gathering to one collection.
+    # Not a UI/operator property.
+    collection_scope: object = None
 
 
 class GltfExporter:
-    def __init__(self, context: "bpy.types.Context", settings: ExportSettings) -> None:
+    def __init__(
+        self,
+        context: "bpy.types.Context",
+        settings: ExportSettings,
+        external_seen: set | None = None,
+        external_depth: int = 0,
+    ) -> None:
         self.context = context
         self.settings = settings
+        # glTF 2.1 [DRAFT] external-asset recursion guards.
+        self._external_seen: set = external_seen or set()
+        self._external_depth = external_depth
         self.buffer = BufferBuilder()
         self.texture_exporter = TextureExporter(self.buffer, settings)
         self.material_exporter = MaterialExporter(self.texture_exporter, settings)
@@ -77,8 +95,55 @@ class GltfExporter:
         if self.interactivity_exporter is not None:
             self.interactivity_exporter.scene_exporter = self.scene_exporter
             self.interactivity_exporter.material_exporter = self.material_exporter
+        if self.settings.export_external_assets:
+            self.scene_exporter.external_asset_builder = self._build_external_file
 
-    def export(self) -> None:
+    def _assign_uids(self) -> None:
+        """Give every object-backed node a glTF 2.1 [DRAFT] ``uid``.
+
+        Reuses an existing ``obj['gltf_uid']`` when present and unique; otherwise
+        generates a stable one and writes it back so re-exports round-trip. A
+        uid must not collide with any other uid or any node name in the file.
+        """
+        import bpy
+        import uuid
+
+        nodes = self.scene_exporter.nodes
+        # Names share the uid identifier namespace per the draft spec.
+        reserved = {n.name for n in nodes if n.name}
+        used_uids: set[str] = set()
+
+        for obj_name, idx in self.scene_exporter.object_to_node_index.items():
+            if idx is None or idx >= len(nodes):
+                continue
+            node = nodes[idx]
+            obj = bpy.data.objects.get(obj_name)
+            if obj is None:
+                continue
+
+            existing = obj.get("gltf_uid")
+            uid = existing if isinstance(existing, str) and existing else None
+            if uid is not None and (uid in used_uids or uid in reserved):
+                print(
+                    f"glTF export: object '{obj_name}' has a colliding gltf_uid "
+                    f"'{uid}'; regenerating"
+                )
+                uid = None
+
+            if uid is None:
+                while True:
+                    cand = f"{obj.name}-{uuid.uuid4().hex[:8]}"
+                    if cand not in used_uids and cand not in reserved:
+                        uid = cand
+                        break
+                obj["gltf_uid"] = uid  # store back for stable round-trips
+
+            node.uid = uid
+            used_uids.add(uid)
+
+    def build(self) -> tuple[dict, bytes]:
+        """Gather and assemble the glTF, returning (gltf_dict, binary) without
+        writing to disk. Reused to produce external sub-assets in memory."""
         # 1. Gather scene data
         scenes, active_scene = self.scene_exporter.gather(self.context)
 
@@ -88,6 +153,10 @@ class GltfExporter:
                 self.scene_exporter.object_to_node_index,
                 self.scene_exporter.nodes,
             )
+
+        # 1c. Assign unique IDs (glTF 2.1 [DRAFT]) to object-backed nodes.
+        if self.settings.export_uids:
+            self._assign_uids()
 
         # 2. Gather animations (needs node mapping from scene pass)
         animations = None
@@ -184,15 +253,72 @@ class GltfExporter:
             extensions=root_extensions or None,
             extensions_used=extensions_used,
             extensions_required=extensions_required,
+            files=self.scene_exporter.files or None,
         )
 
-        # 6. Serialize
-        gltf_dict = gltf.to_dict()
+        return gltf.to_dict(), binary
+
+    def export(self) -> None:
+        gltf_dict, binary = self.build()
         path = Path(self.settings.filepath)
 
         if self.settings.export_format == "GLB":
-            write_glb(path, gltf_dict, binary)
+            write_glb(path, gltf_dict, binary, force_64bit=self.settings.force_64bit)
         elif self.settings.export_format == "GLTF_EMBEDDED":
             write_gltf_embedded(path, gltf_dict, binary)
         else:
             write_gltf(path, gltf_dict, binary)
+
+    # --- glTF 2.1 [DRAFT] external assets ---
+
+    def _build_external_file(self, collection) -> "File | None":
+        """Build a File entry for a collection-instance reference. Embeds the
+        sub-asset GLB into the host buffer (PACKAGED) or writes it as a sibling
+        file (REFERENCES). Returns None on a reference cycle or excessive depth."""
+        if collection.name in self._external_seen or self._external_depth >= _MAX_EXTERNAL_DEPTH:
+            print(
+                f"glTF export: skipping external asset '{collection.name}' "
+                f"(reference cycle or nesting too deep)"
+            )
+            return None
+
+        seen = self._external_seen | {collection.name}
+        sub_dict, sub_binary = build_collection_subasset(
+            self.context, self.settings, collection,
+            depth=self._external_depth + 1, seen=seen,
+        )
+
+        if self.settings.external_assets_mode == "REFERENCES":
+            safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in collection.name)
+            sub_path = Path(self.settings.filepath).parent / f"{safe}.glb"
+            write_glb(sub_path, sub_dict, sub_binary, force_64bit=self.settings.force_64bit)
+            return File(uri=sub_path.name, name=collection.name)
+
+        # PACKAGED: embed the sub-asset GLB as a host bufferView.
+        glb_bytes = serialize_glb(sub_dict, sub_binary, force_64bit=self.settings.force_64bit)
+        bv = self.buffer.add_image_data(glb_bytes)
+        return File(buffer_view=bv, mime_type="model/gltf-binary", name=collection.name)
+
+
+# Max external-asset nesting depth — a backstop against malformed self-references.
+_MAX_EXTERNAL_DEPTH = 8
+
+
+def build_collection_subasset(
+    context: "bpy.types.Context",
+    base_settings: ExportSettings,
+    collection,
+    *,
+    depth: int,
+    seen: set,
+) -> tuple[dict, bytes]:
+    """Export a single collection as a standalone glTF, returning (dict, binary).
+    Runs a nested GltfExporter scoped to the collection; nested collection
+    instances recurse into their own external assets (cycle-guarded by ``seen``)."""
+    sub_settings = replace(
+        base_settings,
+        collection_scope=collection,
+        export_all_scenes=False,
+    )
+    sub = GltfExporter(context, sub_settings, external_seen=seen, external_depth=depth)
+    return sub.build()

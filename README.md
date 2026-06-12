@@ -12,6 +12,8 @@ A custom Blender addon for exporting and importing scenes in glTF 2.0 format.
 - **Physics** — rigid bodies and collision shapes (KHR extensions)
 - **GPU Instancing** — collection instances via `EXT_mesh_gpu_instancing`
 - **Export formats** — GLB (binary), glTF + .bin (separate), glTF embedded (base64)
+- **glTF 2.1 [DRAFT] features** — 64-bit GLB, expanded accessor component types, unique IDs,
+  and external assets + packaging (see [`extensions/gltf_2_1_draft.md`](extensions/gltf_2_1_draft.md))
 
 ## Supported glTF Extensions
 
