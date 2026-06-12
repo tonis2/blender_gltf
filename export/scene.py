@@ -12,7 +12,7 @@ from ..gltf.types import Scene, Node, Camera, CameraPerspective, CameraOrthograp
 from .converter import (
     convert_location, convert_rotation, convert_scale,
     convert_location_array, convert_rotation_array, convert_scale_array,
-    trs_to_node_fields, gather_material_map,
+    trs_to_node_fields, gather_material_map, shear_correction,
 )
 from .mesh import MeshExporter
 from .material import MaterialExporter
@@ -308,8 +308,16 @@ class SceneExporter:
             lod0_node.extras = {}
         lod0_node.extras["MSFT_screencoverage"] = coverage
 
-    def _gather_node(self, obj: "bpy.types.Object") -> int | None:
-        """Convert a Blender object to a glTF Node. Returns node index."""
+    def _gather_node(self, obj: "bpy.types.Object", inherited_shear=None) -> int | None:
+        """Convert a Blender object to a glTF Node. Returns node index.
+
+        ``inherited_shear`` is a 4x4 shear matrix passed down from a sheared
+        ancestor whose own glTF node could only hold a clean TRS. A glTF node
+        transform is TRS-only, so any shear in this object's effective local
+        matrix is baked into its mesh and the *residual* shear is threaded into
+        its children here — otherwise a child of a sheared parent is displaced
+        (the parent's node lost the shear that positioned the child).
+        """
         # LOD1+ objects only exist through their LOD0 node's MSFT_lod extension
         if obj.name in self._lod_skip_names:
             return None
@@ -344,6 +352,20 @@ class SceneExporter:
                 and obj.instance_collection is not None):
             file_index = self._ensure_external_file(obj.instance_collection)
 
+        # A glTF node holds TRS only; shear in the object's effective local
+        # matrix (non-uniform parent scale combined with a rotated child, or a
+        # shear inherited from a sheared ancestor) is dropped by the node's TRS
+        # decompose and must instead be baked into the mesh geometry. The node
+        # transform is taken from this same effective matrix so its clean TRS
+        # plus the baked mesh reproduce the true placement exactly.
+        effective_local = obj.matrix_local
+        if inherited_shear is not None:
+            effective_local = inherited_shear @ effective_local
+        shear = shear_correction(effective_local)
+        # Residual shear this node could not represent, threaded to children so
+        # they compensate for our clean-TRS node losing it.
+        child_shear = shear.to_4x4() if shear is not None else None
+
         if obj.type == "MESH":
             # Check for armature modifier (skinned mesh)
             joint_map = None
@@ -355,15 +377,23 @@ class SceneExporter:
                         joint_map = self.skin_exporter.armature_joint_maps[arm_name]
                         skin_index = self.skin_exporter.armature_skin_index[arm_name]
 
+            # Skinned-mesh nodes ignore their TRS (the skin places vertices), so
+            # there is no node decompose to compensate for — never bake shear.
+            mesh_correction = None if skin_index is not None else shear
+
             # Build material slot -> glTF material index mapping
             material_map = self._gather_materials_for_object(obj)
-            mesh_index = self.mesh_exporter.gather(obj, material_map, joint_map)
+            mesh_index = self.mesh_exporter.gather(
+                obj, material_map, joint_map, correction_matrix=mesh_correction,
+            )
         elif obj.type in {"CURVE", "SURFACE", "FONT", "META", "CURVES", "GREASEPENCIL"}:
             # Evaluate the modifier stack to a mesh (e.g., a curve or hair
             # curves object with a Geometry Nodes modifier emits stem
             # geometry as a mesh that should be exported).
             material_map = self._gather_materials_for_object(obj)
-            mesh_index = self.mesh_exporter.gather(obj, material_map)
+            mesh_index = self.mesh_exporter.gather(
+                obj, material_map, correction_matrix=shear,
+            )
         elif obj.type == "CAMERA":
             camera_index = self._gather_camera(obj)
         elif obj.type == "LIGHT":
@@ -375,7 +405,7 @@ class SceneExporter:
         # For armatures, create bone nodes as children
         if obj.type == "ARMATURE" and self.skin_exporter and self.settings.export_skinning:
             # Create armature node first so we have its index
-            translation, rotation, gltf_scale = trs_to_node_fields(obj.matrix_local)
+            translation, rotation, gltf_scale = trs_to_node_fields(effective_local)
 
             extensions = None
             if not is_visible:
@@ -402,7 +432,7 @@ class SceneExporter:
 
             # Recurse regular children (skinned meshes parented to armature)
             for child in obj.children:
-                child_index = self._gather_node(child)
+                child_index = self._gather_node(child, child_shear)
                 if child_index is not None:
                     children.append(child_index)
 
@@ -410,7 +440,7 @@ class SceneExporter:
             return index
 
         for child in obj.children:
-            child_index = self._gather_node(child)
+            child_index = self._gather_node(child, child_shear)
             if child_index is not None:
                 children.append(child_index)
 
@@ -423,7 +453,7 @@ class SceneExporter:
             obj.type == "CAMERA" and self.settings.export_camera_y_up
         )
         translation, rotation, gltf_scale = trs_to_node_fields(
-            obj.matrix_local, camera_fix=camera_fix,
+            effective_local, camera_fix=camera_fix,
         )
 
         # KHR_node_visibility: only add extension when hidden (visible=true is default)
@@ -690,6 +720,13 @@ class SceneExporter:
         instance_groups: dict[str, list[tuple[list[float], list[float], list[float]]]] = defaultdict(list)
         source_objects: dict[str, "bpy.types.Object"] = {}
         instancer_names: set[str] = set()
+        # Instances whose world matrix carries shear (a non-uniformly scaled
+        # instancer combined with a rotated instance) can't be GPU-instanced:
+        # the EXT_mesh_gpu_instancing accessor is TRS-only, and a shared mesh
+        # can't hold a per-instance shear bake. These are collected here and
+        # emitted as individual nodes with the shear baked into a private mesh
+        # copy. Each entry: (mesh_name, (loc, rot_wxyz, scl), shear3).
+        sheared_instances: list[tuple[str, tuple, "object"]] = []
 
         for inst in depsgraph.object_instances:
             if not inst.is_instance:
@@ -708,14 +745,20 @@ class SceneExporter:
             if inst.parent:
                 instancer_names.add(inst.parent.original.name)
 
-            loc, rot, scl = inst.matrix_world.decompose()
-            instance_groups[obj.name].append((
+            matrix_world = inst.matrix_world
+            shear = shear_correction(matrix_world)
+            loc, rot, scl = matrix_world.decompose()
+            trs = (
                 [loc.x, loc.y, loc.z],
                 [rot.w, rot.x, rot.y, rot.z],
                 [scl.x, scl.y, scl.z],
-            ))
+            )
             if obj.name not in source_objects:
                 source_objects[obj.name] = obj
+            if shear is not None:
+                sheared_instances.append((obj.name, trs, shear))
+                continue
+            instance_groups[obj.name].append(trs)
 
         # Store instancer names so gather() can skip them
         self._instancer_names = instancer_names
@@ -781,6 +824,15 @@ class SceneExporter:
                 if node_idx is not None:
                     result_nodes.append(node_idx)
 
+        # Emit shear-bearing instances as individual baked nodes (the shear is
+        # baked into a private mesh copy via correction_matrix).
+        for mesh_name, trs, shear in sheared_instances:
+            node_idx = self._gather_single_instance(
+                [mesh_name], source_objects, trs, correction_matrix=shear,
+            )
+            if node_idx is not None:
+                result_nodes.append(node_idx)
+
         return result_nodes
 
     def _gather_single_instance(
@@ -788,8 +840,14 @@ class SceneExporter:
         mesh_names: list[str],
         source_objects: dict[str, "bpy.types.Object"],
         transform: tuple[list[float], list[float], list[float]],
+        correction_matrix=None,
     ) -> int | None:
-        """Export a single instance as a regular node."""
+        """Export a single instance as a regular node.
+
+        ``correction_matrix`` is an optional 3x3 shear matrix baked into the
+        mesh geometry so a TRS-only node can reproduce a sheared instance
+        placement (see ``converter.shear_correction``).
+        """
         loc, rot_wxyz, scl = transform
         translation = convert_location(loc)
         rotation = convert_rotation(rot_wxyz)
@@ -799,7 +857,9 @@ class SceneExporter:
         for mesh_name in mesh_names:
             obj = source_objects[mesh_name]
             material_map = self._gather_materials_for_object(obj)
-            mesh_index = self.mesh_exporter.gather(obj, material_map)
+            mesh_index = self.mesh_exporter.gather(
+                obj, material_map, correction_matrix=correction_matrix,
+            )
             if mesh_index is not None:
                 child_node = Node(name=mesh_name, mesh=mesh_index)
                 child_idx = len(self.nodes)

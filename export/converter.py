@@ -123,6 +123,34 @@ def trs_to_node_fields(
     )
 
 
+def shear_correction(matrix):
+    """Return the residual shear of a Blender local matrix as a 3x3 mathutils
+    ``Matrix``, or ``None`` when the matrix is cleanly TRS-decomposable.
+
+    A glTF node transform is TRS-only and cannot represent shear. Shear appears
+    in ``obj.matrix_local`` when a non-uniformly scaled parent is combined with a
+    rotated child (or a non-identity ``matrix_parent_inverse``): decomposing such
+    a matrix to TRS silently drops the shear, displacing the object on import.
+
+    The returned matrix ``S`` satisfies ``TRS @ S == matrix`` where ``TRS`` is the
+    decompose-recompose of ``matrix``. The caller exports the clean ``TRS`` on the
+    node and bakes ``S`` into the mesh geometry, so the reconstructed world
+    transform is exact.
+    """
+    import mathutils
+
+    loc, rot, scl = matrix.decompose()
+    trs = mathutils.Matrix.LocRotScale(loc, rot, scl)
+    shear = (trs.inverted() @ matrix).to_3x3()
+    max_off = max(
+        abs(shear[i][j] - (1.0 if i == j else 0.0))
+        for i in range(3) for j in range(3)
+    )
+    if max_off < 1e-5:
+        return None
+    return shear
+
+
 def gather_material_map(obj, material_exporter) -> dict[int, int]:
     """Gather an object's materials and return the mapping:
     Blender material slot index -> glTF material index."""

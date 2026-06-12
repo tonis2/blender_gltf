@@ -32,8 +32,15 @@ class MeshExporter:
         blender_object: "bpy.types.Object",
         material_map: dict[int, int] | None = None,
         skin_joint_map: dict[str, int] | None = None,
+        correction_matrix=None,
     ) -> int | None:
-        """Export mesh data from a Blender object. Returns mesh index or None."""
+        """Export mesh data from a Blender object. Returns mesh index or None.
+
+        ``correction_matrix`` is an optional 3x3 shear matrix (see
+        ``converter.shear_correction``) baked into positions/normals so a
+        TRS-only node can still reproduce a sheared placement. ``None`` (the
+        common case) leaves geometry and the dedup cache untouched.
+        """
         import bpy
 
         # Accept any type whose post-modifier evaluation can yield mesh data.
@@ -117,6 +124,15 @@ class MeshExporter:
             key_parts.append(repr(tuple(
                 (k, repr(mod[k])) for k in mod_keys
             )))
+        # A baked shear is object-specific, so it must not share a cached mesh
+        # with un-sheared (or differently sheared) users of the same source data.
+        # Only extend the key when a correction is present, keeping keys — and
+        # thus dedup behaviour — byte-identical for the overwhelming common case.
+        if correction_matrix is not None:
+            key_parts.append("shear:" + repr([
+                round(correction_matrix[i][j], 6)
+                for i in range(3) for j in range(3)
+            ]))
         cache_key = "|".join(key_parts)
         if cache_key in self._cache:
             _release_mesh()
@@ -153,6 +169,7 @@ class MeshExporter:
             mesh = self._extract(
                 blender_mesh, blender_object, material_map,
                 shape_key_data, joint_data, weight_data,
+                correction_matrix=correction_matrix,
             )
         finally:
             _release_mesh()
@@ -241,8 +258,18 @@ class MeshExporter:
         shape_key_data: list[tuple[str, np.ndarray]] | None = None,
         joint_data: np.ndarray | None = None,
         weight_data: np.ndarray | None = None,
+        correction_matrix=None,
     ) -> Mesh | None:
         name = blender_object.name
+
+        # Shear bake (Blender object-local space, applied before the Y-up axis
+        # swap): positions transform by S, normals by its inverse-transpose.
+        shear3 = inv_t_shear3 = None
+        if correction_matrix is not None:
+            shear3 = np.array(correction_matrix, dtype=np.float32)
+            inv_t_shear3 = np.array(
+                correction_matrix.inverted().transposed(), dtype=np.float32,
+            )
         blender_mesh.calc_loop_triangles()
         if len(blender_mesh.loop_triangles) == 0:
             return None
@@ -281,6 +308,8 @@ class MeshExporter:
         positions = np.empty(len(blender_mesh.vertices) * 3, dtype=np.float32)
         blender_mesh.vertices.foreach_get("co", positions)
         positions = positions.reshape(-1, 3)
+        if shear3 is not None:
+            positions = np.ascontiguousarray(positions @ shear3.T, dtype=np.float32)
         convert_positions(positions)
 
         # One AABB for the whole mesh so every primitive shares the same
@@ -299,6 +328,11 @@ class MeshExporter:
             normals = np.empty(len(blender_mesh.loops) * 3, dtype=np.float32)
             blender_mesh.corner_normals.foreach_get("vector", normals)
             normals = normals.reshape(-1, 3)
+            if inv_t_shear3 is not None:
+                normals = normals @ inv_t_shear3.T
+                lens = np.linalg.norm(normals, axis=1, keepdims=True)
+                np.divide(normals, lens, out=normals, where=lens != 0.0)
+                normals = np.ascontiguousarray(normals, dtype=np.float32)
             convert_normals(normals)
 
         # Tangents (per loop/corner), valid only after calc_tangents()
@@ -308,6 +342,11 @@ class MeshExporter:
             tangents = np.empty(len(blender_mesh.loops) * 3, dtype=np.float32)
             blender_mesh.loops.foreach_get("tangent", tangents)
             tangents = tangents.reshape(-1, 3)
+            if shear3 is not None:
+                tangents = tangents @ shear3.T
+                lens = np.linalg.norm(tangents, axis=1, keepdims=True)
+                np.divide(tangents, lens, out=tangents, where=lens != 0.0)
+                tangents = np.ascontiguousarray(tangents, dtype=np.float32)
             convert_normals(tangents)
             bitangent_signs = np.empty(len(blender_mesh.loops), dtype=np.float32)
             blender_mesh.loops.foreach_get("bitangent_sign", bitangent_signs)
