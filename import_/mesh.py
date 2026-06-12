@@ -49,16 +49,21 @@ class MeshImporter:
         all_verts: list[np.ndarray] = []
         all_loop_verts: list[np.ndarray] = []
         all_mat_indices: list[int] = []
-        # Entries carry the primitive's cumulative loop start so layer data can
-        # be written to the exact loop range even when primitives have
-        # heterogeneous attribute/layer sets.
-        all_normals: list[tuple[int, np.ndarray, np.ndarray]] = []
-        all_uvs: list[tuple[int, int, np.ndarray, np.ndarray]] = []
-        all_colors: list[tuple[int, int, np.ndarray, np.ndarray]] = []
+        # glTF NORMAL/TEXCOORD/COLOR are per-vertex attributes, so we accumulate
+        # them into per-vertex arrays addressed by the FINAL (offset) vertex
+        # index. After mesh.validate() — which may delete degenerate or
+        # duplicate faces and renumber loops — we look each value up by the
+        # surviving loop's vertex_index. That keeps every layer aligned no
+        # matter how many faces validate drops, instead of relying on fragile
+        # pre-validate loop offsets ("Number of custom normals is not number
+        # of loops", scrambled UVs on later primitives).
+        normal_parts: list[tuple[int, int, np.ndarray]] = []
+        uv_parts: list[tuple[int, int, int, np.ndarray]] = []
+        color_parts: list[tuple[int, int, int, np.ndarray]] = []
         vertex_offset = 0
-        loop_offset = 0
         num_uv_layers = 0
         num_color_layers = 0
+        normals_covered = 0  # vertices that received an explicit NORMAL
 
         for prim_idx, prim in enumerate(gltf_mesh.primitives):
             if "POSITION" not in prim.attributes:
@@ -85,7 +90,8 @@ class MeshImporter:
             if "NORMAL" in prim.attributes and self.settings.import_normals:
                 normals = self.buffer_reader.read_accessor(prim.attributes["NORMAL"])
                 normals = convert_normals(normals)
-                all_normals.append((loop_offset, normals, indices))
+                normal_parts.append((vertex_offset, num_verts, normals))
+                normals_covered += num_verts
 
             # UVs
             uv_idx = 0
@@ -93,7 +99,7 @@ class MeshImporter:
                 if self.settings.import_texcoords:
                     uvs = self.buffer_reader.read_accessor(prim.attributes[f"TEXCOORD_{uv_idx}"])
                     uvs = flip_uv_v(uvs)
-                    all_uvs.append((uv_idx, loop_offset, uvs, indices))
+                    uv_parts.append((uv_idx, vertex_offset, num_verts, uvs))
                 uv_idx += 1
             num_uv_layers = max(num_uv_layers, uv_idx)
 
@@ -102,7 +108,7 @@ class MeshImporter:
             while f"COLOR_{color_idx}" in prim.attributes:
                 if self.settings.import_colors:
                     colors = self.buffer_reader.read_accessor(prim.attributes[f"COLOR_{color_idx}"])
-                    all_colors.append((color_idx, loop_offset, colors, indices))
+                    color_parts.append((color_idx, vertex_offset, num_verts, colors))
                 color_idx += 1
             num_color_layers = max(num_color_layers, color_idx)
 
@@ -115,22 +121,22 @@ class MeshImporter:
                 self.skin_data[index].append((joints_acc, weights_acc, vertex_offset))
 
             vertex_offset += num_verts
-            loop_offset += len(indices)
 
         if not all_verts:
             return mesh
 
         # Build Blender mesh
         verts = np.concatenate(all_verts)
-        loop_vertex_indices = np.concatenate(all_loop_verts)
+        loop_vertex_indices = np.concatenate(all_loop_verts).astype(np.int32)
+        total_verts = len(verts)
         num_loops = len(loop_vertex_indices)
         num_polys = num_loops // 3
 
-        mesh.vertices.add(len(verts))
+        mesh.vertices.add(total_verts)
         mesh.vertices.foreach_set("co", verts.flatten())
 
         mesh.loops.add(num_loops)
-        mesh.loops.foreach_set("vertex_index", loop_vertex_indices.astype(np.int32))
+        mesh.loops.foreach_set("vertex_index", loop_vertex_indices)
 
         mesh.polygons.add(num_polys)
         loop_starts = np.arange(0, num_loops, 3, dtype=np.int32)
@@ -155,62 +161,64 @@ class MeshImporter:
         mesh.update()
         mesh.validate()
 
-        # Custom normals
-        if all_normals:
-            self._apply_normals(mesh, all_normals, num_loops)
+        # validate() may have dropped faces and renumbered loops. Vertices are
+        # left intact, so read each surviving loop's vertex_index and use it to
+        # gather the per-vertex attributes — alignment is guaranteed regardless
+        # of how many loops were removed.
+        loop_vidx = np.empty(len(mesh.loops), dtype=np.int32)
+        mesh.loops.foreach_get("vertex_index", loop_vidx)
+
+        # Custom normals (only when every contributing vertex carried a NORMAL;
+        # otherwise leave Blender's computed normals rather than zeroing some).
+        if normal_parts and normals_covered == total_verts:
+            vert_normals = np.zeros((total_verts, 3), dtype=np.float32)
+            for off, nv, normals in normal_parts:
+                vert_normals[off : off + nv] = normals
+            mesh.normals_split_custom_set(vert_normals[loop_vidx].tolist())
 
         # UV layers
         if self.settings.import_texcoords:
             for layer_idx in range(num_uv_layers):
-                self._apply_uv_layer(mesh, layer_idx, all_uvs, num_loops)
+                self._apply_uv_layer(mesh, layer_idx, uv_parts, total_verts, loop_vidx)
 
         # Vertex colors
         if self.settings.import_colors:
             for layer_idx in range(num_color_layers):
-                self._apply_color_layer(mesh, layer_idx, all_colors, num_loops)
+                self._apply_color_layer(mesh, layer_idx, color_parts, total_verts, loop_vidx)
 
         return mesh
 
-    def _apply_normals(self, mesh, normal_data_list, num_loops: int) -> None:
-        """Set custom split normals."""
-        final_normals = np.zeros((num_loops, 3), dtype=np.float32)
-        for loop_start, normals, indices in normal_data_list:
-            final_normals[loop_start : loop_start + len(indices)] = normals[indices]
-
-        mesh.normals_split_custom_set(final_normals.tolist())
-
-    def _apply_uv_layer(self, mesh, layer_idx: int, all_uvs, num_loops: int) -> None:
+    def _apply_uv_layer(self, mesh, layer_idx, uv_parts, total_verts, loop_vidx) -> None:
         layer_name = "UVMap" if layer_idx == 0 else f"UVMap.{layer_idx:03d}"
         uv_layer = mesh.uv_layers.new(name=layer_name)
 
-        loop_uvs = np.zeros((num_loops, 2), dtype=np.float32)
-        for uv_layer_idx, loop_start, uvs, indices in all_uvs:
+        vert_uvs = np.zeros((total_verts, 2), dtype=np.float32)
+        for uv_layer_idx, off, nv, uvs in uv_parts:
             if uv_layer_idx != layer_idx:
                 continue
-            loop_uvs[loop_start : loop_start + len(indices)] = uvs[indices]
+            vert_uvs[off : off + nv] = uvs
 
-        uv_layer.uv.foreach_set("vector", loop_uvs.flatten())
+        uv_layer.uv.foreach_set("vector", vert_uvs[loop_vidx].flatten())
 
-    def _apply_color_layer(self, mesh, layer_idx: int, all_colors, num_loops: int) -> None:
+    def _apply_color_layer(self, mesh, layer_idx, color_parts, total_verts, loop_vidx) -> None:
         color_attr = mesh.color_attributes.new(
             name="Color" if layer_idx == 0 else f"Color.{layer_idx:03d}",
             type="FLOAT_COLOR",
             domain="CORNER",
         )
 
-        loop_colors = np.ones((num_loops, 4), dtype=np.float32)
-        for color_layer_idx, loop_start, colors, indices in all_colors:
+        vert_colors = np.ones((total_verts, 4), dtype=np.float32)
+        for color_layer_idx, off, nv, colors in color_parts:
             if color_layer_idx != layer_idx:
                 continue
-            # Handle VEC3 colors (no alpha) by padding with 1.0
+            # Handle VEC3 colors (no alpha) by padding alpha with 1.0
             num_components = colors.shape[1] if colors.ndim > 1 else 1
-            n = len(indices)
             if num_components >= 4:
-                loop_colors[loop_start : loop_start + n] = colors[indices, :4]
+                vert_colors[off : off + nv] = colors[:, :4]
             elif num_components == 3:
-                loop_colors[loop_start : loop_start + n, :3] = colors[indices]
+                vert_colors[off : off + nv, :3] = colors
 
-        color_attr.data.foreach_set("color", loop_colors.flatten())
+        color_attr.data.foreach_set("color", vert_colors[loop_vidx].flatten())
 
     def apply_morph_targets(
         self,

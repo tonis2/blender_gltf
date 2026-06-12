@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .converter import (
-    convert_location, convert_rotation, convert_scale,
+    convert_location, convert_rotation, convert_rotation_camera, convert_scale,
     convert_location_array, convert_rotation_array, convert_scale_array,
     matrix_from_gltf,
 )
@@ -226,7 +226,7 @@ class SceneImporter:
 
         obj = bpy.data.objects.new(name, obj_data)
         collection.objects.link(obj)
-        self._apply_transform(obj, node)
+        self._apply_transform(obj, node, camera_fix=self._is_oriented_node(node))
 
         if parent_obj:
             obj.parent = parent_obj
@@ -413,7 +413,28 @@ class SceneImporter:
             return parent_obj.matrix_world @ local
         return local
 
-    def _apply_transform(self, obj: "bpy.types.Object", node: "Node") -> None:
+    @staticmethod
+    def _is_oriented_node(node: "Node") -> bool:
+        """A camera/light/speaker node — one whose -Z forward the exporter
+        post-rotated and the importer must un-rotate."""
+        if node.camera is not None:
+            return True
+        ext = node.extensions
+        return bool(ext and (
+            "KHR_lights_punctual" in ext or "KHR_audio_emitter" in ext
+        ))
+
+    def _apply_transform(
+        self, obj: "bpy.types.Object", node: "Node", camera_fix: bool = False,
+    ) -> None:
+        # Cameras/lights/speakers were post-rotated by Rx(-90°) on export so
+        # their -Z forward survived the axis swap; undo it here, otherwise a
+        # round-tripped light/camera comes back rotated 90° (e.g. a sun pointing
+        # the wrong way). Even when the glTF rotation is omitted (identity) the
+        # inverse fix-up yields a non-identity Blender rotation, so always run it
+        # for oriented nodes rather than gating on node.rotation being present.
+        rot_to_blender = convert_rotation_camera if camera_fix else convert_rotation
+
         if node.matrix:
             import mathutils
             # glTF stores column-major 4x4
@@ -427,14 +448,16 @@ class SceneImporter:
             loc, rot, scl = mat.decompose()
             obj.location = convert_location((loc.x, loc.y, loc.z))
             obj.rotation_mode = "QUATERNION"
-            obj.rotation_quaternion = convert_rotation((rot.x, rot.y, rot.z, rot.w))
+            obj.rotation_quaternion = rot_to_blender((rot.x, rot.y, rot.z, rot.w))
             obj.scale = convert_scale((scl.x, scl.y, scl.z))
         else:
             if node.translation:
                 obj.location = convert_location(node.translation)
-            if node.rotation:
+            if node.rotation or camera_fix:
                 obj.rotation_mode = "QUATERNION"
-                obj.rotation_quaternion = convert_rotation(node.rotation)
+                obj.rotation_quaternion = rot_to_blender(
+                    node.rotation or (0.0, 0.0, 0.0, 1.0)
+                )
             if node.scale:
                 obj.scale = convert_scale(node.scale)
 

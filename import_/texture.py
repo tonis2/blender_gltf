@@ -26,6 +26,10 @@ class TextureImporter:
         self.settings = settings
         self.base_dir = base_dir
         self.blender_images: dict[int, "bpy.types.Image"] = {}
+        # Indices of images that carried an explicit colorspace hint in their
+        # extras on export. The material importer consults this to avoid
+        # clobbering a round-tripped colorspace with per-slot Non-Color forcing.
+        self.hinted_images: set[int] = set()
 
     def import_all(self) -> None:
         if self.gltf.images is None:
@@ -43,6 +47,7 @@ class TextureImporter:
         if img is not None and isinstance(extras, dict):
             cs = extras.get("colorspace")
             if cs:
+                self.hinted_images.add(index)
                 try:
                     img.colorspace_settings.name = cs
                 except (TypeError, ValueError):

@@ -19,6 +19,25 @@ def convert_scale(scale: tuple[float, float, float]) -> tuple[float, float, floa
     return (scale[0], scale[2], scale[1])
 
 
+# √2 / 2 — half-angle component of the Rx(+90°) fix-up quaternion that undoes
+# the Rx(-90°) the exporter applies to cameras/lights/speakers.
+_AXIS_FIXUP_S = 0.7071067811865476
+
+
+def convert_rotation_camera(quat: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    """Inverse of export.convert_rotation_camera.
+
+    Cameras/lights/speakers point along local -Z in both Blender and glTF, but
+    the exporter post-multiplies their rotation by Rx(-90°) so that forward
+    survives the Z-up -> Y-up axis swap. This undoes that fix-up (post-multiply
+    by Rx(+90°)) and converts glTF (x,y,z,w) Y-up -> Blender (w,x,y,z) Z-up, so
+    a round-tripped light/camera lands back at its original orientation.
+    """
+    gx, gy, gz, gw = quat
+    s = _AXIS_FIXUP_S
+    return (s * (gw - gx), s * (gw + gx), s * (gy - gz), s * (gy + gz))
+
+
 def convert_positions(positions: np.ndarray) -> np.ndarray:
     """Convert (N,3) positions: glTF [x,y,z] -> Blender [x,-z,y]."""
     result = positions.copy()

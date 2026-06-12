@@ -107,9 +107,15 @@ class MeshExporter:
                 for p in mod.bl_rna.properties if not p.is_readonly
             )))
             # GN custom-property inputs live in the modifier's mapping, not
-            # the RNA props above.
+            # the RNA props above. Only Geometry Nodes modifiers support
+            # IDProperties; calling keys() on other types raises
+            # "this type doesn't support IDProperties".
+            try:
+                mod_keys = mod.keys()
+            except TypeError:
+                mod_keys = ()
             key_parts.append(repr(tuple(
-                (k, repr(mod[k])) for k in mod.keys()
+                (k, repr(mod[k])) for k in mod_keys
             )))
         cache_key = "|".join(key_parts)
         if cache_key in self._cache:
