@@ -38,6 +38,9 @@ class MaterialExporter:
         self._temp_uvs: list = []                        # (mesh, uv_layer_name)
         self._temp_nodes: list = []                      # (node_tree, node)
         self._hidden_restore: list = []                  # (obj, hide_viewport)
+        self._render_hidden_restore: list = []           # (obj, hide_render)
+        self._coll_render_restore: list = []             # (collection,) hide_render
+        self._vl_hidden_restore: list = []               # (obj,) view-layer hide_set
         self._temp_linked: list = []                     # (obj, collection)
         self._bake_saved: dict | None = None
 
@@ -109,10 +112,13 @@ class MaterialExporter:
 
     def _gather_baked(self, blender_material, obj) -> int | None:
         """Bake `blender_material`'s procedural channels using `obj`'s UVs, then
-        export the result. One texture set per (material, object): objects sharing
-        a procedural material have independent UV layouts.
+        export the result. One texture set per (material, mesh-data): a bake into
+        UV space depends only on the material and the mesh's UVs, so objects that
+        share mesh data (e.g. linked duplicates) reuse a single baked texture set
+        instead of re-baking an identical one each.
         """
-        cache_key = (blender_material.name, obj.name)
+        mesh_key = obj.data.name if obj.data is not None else obj.name
+        cache_key = (blender_material.name, mesh_key)
         if cache_key in self._bake_index_cache:
             return self._bake_index_cache[cache_key]
 
@@ -187,6 +193,26 @@ class MaterialExporter:
         if obj.hide_viewport:
             self._hidden_restore.append((obj, obj.hide_viewport))
             obj.hide_viewport = False
+        # bpy.ops.object.bake refuses render-disabled objects; instance-source
+        # meshes are commonly hide_render=True, so temporarily enable them.
+        if obj.hide_render:
+            self._render_hidden_restore.append((obj, obj.hide_render))
+            obj.hide_render = False
+        # A render-disabled *collection* (e.g. a "Props" or "Instance Sources"
+        # collection with the camera icon off) also makes the object un-bakeable,
+        # and the object flag can't override it. Clear hide_render on every
+        # collection that contains the object (incl. nested parents).
+        for coll in bpy.data.collections:
+            if coll.hide_render and obj.name in coll.all_objects:
+                self._coll_render_restore.append(coll)
+                coll.hide_render = False
+        # View-layer hide (the eye icon, hide_set/hide_get) makes the object
+        # unselectable, so bake would fail with "No valid selected objects".
+        # This is separate from hide_viewport; instance sources are often hidden
+        # this way. Must run after the object is in the view layer (linked above).
+        if obj.hide_get():
+            self._vl_hidden_restore.append(obj)
+            obj.hide_set(False)
         if me.uv_layers:
             me.uv_layers.active = me.uv_layers[0]
             return
@@ -258,14 +284,40 @@ class MaterialExporter:
             return source_mat  # nothing procedural -> export the source as-is
 
         res = self._bake_resolution(source_mat)
-        tag = f"{source_mat.name}__{obj.name}".replace(" ", "_").replace(".", "_")
+        mesh_name = obj.data.name if obj.data is not None else obj.name
+        tag = f"{source_mat.name}__{mesh_name}".replace(" ", "_").replace(".", "_")
         nt = source_mat.node_tree
         out_node = next((n for n in nt.nodes if n.type == "OUTPUT_MATERIAL"), None)
         saved_surface = None
         temp_emit = None
+        saved_actives: list = []
         try:
             self._begin_bake_session()
             self._ensure_uv(obj)
+
+            # bpy.ops.object.bake bakes into the active image node of EVERY
+            # material slot on the object, not just the one we're baking — and
+            # falls back to the *selected* image node when none is active. Other
+            # slots holding image nodes (e.g. a previously-baked material) would
+            # be silently clobbered. Clear the active node and deselect every
+            # image node on those materials for the bake, then restore both.
+            seen_trees = set()
+            for slot in obj.material_slots:
+                m = slot.material
+                if m is None or m is source_mat or m.node_tree is None:
+                    continue
+                tree = m.node_tree
+                if id(tree) in seen_trees:
+                    continue
+                seen_trees.add(id(tree))
+                prev_active = tree.nodes.active
+                prev_selected = [n for n in tree.nodes if n.type == "TEX_IMAGE" and n.select]
+                if prev_active is None and not prev_selected:
+                    continue
+                saved_actives.append((tree, prev_active, prev_selected))
+                tree.nodes.active = None
+                for n in prev_selected:
+                    n.select = False
 
             target = self._bake_targets.get(source_mat.name)
             if target is None or target.name not in nt.nodes:
@@ -370,6 +422,16 @@ class MaterialExporter:
             except Exception:
                 pass
             return None
+        finally:
+            # Restore the active node and selection we cleared on the object's
+            # other materials.
+            for tree, prev_active, prev_selected in saved_actives:
+                try:
+                    for n in prev_selected:
+                        n.select = True
+                    tree.nodes.active = prev_active
+                except Exception:
+                    pass
 
     def cleanup(self) -> None:
         """Remove all temporary bake data and restore render settings. Safe to
@@ -412,6 +474,27 @@ class MaterialExporter:
             except Exception:
                 pass
         self._hidden_restore.clear()
+
+        for obj, hidden in self._render_hidden_restore:
+            try:
+                obj.hide_render = hidden
+            except Exception:
+                pass
+        self._render_hidden_restore.clear()
+
+        for coll in self._coll_render_restore:
+            try:
+                coll.hide_render = True
+            except Exception:
+                pass
+        self._coll_render_restore.clear()
+
+        for obj in self._vl_hidden_restore:
+            try:
+                obj.hide_set(True)
+            except Exception:
+                pass
+        self._vl_hidden_restore.clear()
 
         for obj, coll in self._temp_linked:
             try:
