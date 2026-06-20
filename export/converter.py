@@ -157,7 +157,7 @@ def gather_material_map(obj, material_exporter) -> dict[int, int]:
     material_map: dict[int, int] = {}
     for i, slot in enumerate(obj.material_slots):
         if slot.material is not None:
-            gltf_idx = material_exporter.gather(slot.material)
+            gltf_idx = material_exporter.gather(slot.material, obj)
             if gltf_idx is not None:
                 material_map[i] = gltf_idx
     return material_map

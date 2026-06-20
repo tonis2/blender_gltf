@@ -49,6 +49,8 @@ class ExportSettings:
     export_all_scenes: bool = False
     export_camera_y_up: bool = True
     image_format: str = "AUTO"  # "AUTO", "JPEG", or "PNG"
+    bake_materials: bool = False
+    bake_resolution: str = "1024"  # "512" / "1024" / "2048" / "4096"
     force_64bit: bool = False
     export_uids: bool = True
     export_external_assets: bool = False
@@ -255,6 +257,10 @@ class GltfExporter:
             extensions_required=extensions_required,
             files=self.scene_exporter.files or None,
         )
+
+        # Image bytes were captured eagerly during material gather, so any
+        # temporary baked images/materials/UVs can now be torn down.
+        self.material_exporter.cleanup()
 
         return gltf.to_dict(), binary
 

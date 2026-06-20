@@ -286,6 +286,29 @@ _EXPORT_PROP_DEFS: dict[str, tuple] = {
         ],
         default="AUTO",
     )),
+    "bake_materials": (BoolProperty, dict(
+        name="Bake Materials",
+        description=(
+            "Automatically bake any material whose base color, roughness, "
+            "normal or emission is driven by procedural nodes (Noise, Voronoi, "
+            "bumps, ...) to images, so it survives in glTF. Materials already "
+            "made of plain image textures / constant factors are left untouched. "
+            "A material's own 'Bake Textures on Export' checkbox forces baking "
+            "regardless of this option"
+        ),
+        default=False,
+    )),
+    "bake_resolution": (EnumProperty, dict(
+        name="Bake Resolution",
+        description="Resolution of auto-baked texture maps",
+        items=[
+            ("512", "512 x 512", ""),
+            ("1024", "1024 x 1024", ""),
+            ("2048", "2048 x 2048", ""),
+            ("4096", "4096 x 4096", ""),
+        ],
+        default="1024",
+    )),
     "force_64bit": (BoolProperty, dict(
         name="Force 64-bit GLB",
         description=(
@@ -342,7 +365,9 @@ _EXPORT_PANELS = (
         "export_colors",
         "export_quantization",
     )),
-    ("GLTF_export_material", "Material", ("export_materials", "image_format")),
+    ("GLTF_export_material", "Material", (
+        "export_materials", "image_format", "bake_materials", "bake_resolution",
+    )),
     ("GLTF_export_animation", "Animation", (
         "export_animations",
         "export_animation_events",
@@ -428,13 +453,16 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
             **{prop: getattr(self, prop) for prop in _EXPORT_PROPS},
         )
 
+        exporter = GltfExporter(context, settings)
         try:
-            exporter = GltfExporter(context, settings)
             exporter.export()
             self.report({"INFO"}, f"Exported to {self.filepath}")
         except Exception as e:
             self.report({"ERROR"}, str(e))
             return {"CANCELLED"}
+        finally:
+            # Tear down any temporary bake data even if the export errored.
+            exporter.material_exporter.cleanup()
 
         return {"FINISHED"}
 

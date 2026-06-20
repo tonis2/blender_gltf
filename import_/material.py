@@ -95,6 +95,11 @@ class MaterialImporter:
             if gltf_mat.emissive_texture:
                 self._apply_texture(tree, principled, "Emission Color", gltf_mat.emissive_texture, y_offset=-400)
 
+            # Material PBR-extension layers on the Principled BSDF.
+            if gltf_mat.extensions:
+                self._apply_clearcoat(tree, principled, gltf_mat.extensions)
+                self._apply_sheen(tree, principled, gltf_mat.extensions)
+
         if gltf_mat.alpha_mode == "BLEND":
             if hasattr(mat, "surface_render_method"):
                 mat.surface_render_method = "BLENDED"
@@ -260,6 +265,103 @@ class MaterialImporter:
                 tree.links.new(normal_map.outputs["Normal"], bump.inputs["Normal"])
 
         tree.links.new(bump.outputs["Normal"], principled.inputs["Normal"])
+
+    def _apply_clearcoat(self, tree, principled, extensions: dict) -> None:
+        """KHR_materials_clearcoat -> Principled Coat. Inverse of the exporter:
+        clearcoatFactor -> Coat Weight, clearcoatRoughnessFactor -> Coat
+        Roughness, with textures wired through their glTF channels (clearcoat in
+        R, clearcoat-roughness in G) honoring the scalar factors. glTF clearcoat
+        has no IOR/tint, so those Blender inputs keep their defaults.
+        """
+        cc = extensions.get("KHR_materials_clearcoat")
+        if not cc or "Coat Weight" not in principled.inputs:
+            return
+        factor = cc.get("clearcoatFactor")
+        rough = cc.get("clearcoatRoughnessFactor")
+
+        cc_tex = cc.get("clearcoatTexture")
+        if cc_tex:
+            node = self._make_texture_node(tree, cc_tex, principled, (-900, 250), non_color=True)
+            if node is not None:
+                sep = tree.nodes.new("ShaderNodeSeparateColor")
+                sep.location = (principled.location[0] - 700, principled.location[1] + 250)
+                tree.links.new(node.outputs["Color"], sep.inputs["Color"])
+                self._wire_channel_factor(
+                    tree, sep.outputs["Red"], principled.inputs["Coat Weight"], factor,
+                )
+        elif factor is not None:
+            principled.inputs["Coat Weight"].default_value = float(factor)
+
+        if "Coat Roughness" in principled.inputs:
+            cr_tex = cc.get("clearcoatRoughnessTexture")
+            if cr_tex:
+                node = self._make_texture_node(tree, cr_tex, principled, (-900, 130), non_color=True)
+                if node is not None:
+                    sep = tree.nodes.new("ShaderNodeSeparateColor")
+                    sep.location = (principled.location[0] - 700, principled.location[1] + 130)
+                    tree.links.new(node.outputs["Color"], sep.inputs["Color"])
+                    self._wire_channel_factor(
+                        tree, sep.outputs["Green"], principled.inputs["Coat Roughness"], rough,
+                    )
+            elif rough is not None:
+                principled.inputs["Coat Roughness"].default_value = float(rough)
+
+        cn_tex = cc.get("clearcoatNormalTexture")
+        if cn_tex and "Coat Normal" in principled.inputs:
+            node = self._make_texture_node(tree, cn_tex, principled, (-900, -50), non_color=True)
+            if node is not None:
+                nm = tree.nodes.new("ShaderNodeNormalMap")
+                nm.location = (principled.location[0] - 650, principled.location[1] - 50)
+                scale = cn_tex.get("scale") if isinstance(cn_tex, dict) else None
+                if scale is not None:
+                    nm.inputs["Strength"].default_value = float(scale)
+                tree.links.new(node.outputs["Color"], nm.inputs["Color"])
+                tree.links.new(nm.outputs["Normal"], principled.inputs["Coat Normal"])
+
+    def _apply_sheen(self, tree, principled, extensions: dict) -> None:
+        """KHR_materials_sheen -> Principled Sheen. glTF stores a single sheen
+        *color*; Blender splits it into Sheen Weight (scalar) x Sheen Tint
+        (color), so the brightest channel is recovered as the weight and the
+        normalized color as the tint (mirrors the exporter's tint*weight fold).
+        sheenRoughnessFactor -> Sheen Roughness; the roughness texture's value
+        lives in its Alpha channel per the glTF spec.
+        """
+        sh = extensions.get("KHR_materials_sheen")
+        if not sh or "Sheen Weight" not in principled.inputs:
+            return
+        color = sh.get("sheenColorFactor")
+        rough = sh.get("sheenRoughnessFactor")
+        color_tex = sh.get("sheenColorTexture")
+        rough_tex = sh.get("sheenRoughnessTexture")
+
+        weight = 1.0
+        if color and len(color) >= 3:
+            peak = max(float(color[0]), float(color[1]), float(color[2]))
+            if peak > 0.0:
+                weight = peak
+                if "Sheen Tint" in principled.inputs and not color_tex:
+                    principled.inputs["Sheen Tint"].default_value = (
+                        color[0] / peak, color[1] / peak, color[2] / peak, 1.0,
+                    )
+            else:
+                weight = 0.0
+        principled.inputs["Sheen Weight"].default_value = weight
+
+        if rough is not None and "Sheen Roughness" in principled.inputs:
+            principled.inputs["Sheen Roughness"].default_value = float(rough)
+
+        if color_tex and "Sheen Tint" in principled.inputs:
+            node = self._make_texture_node(tree, color_tex, principled, (-900, -200))
+            if node is not None:
+                tree.links.new(node.outputs["Color"], principled.inputs["Sheen Tint"])
+                if weight == 0.0:
+                    principled.inputs["Sheen Weight"].default_value = 1.0
+
+        if rough_tex and "Sheen Roughness" in principled.inputs:
+            node = self._make_texture_node(tree, rough_tex, principled, (-900, -320), non_color=True)
+            if node is not None:
+                # glTF carries sheen roughness in the texture's Alpha channel.
+                tree.links.new(node.outputs["Alpha"], principled.inputs["Sheen Roughness"])
 
     def _apply_texture_transform(self, tree, tex_node, texture_info) -> None:
         """Create Mapping + Texture Coordinate nodes for KHR_texture_transform,

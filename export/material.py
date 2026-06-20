@@ -14,6 +14,8 @@ if TYPE_CHECKING:
 EXT_MATERIALS_UNLIT = "KHR_materials_unlit"
 EXT_MATERIALS_LAYERS = "CUSTOM_materials_layers"
 EXT_EMISSIVE_STRENGTH = "KHR_materials_emissive_strength"
+EXT_MATERIALS_CLEARCOAT = "KHR_materials_clearcoat"
+EXT_MATERIALS_SHEEN = "KHR_materials_sheen"
 BSDF_STACK_NODE_IDNAME = "BSDFStackNodeType"
 # All Blender ShaderNodeMix blend types the BSDFStackNode exposes per layer.
 _VALID_BLEND_MODES = {m[0] for m in BLEND_MODES}
@@ -28,19 +30,415 @@ class MaterialExporter:
         self.material_index_by_name: dict[str, int] = {}
         self.extensions_used: set[str] = set()
 
-    def gather(self, blender_material: "bpy.types.Material") -> int | None:
-        """Export a Blender material. Returns material index or None."""
+        # Export-time bake bookkeeping (see _gather_baked / cleanup).
+        self._bake_index_cache: dict[tuple, int] = {}   # (mat, obj) -> gltf index
+        self._bake_targets: dict[str, object] = {}      # source mat name -> target node
+        self._temp_images: list = []
+        self._temp_materials: list = []
+        self._temp_uvs: list = []                        # (mesh, uv_layer_name)
+        self._temp_nodes: list = []                      # (node_tree, node)
+        self._hidden_restore: list = []                  # (obj, hide_viewport)
+        self._temp_linked: list = []                     # (obj, collection)
+        self._bake_saved: dict | None = None
+
+    def gather(
+        self, blender_material: "bpy.types.Material", obj: "bpy.types.Object | None" = None
+    ) -> int | None:
+        """Export a Blender material. Returns material index or None.
+
+        `obj` is the object the material is gathered for; it is required for the
+        bake path (baking needs the object's UVs). Callers without an object
+        simply skip baking.
+        """
         if blender_material is None:
             return None
+        if obj is not None and self._should_bake(blender_material):
+            return self._gather_baked(blender_material, obj)
+        return self._gather_unbaked(blender_material)
 
-        if blender_material.name in self.material_index_by_name:
-            return self.material_index_by_name[blender_material.name]
-
-        material = self._extract(blender_material)
+    def _add_material(self, material: "Material") -> int:
+        """Append a Material to the export list and return its index."""
         index = len(self.materials)
         self.materials.append(material)
+        return index
+
+    def _gather_unbaked(self, blender_material) -> int:
+        """Extract and register a material, de-duplicated by name."""
+        index = self.material_index_by_name.get(blender_material.name)
+        if index is not None:
+            return index
+        index = self._add_material(self._extract(blender_material))
         self.material_index_by_name[blender_material.name] = index
         return index
+
+    def _should_bake(self, blender_material: "bpy.types.Material") -> bool:
+        """Bake when the global 'Bake Materials' export option is on and the
+        material actually needs it (a channel is procedural and can't be
+        represented directly)."""
+        if not getattr(self.settings, "bake_materials", False):
+            return False
+        return self._material_needs_bake(blender_material)
+
+    # Nodes that resolve to a constant glTF factor (no bake needed) even though
+    # they're "linked": plain RGB/Value/Combine constants.
+    _CONSTANT_NODE_TYPES = {"RGB", "VALUE", "COMBINE_COLOR", "COMBINE_RGB", "COMBXYZ"}
+
+    def _socket_needs_bake(self, socket) -> bool:
+        """True if `socket` is driven by procedural nodes that glTF can't hold.
+        A socket resolving to an Image Texture (directly exportable) or to a
+        plain constant node (exportable as a factor) does NOT need baking."""
+        if socket is None or not socket.is_linked:
+            return False
+        if self._walk_to_image(socket) is not None:
+            return False  # representable as a texture as-is
+        src_type = getattr(socket.links[0].from_node, "type", "")
+        if src_type in self._CONSTANT_NODE_TYPES:
+            return False  # representable as a constant factor
+        return True
+
+    def _material_needs_bake(self, blender_material: "bpy.types.Material") -> bool:
+        """Heuristic: does any glTF-relevant Principled channel depend on
+        procedural nodes (so it would be lost without baking)?"""
+        principled = self._find_principled_bsdf(blender_material)
+        if principled is None:
+            return False  # custom/surface-group materials are not auto-baked
+        for name in ("Base Color", "Metallic", "Roughness", "Normal", "Emission Color"):
+            if self._socket_needs_bake(principled.inputs.get(name)):
+                return True
+        return False
+
+    def _gather_baked(self, blender_material, obj) -> int | None:
+        """Bake `blender_material`'s procedural channels using `obj`'s UVs, then
+        export the result. One texture set per (material, object): objects sharing
+        a procedural material have independent UV layouts.
+        """
+        cache_key = (blender_material.name, obj.name)
+        if cache_key in self._bake_index_cache:
+            return self._bake_index_cache[cache_key]
+
+        baked_mat = self._bake_material(blender_material, obj)
+        if baked_mat is None:
+            # Bake failed -> fall back to a plain (un-baked) export so the
+            # material still appears, just without its procedural detail.
+            return self._gather_unbaked(blender_material)
+
+        material = self._extract(baked_mat)
+        material.name = blender_material.name  # keep the user-facing name
+        index = self._add_material(material)
+        self._bake_index_cache[cache_key] = index
+        return index
+
+    # ------------------------------------------------------------------
+    # Export-time per-channel texture baking ("Bake Materials")
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_override() -> dict:
+        """A VIEW_3D context override so bpy.ops (unwrap/bake) poll correctly
+        when driven from the exporter rather than a 3D viewport."""
+        import bpy
+        for w in bpy.context.window_manager.windows:
+            for a in w.screen.areas:
+                if a.type == "VIEW_3D":
+                    region = next((r for r in a.regions if r.type == "WINDOW"), None)
+                    return {"window": w, "screen": w.screen, "area": a, "region": region}
+        return {}
+
+    def _bake_resolution(self, blender_material) -> int:
+        """Resolution for the bake, from the global export 'Bake Resolution'."""
+        val = getattr(self.settings, "bake_resolution", "1024")
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return 1024
+
+    def _begin_bake_session(self) -> None:
+        import bpy
+        sc = bpy.context.scene
+        if self._bake_saved is None:
+            self._bake_saved = {
+                "engine": sc.render.engine,
+                "samples": getattr(getattr(sc, "cycles", None), "samples", None),
+                "active": bpy.context.view_layer.objects.active,
+                "selected": [o for o in bpy.context.view_layer.objects if o.select_get()],
+            }
+        sc.render.engine = "CYCLES"
+        try:
+            sc.cycles.samples = 1   # albedo/roughness/normal are deterministic
+        except Exception:
+            pass
+        rb = sc.render.bake
+        rb.use_clear = True
+        rb.margin = 6
+
+    def _ensure_uv(self, obj) -> None:
+        """Make obj baking-ready: a UV map active, object visible & selectable.
+        Creates a temporary UV layer (Smart UV Project) when the mesh has none.
+        """
+        import bpy
+        me = obj.data
+        # Objects reached via hierarchy traversal may not be in the active view
+        # layer (so bpy.ops can't select them); link them in for the bake.
+        if obj.name not in bpy.context.view_layer.objects:
+            coll = bpy.context.scene.collection
+            coll.objects.link(obj)
+            self._temp_linked.append((obj, coll))
+            bpy.context.view_layer.update()
+        if obj.hide_viewport:
+            self._hidden_restore.append((obj, obj.hide_viewport))
+            obj.hide_viewport = False
+        if me.uv_layers:
+            me.uv_layers.active = me.uv_layers[0]
+            return
+        ov = self._get_override()
+        with bpy.context.temp_override(**ov):
+            bpy.ops.object.select_all(action="DESELECT")
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode="EDIT")
+            bpy.ops.mesh.select_all(action="SELECT")
+            bpy.ops.uv.smart_project(angle_limit=1.15, island_margin=0.02)
+            bpy.ops.object.mode_set(mode="OBJECT")
+        if me.uv_layers.active is not None:
+            self._temp_uvs.append((me, me.uv_layers.active.name))
+
+    def _bake_pass(self, obj, source_mat, target, name, res, bake_type, non_color):
+        import bpy
+        img = bpy.data.images.get(name)
+        if img is not None:
+            bpy.data.images.remove(img)
+        img = bpy.data.images.new(name, res, res, alpha=False)
+        img.colorspace_settings.name = "Non-Color" if non_color else "sRGB"
+        self._temp_images.append(img)
+        target.image = img
+
+        sc = bpy.context.scene
+        rb = sc.render.bake
+        ov = self._get_override()
+        with bpy.context.temp_override(**ov):
+            bpy.ops.object.select_all(action="DESELECT")
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+            if bake_type == "DIFFUSE":
+                rb.use_pass_direct = False
+                rb.use_pass_indirect = False
+                rb.use_pass_color = True
+            bpy.ops.object.bake(type=bake_type)
+        return img
+
+    def _bake_material(self, source_mat, obj):
+        """Bake only the *procedural* channels of source_mat for `obj` and return
+        a copy material whose procedural channels point at freshly baked images
+        while its image-backed channels keep the original textures untouched.
+        Returns None on failure (caller falls back to an un-baked export).
+
+        Per-channel: Base Color / Normal / Emission each bake to their own image
+        only when that channel can't be represented directly (procedural). Metallic
+        and Roughness share one glTF slot, so when either is procedural both are
+        sampled and packed into a single metallic-roughness image (G=roughness,
+        B=metallic). Channels that already resolve to an image (or a constant) are
+        left exactly as authored, so a material that only has, say, a procedural
+        metallic mask keeps its original high-res albedo/normal maps.
+        """
+        import bpy
+        if source_mat.node_tree is None:
+            return None
+        ps = self._find_principled_bsdf(source_mat)
+        if ps is None:
+            return None  # custom / surface-group materials: nothing to bake here
+
+        def _want(ch):
+            return self._socket_needs_bake(ps.inputs.get(ch))
+
+        bake_base = _want("Base Color")
+        bake_norm = _want("Normal")
+        bake_emit = _want("Emission Color")
+        bake_mr = _want("Metallic") or _want("Roughness")
+        if not (bake_base or bake_norm or bake_emit or bake_mr):
+            return source_mat  # nothing procedural -> export the source as-is
+
+        res = self._bake_resolution(source_mat)
+        tag = f"{source_mat.name}__{obj.name}".replace(" ", "_").replace(".", "_")
+        nt = source_mat.node_tree
+        out_node = next((n for n in nt.nodes if n.type == "OUTPUT_MATERIAL"), None)
+        saved_surface = None
+        temp_emit = None
+        try:
+            self._begin_bake_session()
+            self._ensure_uv(obj)
+
+            target = self._bake_targets.get(source_mat.name)
+            if target is None or target.name not in nt.nodes:
+                target = nt.nodes.new("ShaderNodeTexImage")
+                target.location = (-1400, 700)
+                self._bake_targets[source_mat.name] = target
+                self._temp_nodes.append((nt, target))
+            nt.nodes.active = target
+
+            img_base = img_norm = img_emit = img_mr = None
+
+            if bake_base:
+                img_base = self._bake_pass(obj, source_mat, target, f"{tag}_basecolor", res, "DIFFUSE", False)
+            if bake_norm:
+                img_norm = self._bake_pass(obj, source_mat, target, f"{tag}_normal", res, "NORMAL", True)
+            if bake_emit:
+                img_emit = self._bake_pass(obj, source_mat, target, f"{tag}_emit", res, "EMIT", False)
+
+            if bake_mr:
+                import numpy as np
+                img_rough = self._bake_pass(obj, source_mat, target, f"{tag}_rough", res, "ROUGHNESS", True)
+
+                # Metallic has no native bake pass: route the Metallic input
+                # through a temporary Emission shader and bake the EMIT pass.
+                msock = ps.inputs.get("Metallic")
+                if msock is not None and msock.is_linked and out_node is not None:
+                    surf = out_node.inputs["Surface"]
+                    saved_surface = surf.links[0].from_socket if surf.is_linked else None
+                    temp_emit = nt.nodes.new("ShaderNodeEmission")
+                    temp_emit.location = (300, 700)
+                    nt.links.new(msock.links[0].from_socket, temp_emit.inputs["Color"])
+                    nt.links.new(temp_emit.outputs["Emission"], surf)
+                    img_metal = self._bake_pass(obj, source_mat, target, f"{tag}_metal", res, "EMIT", True)
+                    if saved_surface is not None:
+                        nt.links.new(saved_surface, surf)
+                    nt.nodes.remove(temp_emit)
+                    temp_emit = None
+                    metal_px = np.empty(res * res * 4, dtype=np.float32)
+                    img_metal.pixels.foreach_get(metal_px)
+                    metal_b = metal_px[0::4]
+                else:
+                    mv = self._get_socket_default(ps, "Metallic")
+                    metal_b = float(mv) if mv is not None else 0.0
+
+                rough_px = np.empty(res * res * 4, dtype=np.float32)
+                img_rough.pixels.foreach_get(rough_px)
+                mr_px = np.empty(res * res * 4, dtype=np.float32)
+                mr_px[0::4] = 0.0
+                mr_px[1::4] = rough_px[0::4]   # G = roughness
+                mr_px[2::4] = metal_b          # B = metallic
+                mr_px[3::4] = 1.0
+                img_mr = bpy.data.images.new(f"{tag}_mr", res, res, alpha=False)
+                img_mr.colorspace_settings.name = "Non-Color"
+                img_mr.pixels.foreach_set(mr_px)
+                img_mr.update()
+                self._temp_images.append(img_mr)
+
+            # Output material: a copy of the source (so every image-backed channel
+            # survives verbatim) with the procedural channels rewired to the bakes.
+            work = source_mat.copy()
+            work.name = f"__gltf_baked__{tag}"
+            self._temp_materials.append(work)
+            wnt = work.node_tree
+            pw = self._find_principled_bsdf(work)
+
+            def _img_node(image, x, y, non_color):
+                node = wnt.nodes.new("ShaderNodeTexImage")
+                node.image = image
+                node.location = (x, y)
+                if non_color:
+                    image.colorspace_settings.name = "Non-Color"
+                return node
+
+            if pw is not None:
+                if img_base is not None:
+                    n = _img_node(img_base, -800, 300, False)
+                    wnt.links.new(n.outputs["Color"], pw.inputs["Base Color"])
+                if img_norm is not None:
+                    n = _img_node(img_norm, -1000, -300, True)
+                    nm = wnt.nodes.new("ShaderNodeNormalMap"); nm.location = (-600, -300)
+                    wnt.links.new(n.outputs["Color"], nm.inputs["Color"])
+                    wnt.links.new(nm.outputs["Normal"], pw.inputs["Normal"])
+                if img_emit is not None:
+                    n = _img_node(img_emit, -800, -600, False)
+                    if "Emission Color" in pw.inputs:
+                        wnt.links.new(n.outputs["Color"], pw.inputs["Emission Color"])
+                    if "Emission Strength" in pw.inputs and not pw.inputs["Emission Strength"].is_linked:
+                        pw.inputs["Emission Strength"].default_value = 1.0
+                if img_mr is not None:
+                    n = _img_node(img_mr, -800, 0, True)
+                    wnt.links.new(n.outputs["Color"], pw.inputs["Metallic"])
+                    wnt.links.new(n.outputs["Color"], pw.inputs["Roughness"])
+
+            return work
+        except Exception as e:  # noqa: BLE001 - never let a bake abort the export
+            print(f"glTF export: bake failed for '{source_mat.name}' on '{obj.name}': {e}")
+            try:
+                if temp_emit is not None and out_node is not None:
+                    if saved_surface is not None:
+                        nt.links.new(saved_surface, out_node.inputs["Surface"])
+                    nt.nodes.remove(temp_emit)
+            except Exception:
+                pass
+            return None
+
+    def cleanup(self) -> None:
+        """Remove all temporary bake data and restore render settings. Safe to
+        call multiple times; a no-op when nothing was baked."""
+        import bpy
+        for nt, node in self._temp_nodes:
+            try:
+                nt.nodes.remove(node)
+            except Exception:
+                pass
+        self._temp_nodes.clear()
+        self._bake_targets.clear()
+
+        for me, uv_name in self._temp_uvs:
+            try:
+                uv = me.uv_layers.get(uv_name)
+                if uv is not None:
+                    me.uv_layers.remove(uv)
+            except Exception:
+                pass
+        self._temp_uvs.clear()
+
+        for m in self._temp_materials:
+            try:
+                bpy.data.materials.remove(m)
+            except Exception:
+                pass
+        self._temp_materials.clear()
+
+        for img in self._temp_images:
+            try:
+                bpy.data.images.remove(img)
+            except Exception:
+                pass
+        self._temp_images.clear()
+
+        for obj, hidden in self._hidden_restore:
+            try:
+                obj.hide_viewport = hidden
+            except Exception:
+                pass
+        self._hidden_restore.clear()
+
+        for obj, coll in self._temp_linked:
+            try:
+                coll.objects.unlink(obj)
+            except Exception:
+                pass
+        self._temp_linked.clear()
+
+        if self._bake_saved is not None:
+            sc = bpy.context.scene
+            try:
+                sc.render.engine = self._bake_saved["engine"]
+            except Exception:
+                pass
+            if self._bake_saved.get("samples") is not None:
+                try:
+                    sc.cycles.samples = self._bake_saved["samples"]
+                except Exception:
+                    pass
+            try:
+                vl_objs = bpy.context.view_layer.objects
+                for o in vl_objs:
+                    o.select_set(o in self._bake_saved.get("selected", []))
+                vl_objs.active = self._bake_saved.get("active")
+            except Exception:
+                pass
+            self._bake_saved = None
 
     def _extract(self, blender_material: "bpy.types.Material") -> Material:
         pbr = None
@@ -53,6 +451,7 @@ class MaterialExporter:
         double_sided = None
         layers = None
         base_extra = None
+        principled = None
 
         stack_node = self._find_bsdf_stack_node(blender_material)
         if stack_node is not None:
@@ -121,6 +520,24 @@ class MaterialExporter:
                 "emissiveStrength": emissive_strength,
             }
             self.extensions_used.add(EXT_EMISSIVE_STRENGTH)
+
+        # KHR_materials_clearcoat / KHR_materials_sheen: the Principled BSDF's
+        # Coat and Sheen layers. Only emitted for the standard Principled path
+        # (the BSDFStack path routes its coat/sheen through CUSTOM_materials_layers).
+        if principled is not None:
+            clearcoat = self._gather_clearcoat(principled)
+            if clearcoat is not None:
+                if extensions is None:
+                    extensions = {}
+                extensions[EXT_MATERIALS_CLEARCOAT] = clearcoat
+                self.extensions_used.add(EXT_MATERIALS_CLEARCOAT)
+
+            sheen = self._gather_sheen(principled)
+            if sheen is not None:
+                if extensions is None:
+                    extensions = {}
+                extensions[EXT_MATERIALS_SHEEN] = sheen
+                self.extensions_used.add(EXT_MATERIALS_SHEEN)
 
         return Material(
             name=blender_material.name,
@@ -319,6 +736,150 @@ class MaterialExporter:
                 if strength and strength.default_value != 1.0:
                     scale = float(strength.default_value)
 
+        return NormalTextureInfo(
+            index=tex_info.index,
+            tex_coord=tex_info.tex_coord,
+            scale=scale,
+            extensions=tex_info.extensions,
+        )
+
+    def _gather_clearcoat(
+        self, principled: "bpy.types.ShaderNodeBsdfPrincipled"
+    ) -> dict | None:
+        """KHR_materials_clearcoat from the Principled BSDF Coat inputs.
+
+        Maps Coat Weight -> clearcoatFactor/clearcoatTexture (R),
+        Coat Roughness -> clearcoatRoughnessFactor/clearcoatRoughnessTexture (G),
+        Coat Normal -> clearcoatNormalTexture. glTF clearcoat has no IOR or tint,
+        so Coat IOR / Coat Tint are intentionally dropped.
+        """
+        weight_socket = principled.inputs.get("Coat Weight")
+        if weight_socket is None:
+            return None  # Blender too old to expose a Coat layer
+
+        weight_val = self._get_socket_default(principled, "Coat Weight")
+        weight_val = float(weight_val) if weight_val is not None else 0.0
+
+        weight_node = self._get_connected_image_node(principled, "Coat Weight")
+        rough_node = self._get_connected_image_node(principled, "Coat Roughness")
+        normal_node = self._get_connected_image_node(principled, "Coat Normal")
+
+        # Inactive coat: zero weight, nothing linked -> no extension.
+        if (
+            weight_val == 0.0 and not weight_socket.is_linked
+            and weight_node is None and rough_node is None and normal_node is None
+        ):
+            return None
+
+        ext: dict = {}
+        # A linked socket's default_value is ignored by Blender, so the glTF
+        # factor must stay at 1.0 to avoid scaling the texture down on import.
+        if weight_socket.is_linked:
+            ext["clearcoatFactor"] = 1.0
+        elif weight_val != 0.0:  # spec default is 0.0
+            ext["clearcoatFactor"] = weight_val
+
+        rough_socket = principled.inputs.get("Coat Roughness")
+        if rough_socket is not None:
+            if rough_socket.is_linked:
+                ext["clearcoatRoughnessFactor"] = 1.0
+            else:
+                rv = self._get_socket_default(principled, "Coat Roughness")
+                if rv is not None and float(rv) != 0.0:
+                    ext["clearcoatRoughnessFactor"] = float(rv)
+
+        if weight_node is not None:
+            ti = self.texture_exporter.gather_texture_info(weight_node)
+            if ti is not None:
+                ext["clearcoatTexture"] = ti
+        if rough_node is not None:
+            ti = self.texture_exporter.gather_texture_info(rough_node)
+            if ti is not None:
+                ext["clearcoatRoughnessTexture"] = ti
+        if normal_node is not None:
+            nti = self._gather_normal_for_socket(principled, "Coat Normal")
+            if nti is not None:
+                ext["clearcoatNormalTexture"] = nti
+
+        return ext or None
+
+    def _gather_sheen(
+        self, principled: "bpy.types.ShaderNodeBsdfPrincipled"
+    ) -> dict | None:
+        """KHR_materials_sheen from the Principled BSDF Sheen inputs.
+
+        glTF stores a sheen *color*; Blender splits it into Sheen Weight
+        (scalar) x Sheen Tint (color), so sheenColorFactor = tint * weight.
+        Sheen Roughness -> sheenRoughnessFactor (texture uses the A channel).
+        """
+        weight_socket = principled.inputs.get("Sheen Weight")
+        if weight_socket is None:
+            return None
+
+        weight_val = self._get_socket_default(principled, "Sheen Weight")
+        weight_val = float(weight_val) if weight_val is not None else 0.0
+
+        color_node = self._get_connected_image_node(principled, "Sheen Tint")
+        rough_node = self._get_connected_image_node(principled, "Sheen Roughness")
+
+        if (
+            weight_val == 0.0 and not weight_socket.is_linked
+            and color_node is None and rough_node is None
+        ):
+            return None
+
+        ext: dict = {}
+        # Weight scales the tint into the color factor. A linked weight socket's
+        # default is ignored, so fold a unit weight and let the texture drive it.
+        wscale = 1.0 if weight_socket.is_linked else weight_val
+        tint = self._get_socket_default(principled, "Sheen Tint")
+        if tint is not None and hasattr(tint, "__len__") and len(tint) >= 3:
+            color = [float(tint[0]) * wscale, float(tint[1]) * wscale, float(tint[2]) * wscale]
+        else:
+            # Scalar/!color tint (older Blender) or none: greyscale by weight.
+            color = [wscale, wscale, wscale]
+        if color != [0.0, 0.0, 0.0]:  # spec default is [0,0,0]
+            ext["sheenColorFactor"] = color
+
+        rough_socket = principled.inputs.get("Sheen Roughness")
+        if rough_socket is not None:
+            if rough_socket.is_linked:
+                ext["sheenRoughnessFactor"] = 1.0
+            else:
+                rv = self._get_socket_default(principled, "Sheen Roughness")
+                if rv is not None and float(rv) != 0.0:
+                    ext["sheenRoughnessFactor"] = float(rv)
+
+        if color_node is not None:
+            ti = self.texture_exporter.gather_texture_info(color_node)
+            if ti is not None:
+                ext["sheenColorTexture"] = ti
+        if rough_node is not None:
+            ti = self.texture_exporter.gather_texture_info(rough_node)
+            if ti is not None:
+                ext["sheenRoughnessTexture"] = ti
+
+        return ext or None
+
+    def _gather_normal_for_socket(
+        self, node: "bpy.types.ShaderNode", socket_name: str
+    ) -> NormalTextureInfo | None:
+        """NormalTextureInfo for an arbitrary normal socket (e.g. "Coat Normal"),
+        reading the Normal Map node's Strength as the glTF scale."""
+        image_node = self._get_connected_image_node(node, socket_name)
+        if image_node is None:
+            return None
+        tex_info = self.texture_exporter.gather_texture_info(image_node)
+        if tex_info is None:
+            return None
+        scale = None
+        socket = node.inputs.get(socket_name)
+        if socket and socket.is_linked:
+            src = socket.links[0].from_node
+            if src.type == "NORMAL_MAP":
+                strength = src.inputs.get("Strength")
+                if strength and strength.default_value != 1.0:
+                    scale = float(strength.default_value)
         return NormalTextureInfo(
             index=tex_info.index,
             tex_coord=tex_info.tex_coord,
