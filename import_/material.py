@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 
 EXT_MATERIALS_LAYERS = "CUSTOM_materials_layers"
+EXT_PACKED_TEXTURE = "CUSTOM_packed_texture"
 BSDF_STACK_NODE_IDNAME = "BSDFStackNodeType"
 
 # Valid CUSTOM_materials_layers blend mode ids, derived from the shared table.
@@ -73,7 +74,7 @@ class MaterialImporter:
 
             pbr = gltf_mat.pbr_metallic_roughness
             if pbr:
-                self._apply_pbr(tree, principled, pbr)
+                self._apply_pbr(tree, principled, pbr, gltf_mat, mat)
 
             if base and (base.get("heightTexture") or base.get("bump")):
                 # Rebuild the Bump node (Height <- displacement, Normal <- the
@@ -128,7 +129,7 @@ class MaterialImporter:
 
         return mat
 
-    def _apply_pbr(self, tree, principled, pbr) -> None:
+    def _apply_pbr(self, tree, principled, pbr, gltf_mat=None, mat=None) -> None:
         if pbr.base_color_factor:
             principled.inputs["Base Color"].default_value = tuple(pbr.base_color_factor[:4])
             if len(pbr.base_color_factor) > 3:
@@ -144,9 +145,9 @@ class MaterialImporter:
             self._apply_texture(tree, principled, "Base Color", pbr.base_color_texture, y_offset=0)
 
         if pbr.metallic_roughness_texture:
-            self._apply_metallic_roughness_texture(tree, principled, pbr)
+            self._apply_metallic_roughness_texture(tree, principled, pbr, gltf_mat, mat)
 
-    def _apply_metallic_roughness_texture(self, tree, principled, pbr) -> None:
+    def _apply_metallic_roughness_texture(self, tree, principled, pbr, gltf_mat=None, mat=None) -> None:
         """glTF packs roughness in the G channel and metallic in the B channel of
         a single combined texture. Split it: Green -> Roughness, Blue -> Metallic,
         honoring the scalar factors (final = factor * sampled_channel).
@@ -174,6 +175,41 @@ class MaterialImporter:
             tree, sep.outputs["Blue"], principled.inputs["Metallic"],
             pbr.metallic_factor,
         )
+
+        # Reinterpret the packed R (occlusion) and A (alpha) channels of the
+        # same image, and record the layout on gltf_props for a lossless
+        # re-export.
+        if gltf_mat is not None and mat is not None:
+            self._apply_packed_channels(tree, principled, mat, gltf_mat, tex_node, pbr)
+
+    def _apply_packed_channels(self, tree, principled, mat, gltf_mat, tex_node, pbr) -> None:
+        """Handle the non-standard channels of a hand-packed ORM(A) texture:
+        occlusion (R) is recorded for round-trip (preserve-only, no viewport
+        effect, matching the official glTF importer); base alpha packed in the
+        Alpha channel (CUSTOM_packed_texture) is wired into Principled.Alpha.
+        Roughness (G) / Metallic (B) are already split by the caller.
+        """
+        gltf_props = getattr(mat, "gltf_props", None)
+        mr_index = pbr.metallic_roughness_texture.index
+
+        # Occlusion sharing the MR image -> spec ORM. Preserve-only: the R
+        # channel round-trips via gltf_props without altering viewport shading.
+        occ = gltf_mat.occlusion_texture
+        if occ is not None and getattr(occ, "index", None) == mr_index:
+            if gltf_props is not None:
+                gltf_props.packed_r_channel = "OCCLUSION"
+                if getattr(occ, "strength", None) is not None:
+                    gltf_props.occlusion_strength = float(occ.strength)
+
+        # Base alpha packed in the MR texture's Alpha channel.
+        ext = gltf_mat.extensions or {}
+        packed = ext.get(EXT_PACKED_TEXTURE)
+        if packed and packed.get("alphaChannel") == "metallicRoughness":
+            alpha_out = tex_node.outputs.get("Alpha")
+            if alpha_out is not None:
+                tree.links.new(alpha_out, principled.inputs["Alpha"])
+            if gltf_props is not None:
+                gltf_props.packed_alpha = True
 
     def _wire_channel_factor(self, tree, from_socket, to_socket, factor) -> None:
         """Link a separated metallic/roughness channel into `to_socket`,

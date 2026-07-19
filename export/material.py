@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ..gltf.types import Material, MaterialPBRMetallicRoughness, NormalTextureInfo
+from ..gltf.types import (
+    Material,
+    MaterialPBRMetallicRoughness,
+    NormalTextureInfo,
+    OcclusionTextureInfo,
+)
 from ..layer_node.constants import N_CH, CH_TO_IDX, BLEND_MODES
 from .texture import TextureExporter
 
@@ -16,6 +21,7 @@ EXT_MATERIALS_LAYERS = "CUSTOM_materials_layers"
 EXT_EMISSIVE_STRENGTH = "KHR_materials_emissive_strength"
 EXT_MATERIALS_CLEARCOAT = "KHR_materials_clearcoat"
 EXT_MATERIALS_SHEEN = "KHR_materials_sheen"
+EXT_PACKED_TEXTURE = "CUSTOM_packed_texture"
 BSDF_STACK_NODE_IDNAME = "BSDFStackNodeType"
 # All Blender ShaderNodeMix blend types the BSDFStackNode exposes per layer.
 _VALID_BLEND_MODES = {m[0] for m in BLEND_MODES}
@@ -575,9 +581,43 @@ class MaterialExporter:
         if blender_material.use_backface_culling is False:
             double_sided = True
 
+        gltf_props = getattr(blender_material, "gltf_props", None)
+
+        # CUSTOM_packed_texture: a hand-packed ORM(A) metallic/roughness texture.
+        # Roughness (G) and Metallic (B) already flow through pbr; here the R and
+        # A channels are reinterpreted per the material's packed settings.
+        # Occlusion reuses the MR texture index as a spec occlusionTexture;
+        # alpha-in-A is flagged via the CUSTOM extension so import can rewire it.
+        # (Depth on R needs no handling here: wiring it through a Bump node into
+        # Principled.Normal already exports it via the heightTexture/bump path.)
+        occlusion_texture = None
+        packed_alpha = False
+        mr_ti = pbr.metallic_roughness_texture if pbr is not None else None
+        if gltf_props and mr_ti is not None:
+            r_mode = getattr(gltf_props, "packed_r_channel", "NONE")
+            if r_mode == "OCCLUSION":
+                strength = float(getattr(gltf_props, "occlusion_strength", 1.0))
+                occlusion_texture = OcclusionTextureInfo(
+                    index=mr_ti.index,
+                    tex_coord=mr_ti.tex_coord,
+                    strength=None if strength == 1.0 else strength,
+                )
+            packed_alpha = bool(getattr(gltf_props, "packed_alpha", False))
+
+        # With packed alpha the base alpha lives in the MR texture's A channel,
+        # so the Principled Alpha socket is typically unwired and _gather_alpha
+        # can't see it. Derive the mode from the material's render method instead.
+        if packed_alpha and alpha_mode is None:
+            render_method = getattr(blender_material, "surface_render_method", None)
+            if render_method == "DITHERED":
+                thr = getattr(blender_material, "alpha_threshold", 0.5)
+                alpha_mode = "MASK"
+                alpha_cutoff = float(thr) if thr != 0.5 else None
+            else:
+                alpha_mode = "BLEND"
+
         # KHR_materials_unlit
         extensions = None
-        gltf_props = getattr(blender_material, "gltf_props", None)
         if gltf_props and gltf_props.unlit:
             extensions = {EXT_MATERIALS_UNLIT: {}}
             self.extensions_used.add(EXT_MATERIALS_UNLIT)
@@ -593,6 +633,14 @@ class MaterialExporter:
                 ext_dict["base"] = base_extra
             extensions[EXT_MATERIALS_LAYERS] = ext_dict
             self.extensions_used.add(EXT_MATERIALS_LAYERS)
+
+        # CUSTOM_packed_texture: base alpha rides in the metallicRoughness
+        # texture's Alpha channel (non-standard slot, so import needs the hint).
+        if packed_alpha:
+            if extensions is None:
+                extensions = {}
+            extensions[EXT_PACKED_TEXTURE] = {"alphaChannel": "metallicRoughness"}
+            self.extensions_used.add(EXT_PACKED_TEXTURE)
 
         # KHR_materials_emissive_strength: emission beyond [0,1] is carried by
         # the extension while emissiveFactor stays clamped.
@@ -626,6 +674,7 @@ class MaterialExporter:
             name=blender_material.name,
             pbr_metallic_roughness=pbr,
             normal_texture=normal_texture,
+            occlusion_texture=occlusion_texture,
             emissive_texture=emissive_texture,
             emissive_factor=emissive_factor,
             alpha_mode=alpha_mode,
@@ -735,6 +784,18 @@ class MaterialExporter:
                 return None
             return self._walk_to_image(
                 parent_in, _group_stack[:-1], _visited, _depth + 1,
+            )
+        if t in ("SEPARATE_COLOR", "SEPRGB"):
+            # A packed texture (e.g. ORM) is split by a Separate Color/RGB node,
+            # then individual channels feed Roughness/Metallic/etc. Trace back
+            # through it to the source image so those sockets export their texture.
+            src = (
+                upstream.inputs.get("Color")
+                or upstream.inputs.get("Image")
+                or (upstream.inputs[0] if upstream.inputs else None)
+            )
+            return self._walk_to_image(
+                src, _group_stack, _visited, _depth + 1,
             )
         if t in ("MIX", "MIX_RGB"):
             # Best-effort: return whichever color input traces to an image.

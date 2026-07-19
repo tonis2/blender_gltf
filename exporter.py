@@ -19,6 +19,7 @@ from .export.physics import PhysicsExporter
 from .export.particles import ParticleExporter
 from .export.interactivity import InteractivityExporter
 from .export.audio import AudioExporter
+from .export.walkability import WalkabilityExporter
 
 if TYPE_CHECKING:
     import bpy
@@ -45,6 +46,7 @@ class ExportSettings:
     export_particles: bool = True
     export_interactivity: bool = True
     export_audio: bool = True
+    export_walkability: bool = True
     export_only_visible: bool = False
     export_all_scenes: bool = False
     export_camera_y_up: bool = True
@@ -76,7 +78,9 @@ class GltfExporter:
         self.buffer = BufferBuilder()
         self.texture_exporter = TextureExporter(self.buffer, settings)
         self.material_exporter = MaterialExporter(self.texture_exporter, settings)
-        self.mesh_exporter = MeshExporter(self.buffer, settings)
+        self.mesh_exporter = MeshExporter(
+            self.buffer, settings, self.material_exporter,
+        )
         self.skin_exporter = SkinExporter(self.buffer, settings) if settings.export_skinning else None
         self.physics_exporter = PhysicsExporter(settings) if settings.export_physics else None
         self.particle_exporter = ParticleExporter(
@@ -86,6 +90,9 @@ class GltfExporter:
             settings,
         ) if settings.export_interactivity else None
         self.audio_exporter = AudioExporter(self.buffer, settings) if settings.export_audio else None
+        self.walkability_exporter = WalkabilityExporter(
+            self.texture_exporter, settings,
+        ) if settings.export_walkability else None
         self.scene_exporter = SceneExporter(
             self.mesh_exporter, self.material_exporter, self.buffer, settings,
             skin_exporter=self.skin_exporter,
@@ -93,6 +100,7 @@ class GltfExporter:
             particle_exporter=self.particle_exporter,
             interactivity_exporter=self.interactivity_exporter,
             audio_exporter=self.audio_exporter,
+            walkability_exporter=self.walkability_exporter,
         )
         if self.interactivity_exporter is not None:
             self.interactivity_exporter.scene_exporter = self.scene_exporter
@@ -202,6 +210,8 @@ class GltfExporter:
             all_extensions |= self.interactivity_exporter.extensions_used
         if self.audio_exporter:
             all_extensions |= self.audio_exporter.extensions_used
+        if self.walkability_exporter:
+            all_extensions |= self.walkability_exporter.extensions_used
         extensions_required = None
         if self.mesh_exporter.used_quantization:
             # Quantized attribute types are invalid core glTF, so loaders

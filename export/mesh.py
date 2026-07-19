@@ -16,9 +16,15 @@ if TYPE_CHECKING:
 
 
 class MeshExporter:
-    def __init__(self, buffer: BufferBuilder, settings: "ExportSettings") -> None:
+    def __init__(
+        self,
+        buffer: BufferBuilder,
+        settings: "ExportSettings",
+        material_exporter=None,
+    ) -> None:
         self.buffer = buffer
         self.settings = settings
+        self.material_exporter = material_exporter
         self.meshes: list[Mesh] = []
         self._cache: dict[str, int] = {}
         self.used_quantization = False
@@ -137,6 +143,37 @@ class MeshExporter:
         if cache_key in self._cache:
             _release_mesh()
             return self._cache[cache_key]
+
+        # Triangle material_index values index into the *evaluated* mesh's
+        # material list, which GN output can extend or replace relative to
+        # the object's own material slots: realized instances carry their
+        # source objects' materials (e.g. a Grease Pencil fence object whose
+        # GN modifier instances wooden fence pieces — the evaluated mesh has
+        # MAT_Wood/MAT_WoodLight while the object only has a GP slot). A
+        # material_map built from object slots then assigns wrong or missing
+        # primitive materials, so rebuild it against the evaluated list.
+        # For meshes untouched by GN the two lists are identical and the
+        # incoming map is kept.
+        if (
+            material_map is not None
+            and self.material_exporter is not None
+            and self.settings.export_materials
+        ):
+            mesh_mats = list(blender_mesh.materials)
+            slot_mats = [s.material for s in blender_object.material_slots]
+            same_slots = len(mesh_mats) == len(slot_mats) and all(
+                (a is None and b is None)
+                or (a is not None and b is not None and a.name == b.name)
+                for a, b in zip(mesh_mats, slot_mats)
+            )
+            if not same_slots:
+                material_map = {}
+                for i, mat in enumerate(mesh_mats):
+                    if mat is None:
+                        continue
+                    gltf_idx = self.material_exporter.gather(mat, blender_object)
+                    if gltf_idx is not None:
+                        material_map[i] = gltf_idx
 
         # Extract shape key deltas before evaluation (shape keys live on original data)
         shape_key_data = None

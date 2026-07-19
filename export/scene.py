@@ -25,6 +25,7 @@ from .audio import AudioExporter
 if TYPE_CHECKING:
     import bpy
     from ..exporter import ExportSettings
+    from .walkability import WalkabilityExporter
 
 
 EXT_NODE_VISIBILITY = "KHR_node_visibility"
@@ -55,6 +56,7 @@ class SceneExporter:
         particle_exporter: ParticleExporter | None = None,
         interactivity_exporter: InteractivityExporter | None = None,
         audio_exporter: AudioExporter | None = None,
+        walkability_exporter: "WalkabilityExporter | None" = None,
     ) -> None:
         self.mesh_exporter = mesh_exporter
         self.material_exporter = material_exporter
@@ -65,6 +67,7 @@ class SceneExporter:
         self.particle_exporter = particle_exporter
         self.interactivity_exporter = interactivity_exporter
         self.audio_exporter = audio_exporter
+        self.walkability_exporter = walkability_exporter
         self._fps: float = 24.0
         self.nodes: list[Node] = []
         self.object_to_node_index: dict[str, int] = {}
@@ -528,6 +531,14 @@ class SceneExporter:
                 if node.extensions is None:
                     node.extensions = {}
                 node.extensions.update(audio_ext)
+
+        # CUSTOM_walkability_mask (painted walkable areas)
+        if self.walkability_exporter:
+            walk_ext = self.walkability_exporter.gather_node(obj)
+            if walk_ext:
+                if node.extensions is None:
+                    node.extensions = {}
+                node.extensions.update(walk_ext)
 
         # Custom properties as extras
         if self.settings.export_extras:
