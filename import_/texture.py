@@ -6,6 +6,8 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .. import ktx_lib
+
 if TYPE_CHECKING:
     import bpy
     from ..gltf.types import Gltf
@@ -70,6 +72,13 @@ class TextureImporter:
                 return self._load_from_bytes(name, data, mime)
             else:
                 filepath = self.base_dir / gltf_image.uri
+                if filepath.suffix.lower() == ".ktx2":
+                    try:
+                        data = filepath.read_bytes()
+                    except OSError as e:
+                        print(f"[glTF import] Could not read image '{gltf_image.uri}': {e}")
+                        return self._placeholder(name)
+                    return self._load_ktx2(name, data)
                 try:
                     img = bpy.data.images.load(str(filepath))
                 except RuntimeError as e:
@@ -89,6 +98,10 @@ class TextureImporter:
     def _load_from_bytes(self, name: str, data: bytes, mime_type: str | None) -> "bpy.types.Image":
         import bpy
 
+        # Blender cannot load KTX2 itself; decode via the bundled ktx library.
+        if ktx_lib.is_ktx2(data) or (mime_type or "") == "image/ktx2":
+            return self._load_ktx2(name, data)
+
         ext = ".png" if "png" in (mime_type or "") else ".jpg"
         with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
             f.write(data)
@@ -102,6 +115,28 @@ class TextureImporter:
             return self._placeholder(name)
         finally:
             os.unlink(tmp_path)
+        return img
+
+    def _load_ktx2(self, name: str, data: bytes) -> "bpy.types.Image":
+        """Decode a KTX2 payload (BCn or Basis) to a packed Blender image."""
+        import bpy
+
+        try:
+            rgba, w, h = ktx_lib.decode_rgba(data)
+        except Exception as e:
+            print(f"[glTF import] Could not decode KTX2 image '{name}': {e}")
+            return self._placeholder(name)
+
+        import numpy as np
+        px = np.frombuffer(rgba, dtype=np.uint8).astype(np.float32) / 255.0
+        # KTX2 rows are top-down; Blender stores rows bottom-up.
+        px = px.reshape(h, w * 4)[::-1].ravel()
+        img = bpy.data.images.new(name, width=w, height=h, alpha=True)
+        img.pixels.foreach_set(px)
+        try:
+            img.pack()
+        except RuntimeError:
+            pass  # unpacked images still work for the session
         return img
 
     def get_blender_image(self, image_index: int) -> "bpy.types.Image | None":

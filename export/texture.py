@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 from ..gltf.buffer import BufferBuilder
 from ..gltf.constants import TextureFilter, TextureWrap
 from ..gltf.types import Texture, Image, Sampler, TextureInfo
+from .. import ktx_lib
 
 if TYPE_CHECKING:
     import bpy
@@ -12,6 +13,7 @@ if TYPE_CHECKING:
 
 
 EXT_TEXTURE_TRANSFORM = "KHR_texture_transform"
+EXT_TEXTURE_BASISU = "KHR_texture_basisu"
 
 
 class TextureExporter:
@@ -24,6 +26,7 @@ class TextureExporter:
         self._image_cache: dict[str, int] = {}  # blender image name -> image index
         self._sampler_cache: dict[tuple, int] = {}
         self._texture_cache: dict[tuple[int, int], int] = {}  # (image, sampler) -> texture index
+        self._ktx2_images: set[int] = set()  # image indices holding KTX2 payloads
         self.extensions_used: set[str] = set()
 
     def gather_texture_info(
@@ -125,11 +128,21 @@ class TextureExporter:
             return self._texture_cache[key]
 
         tex_index = len(self.textures)
-        self.textures.append(Texture(
-            source=image_index,
-            sampler=sampler_index,
-            name=image_node.image.name,
-        ))
+        if image_index in self._ktx2_images:
+            # KHR_texture_basisu: the KTX2 image is referenced from the
+            # extension, not texture.source (we ship no PNG fallback).
+            self.extensions_used.add(EXT_TEXTURE_BASISU)
+            self.textures.append(Texture(
+                sampler=sampler_index,
+                name=image_node.image.name,
+                extensions={EXT_TEXTURE_BASISU: {"source": image_index}},
+            ))
+        else:
+            self.textures.append(Texture(
+                source=image_index,
+                sampler=sampler_index,
+                name=image_node.image.name,
+            ))
         self._texture_cache[key] = tex_index
         return tex_index
 
@@ -173,12 +186,23 @@ class TextureExporter:
         if blender_image.name in self._image_cache:
             return self._image_cache[blender_image.name]
 
-        if self.settings.export_format == "GLB":
-            image_index = self._pack_image_to_buffer(blender_image)
-        elif self.settings.export_format == "GLTF_EMBEDDED":
-            image_index = self._embed_image_as_data_uri(blender_image)
-        else:
-            image_index = self._write_image_file(blender_image)
+        image_index = None
+        if self.settings.image_format == "KTX2":
+            try:
+                image_index = self._gather_image_ktx2(blender_image)
+                self._ktx2_images.add(image_index)
+            except Exception as e:
+                print(f"[glTF export] KTX2 encode failed for "
+                      f"'{blender_image.name}', falling back to PNG/JPEG: {e}")
+                image_index = None
+
+        if image_index is None:
+            if self.settings.export_format == "GLB":
+                image_index = self._pack_image_to_buffer(blender_image)
+            elif self.settings.export_format == "GLTF_EMBEDDED":
+                image_index = self._embed_image_as_data_uri(blender_image)
+            else:
+                image_index = self._write_image_file(blender_image)
 
         # glTF core has no per-image colorspace; preserve the Blender colorspace
         # in extras so a round-trip keeps non-standard setups (e.g. a diffuse
@@ -192,6 +216,57 @@ class TextureExporter:
 
         self._image_cache[blender_image.name] = image_index
         return image_index
+
+    def _encode_ktx2(self, blender_image: "bpy.types.Image") -> bytes:
+        """Encode a Blender image to a KTX2 blob (Basis UASTC/ETC1S + mips)."""
+        import numpy as np
+
+        w, h = blender_image.size
+        if not w or not h:
+            raise ValueError("image has no pixel data")
+        pixels = np.empty(w * h * 4, dtype=np.float32)
+        blender_image.pixels.foreach_get(pixels)
+        # Blender stores rows bottom-up; KTX2 wants the top-down orientation a
+        # PNG export would have, so glTF UVs keep working unchanged.
+        rgba = np.clip(
+            pixels.reshape(h, w * 4)[::-1].ravel() * 255.0 + 0.5, 0.0, 255.0,
+        ).astype(np.uint8).tobytes()
+
+        cs = getattr(blender_image.colorspace_settings, "name", "sRGB")
+        codec = self.settings.ktx_codec or "uastc"
+        fmt = codec if cs == "sRGB" else codec + "-linear"
+        return ktx_lib.encode_rgba(rgba, w, h, fmt, mipmaps=True)
+
+    def _gather_image_ktx2(self, blender_image: "bpy.types.Image") -> int:
+        """Emit a KTX2 image via the bundled ktx library (all export modes)."""
+        blob = self._encode_ktx2(blender_image)
+
+        index = len(self.images)
+        if self.settings.export_format == "GLB":
+            bv_index = self.buffer.add_image_data(blob)
+            self.images.append(Image(
+                buffer_view=bv_index,
+                mime_type="image/ktx2",
+                name=blender_image.name,
+            ))
+        elif self.settings.export_format == "GLTF_EMBEDDED":
+            import base64
+            encoded = base64.b64encode(blob).decode("ascii")
+            self.images.append(Image(
+                uri=f"data:image/ktx2;base64,{encoded}",
+                mime_type="image/ktx2",
+                name=blender_image.name,
+            ))
+        else:
+            from pathlib import Path
+            filename = blender_image.name + ".ktx2"
+            (Path(self.settings.filepath).parent / filename).write_bytes(blob)
+            self.images.append(Image(
+                uri=filename,
+                mime_type="image/ktx2",
+                name=blender_image.name,
+            ))
+        return index
 
     def _pack_image_to_buffer(self, blender_image: "bpy.types.Image") -> int:
         """Pack image data into the GLB buffer."""

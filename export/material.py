@@ -1257,14 +1257,29 @@ class MaterialExporter:
         v = socket.default_value
         return [float(v[0]), float(v[1]), float(v[2])]
 
+    def _layer_color_factor(self, node, layer_index, channel_name):
+        """Color factor for a layer channel: the socket's default_value, or
+        None when the socket is linked. Blender ignores a linked socket's
+        default, so exporting it would double-apply it on top of the texture
+        (glTF multiplies factor × texture) — same rule as _layer_scalar_factor.
+        """
+        socket = self._layer_socket(node, layer_index, channel_name)
+        if socket is None or socket.is_linked:
+            return None
+        v = socket.default_value
+        return [float(v[0]), float(v[1]), float(v[2])]
+
     def _layer_pbr_dict(self, node, i):
         """Build a pbrMetallicRoughness dict for layer i (factors + textures)."""
         pbr: dict = {}
-        rgb = self._layer_color_rgb(node, i, "Color")
+        rgb = self._layer_color_factor(node, i, "Color")
         alpha = self._layer_float(node, i, "Alpha")
         a = alpha if alpha is not None else 1.0
         if rgb is not None and (rgb != [1.0, 1.0, 1.0] or a != 1.0):
             pbr["baseColorFactor"] = [rgb[0], rgb[1], rgb[2], a]
+        elif rgb is None and a != 1.0 and self._layer_socket(node, i, "Color") is not None:
+            # Color is texture-driven; only the layer alpha needs a factor.
+            pbr["baseColorFactor"] = [1.0, 1.0, 1.0, a]
         bc_tex = self._layer_image_tex(node, i, "Color")
         if bc_tex is not None:
             pbr["baseColorTexture"] = bc_tex
@@ -1354,13 +1369,16 @@ class MaterialExporter:
 
     def _layer_emission(self, node, i):
         """Return (emissive_factor list|None, TextureInfo|None) for layer i."""
-        rgb = self._layer_color_rgb(node, i, "Emission Color")
+        tex = self._layer_image_tex(node, i, "Emission Color")
+        rgb = self._layer_color_factor(node, i, "Emission Color")
+        if rgb is None and tex is not None:
+            # Texture-driven emission: the linked socket's default is ignored.
+            rgb = [1.0, 1.0, 1.0]
         strength = self._layer_float(node, i, "Emission Strength")
         if rgb is None:
             return None, None
         s = strength if strength is not None else 1.0
         factor = [rgb[0] * s, rgb[1] * s, rgb[2] * s]
-        tex = self._layer_image_tex(node, i, "Emission Color")
         if factor == [0.0, 0.0, 0.0] and tex is None:
             return None, None
         return factor, tex
@@ -1386,7 +1404,9 @@ class MaterialExporter:
         n_layers = len(node.layers)
 
         # ---- Layer 0 -> base material ----
-        rgb = self._layer_color_rgb(node, 0, "Color") or [1.0, 1.0, 1.0]
+        # _layer_color_factor: None when the Color socket is linked (Blender
+        # ignores the default there; the texture alone carries the color).
+        rgb = self._layer_color_factor(node, 0, "Color") or [1.0, 1.0, 1.0]
         alpha = self._layer_float(node, 0, "Alpha")
         a = alpha if alpha is not None else 1.0
         base_factor = [rgb[0], rgb[1], rgb[2], a]
@@ -1496,9 +1516,11 @@ class MaterialExporter:
 
         image_node = self._walk_to_image(socket)
         if image_node is not None:
-            v = socket.default_value
+            # The socket is linked (an image was reachable), so Blender ignores
+            # its default_value — the factor must stay white or glTF's
+            # factor × texture would double-apply it.
             tex_info = self.texture_exporter.gather_texture_info(image_node)
-            return [v[0], v[1], v[2], v[3]], tex_info
+            return [1.0, 1.0, 1.0, 1.0], tex_info
 
         if socket.is_linked:
             from_socket = socket.links[0].from_socket

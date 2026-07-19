@@ -773,9 +773,13 @@ class MaterialImporter:
         if idx is None or idx >= len(self.gltf.textures):
             return None
         gltf_tex = self.gltf.textures[idx]
-        if gltf_tex.source is None:
+        source = gltf_tex.source
+        if source is None and gltf_tex.extensions:
+            # KHR_texture_basisu keeps the KTX2 image in the extension block.
+            source = (gltf_tex.extensions.get("KHR_texture_basisu") or {}).get("source")
+        if source is None:
             return None
-        img = self.texture_importer.get_blender_image(gltf_tex.source)
+        img = self.texture_importer.get_blender_image(source)
         if img is None:
             return None
 
@@ -784,7 +788,7 @@ class MaterialImporter:
         # Only force Non-Color when the image didn't carry an explicit
         # colorspace hint on export; otherwise we'd clobber the round-tripped
         # setting and corrupt images shared between color and non-color slots.
-        if non_color and gltf_tex.source not in self.texture_importer.hinted_images:
+        if non_color and source not in self.texture_importer.hinted_images:
             tex_node.image.colorspace_settings.name = "Non-Color"
         tex_node.location = (
             anchor_node.location[0] + offset[0],

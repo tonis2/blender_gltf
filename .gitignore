@@ -7,6 +7,10 @@ opencode.json
 # C extensions
 *.so
 
+# ...but the bundled ktx native libraries (bin/<triple>/ktx.so|dylib|dll,
+# built by ktx.c3's native/build-shared.sh) ship with the addon.
+!bin/**
+
 # Distribution / packaging
 .Python
 build/

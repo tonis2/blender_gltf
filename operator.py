@@ -399,8 +399,19 @@ _EXPORT_PROP_DEFS: dict[str, tuple] = {
             ("AUTO", "Auto", "Keep the original image format"),
             ("JPEG", "JPEG", "Export all textures as JPEG"),
             ("PNG", "PNG", "Export all textures as PNG"),
+            ("KTX2", "KTX2 (Basis)", "GPU-compressed KTX2 via the bundled "
+             "ktx library (KHR_texture_basisu)"),
         ],
         default="AUTO",
+    )),
+    "ktx_codec": (EnumProperty, dict(
+        name="KTX2 Codec",
+        description="Basis Universal codec for KTX2 textures",
+        items=[
+            ("uastc", "UASTC", "Higher quality, larger files (Zstd-compressed)"),
+            ("etc1s", "ETC1S", "Smallest files, lower quality (BasisLZ)"),
+        ],
+        default="uastc",
     )),
     "bake_materials": (BoolProperty, dict(
         name="Bake Materials",
@@ -482,7 +493,7 @@ _EXPORT_PANELS = (
         "export_quantization",
     )),
     ("GLTF_export_material", "Material", (
-        "export_materials", "image_format", "bake_materials", "bake_resolution",
+        "export_materials", "image_format", "ktx_codec", "bake_materials", "bake_resolution",
     )),
     ("GLTF_export_animation", "Animation", (
         "export_animations",

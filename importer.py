@@ -43,6 +43,7 @@ SUPPORTED_EXTENSIONS = frozenset({
     "KHR_mesh_quantization",
     "KHR_node_visibility",
     "KHR_physics_rigid_bodies",
+    "KHR_texture_basisu",
     "KHR_texture_transform",
     "MSFT_lod",
 })

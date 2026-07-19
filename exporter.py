@@ -50,7 +50,8 @@ class ExportSettings:
     export_only_visible: bool = False
     export_all_scenes: bool = False
     export_camera_y_up: bool = True
-    image_format: str = "AUTO"  # "AUTO", "JPEG", or "PNG"
+    image_format: str = "AUTO"  # "AUTO", "JPEG", "PNG", or "KTX2"
+    ktx_codec: str = "uastc"  # "uastc" or "etc1s" (KTX2 only)
     bake_materials: bool = False
     bake_resolution: str = "1024"  # "512" / "1024" / "2048" / "4096"
     force_64bit: bool = False
@@ -212,12 +213,16 @@ class GltfExporter:
             all_extensions |= self.audio_exporter.extensions_used
         if self.walkability_exporter:
             all_extensions |= self.walkability_exporter.extensions_used
-        extensions_required = None
+        required = []
         if self.mesh_exporter.used_quantization:
             # Quantized attribute types are invalid core glTF, so loaders
             # must understand the extension.
             all_extensions.add("KHR_mesh_quantization")
-            extensions_required = ["KHR_mesh_quantization"]
+            required.append("KHR_mesh_quantization")
+        if "KHR_texture_basisu" in all_extensions:
+            # KTX2 textures carry no PNG fallback, so loaders must decode them.
+            required.append("KHR_texture_basisu")
+        extensions_required = required or None
         extensions_used = sorted(all_extensions) or None
 
         # 5b. Collect root-level extensions
