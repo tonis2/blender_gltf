@@ -603,9 +603,68 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
                         "the download, then export again")
             return {"CANCELLED"}
 
-        exporter = GltfExporter(context, settings)
+        self._exporter = GltfExporter(context, settings)
+        self._timer = None
         try:
-            exporter.export()
+            self._exporter.build_begin()
+        except Exception as e:
+            self.report({"ERROR"}, str(e))
+            self._exporter.material_exporter.cleanup()
+            return {"CANCELLED"}
+
+        # KTX2 encodes run on a background thread; go modal so Blender stays
+        # responsive while they finish. Scripted calls (timers, MCP) have no
+        # window in their context, so borrow one from the window manager;
+        # truly headless runs fall back to blocking — same behavior as before.
+        tex = self._exporter.texture_exporter
+        win = context.window
+        if win is None:
+            windows = list(getattr(context.window_manager, "windows", []))
+            win = windows[0] if windows else None
+        if win is not None and not tex.ktx_pending_done():
+            wm = context.window_manager
+            try:
+                wm.modal_handler_add(self)
+            except RuntimeError:
+                return self._finish(context)  # no UI loop to keep responsive
+            self._timer = wm.event_timer_add(0.1, window=win)
+            return {"RUNNING_MODAL"}
+
+        return self._finish(context)
+
+    def modal(self, context, event):
+        tex = self._exporter.texture_exporter
+        if event.type == "ESC":
+            self._end_modal(context)
+            tex.cancel_ktx()
+            self._exporter.material_exporter.cleanup()
+            self.report({"WARNING"}, "glTF export cancelled")
+            return {"CANCELLED"}
+        if event.type != "TIMER":
+            # Let the user keep working while the encodes run.
+            return {"PASS_THROUGH"}
+        if not tex.ktx_pending_done():
+            done, total = tex.ktx_progress()
+            if context.workspace is not None:
+                context.workspace.status_text_set(
+                    f"glTF export: encoding KTX2 textures ({done}/{total} "
+                    f"done, Esc to cancel)")
+            return {"RUNNING_MODAL"}
+        self._end_modal(context)
+        return self._finish(context)
+
+    def _end_modal(self, context):
+        if self._timer is not None:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+        if context.workspace is not None:
+            context.workspace.status_text_set(None)
+
+    def _finish(self, context):
+        exporter = self._exporter
+        try:
+            gltf_dict, binary = exporter.build_finish()
+            exporter.write_output(gltf_dict, binary)
             self.report({"INFO"}, f"Exported to {self.filepath}")
         except Exception as e:
             self.report({"ERROR"}, str(e))

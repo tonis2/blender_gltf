@@ -15,6 +15,24 @@ if TYPE_CHECKING:
 EXT_TEXTURE_TRANSFORM = "KHR_texture_transform"
 EXT_TEXTURE_BASISU = "KHR_texture_basisu"
 
+# KTX2 encoding is slow (seconds per texture), so it runs on this background
+# worker while the operator stays modal and Blender keeps responding. One
+# worker is deliberate: libktx already fans out across every core internally,
+# and a single thread serializes access to the library's last-error state.
+# The worker is shared across exports and lives for the whole session — the
+# native library allocates per-thread scratch on first use, so churning
+# threads would leak it.
+_ktx_executor = None
+
+
+def _executor():
+    global _ktx_executor
+    if _ktx_executor is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _ktx_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="ktx-encode")
+    return _ktx_executor
+
 
 class TextureExporter:
     def __init__(self, buffer: BufferBuilder, settings: "ExportSettings") -> None:
@@ -27,6 +45,8 @@ class TextureExporter:
         self._sampler_cache: dict[tuple, int] = {}
         self._texture_cache: dict[tuple[int, int], int] = {}  # (image, sampler) -> texture index
         self._ktx2_images: set[int] = set()  # image indices holding KTX2 payloads
+        # (image index, Future[bytes], blender image name) awaiting resolve.
+        self._pending_ktx: list[tuple[int, object, str]] = []
         self.extensions_used: set[str] = set()
 
     def gather_texture_info(
@@ -217,8 +237,9 @@ class TextureExporter:
         self._image_cache[blender_image.name] = image_index
         return image_index
 
-    def _encode_ktx2(self, blender_image: "bpy.types.Image") -> bytes:
-        """Encode a Blender image to a KTX2 blob (Basis UASTC/ETC1S + mips)."""
+    def _extract_rgba(self, blender_image: "bpy.types.Image") -> tuple[bytes, int, int, str]:
+        """Pull top-down RGBA8 pixels + ktx format string. Main thread only
+        (touches bpy data); the returned bytes are safe to hand to a worker."""
         import numpy as np
 
         w, h = blender_image.size
@@ -235,38 +256,111 @@ class TextureExporter:
         cs = getattr(blender_image.colorspace_settings, "name", "sRGB")
         codec = self.settings.ktx_codec or "uastc"
         fmt = codec if cs == "sRGB" else codec + "-linear"
-        return ktx_lib.encode_rgba(rgba, w, h, fmt, mipmaps=True)
+        return rgba, w, h, fmt
 
     def _gather_image_ktx2(self, blender_image: "bpy.types.Image") -> int:
-        """Emit a KTX2 image via the ktx native library (all export modes)."""
-        blob = self._encode_ktx2(blender_image)
+        """Queue a KTX2 image for background encoding and emit a placeholder.
+
+        Pixels are extracted here (bpy access needs the main thread), the
+        encode itself runs on the shared worker — ctypes releases the GIL, so
+        Blender's event loop keeps running. resolve_ktx_images() patches the
+        placeholder once the blob exists; until then the Image has only a
+        name/mime_type. ktx_lib availability was checked by the operator.
+        """
+        rgba, w, h, fmt = self._extract_rgba(blender_image)
+        future = _executor().submit(
+            ktx_lib.encode_rgba, rgba, w, h, fmt, mipmaps=True)
 
         index = len(self.images)
+        self.images.append(Image(mime_type="image/ktx2", name=blender_image.name))
+        self._pending_ktx.append((index, future, blender_image.name))
+        return index
+
+    def ktx_progress(self) -> tuple[int, int]:
+        """(finished, total) background KTX encodes for this export."""
+        done = sum(1 for _, f, _ in self._pending_ktx if f.done())
+        return done, len(self._pending_ktx)
+
+    def ktx_pending_done(self) -> bool:
+        return all(f.done() for _, f, _ in self._pending_ktx)
+
+    def cancel_ktx(self) -> None:
+        """Abandon queued encodes (an in-flight one finishes and is dropped)."""
+        for _, f, _ in self._pending_ktx:
+            f.cancel()
+        self._pending_ktx.clear()
+
+    def resolve_ktx_images(self) -> None:
+        """Land finished KTX blobs in their placeholders (main thread).
+
+        Blocks on any encode still running, so callers wanting a responsive UI
+        should wait for ktx_pending_done() first. A failed encode falls back
+        to PNG/JPEG like the synchronous path used to, which also means
+        rewriting any texture that referenced the image via
+        KHR_texture_basisu back to a plain source.
+        """
+        pending, self._pending_ktx = self._pending_ktx, []
+        for index, future, image_name in pending:
+            try:
+                blob = future.result()
+            except Exception as e:
+                print(f"[glTF export] KTX2 encode failed for "
+                      f"'{image_name}', falling back to PNG/JPEG: {e}")
+                self._fallback_ktx_image(index, image_name)
+                continue
+
+            img = self.images[index]
+            if self.settings.export_format == "GLB":
+                img.buffer_view = self.buffer.add_image_data(blob)
+            elif self.settings.export_format == "GLTF_EMBEDDED":
+                import base64
+                encoded = base64.b64encode(blob).decode("ascii")
+                img.uri = f"data:image/ktx2;base64,{encoded}"
+            else:
+                from pathlib import Path
+                filename = image_name + ".ktx2"
+                (Path(self.settings.filepath).parent / filename).write_bytes(blob)
+                img.uri = filename
+
+        # If every KTX image fell back, the basisu extension is no longer used
+        # (extension lists are assembled after this runs).
+        if not any(EXT_TEXTURE_BASISU in (t.extensions or {}) for t in self.textures):
+            self.extensions_used.discard(EXT_TEXTURE_BASISU)
+
+    def _fallback_ktx_image(self, index: int, image_name: str) -> None:
+        """Replace a failed KTX2 placeholder with PNG/JPEG bytes in place."""
+        import bpy
+
+        img = self.images[index]
+        img.mime_type = None
+        self._ktx2_images.discard(index)
+        # Textures point at KTX2 images through KHR_texture_basisu; move the
+        # reference back to the core source field.
+        for tex in self.textures:
+            ext = tex.extensions or {}
+            if ext.get(EXT_TEXTURE_BASISU, {}).get("source") == index:
+                del ext[EXT_TEXTURE_BASISU]
+                tex.extensions = ext or None
+                tex.source = index
+
+        blender_image = bpy.data.images.get(image_name)
+        if blender_image is None:
+            print(f"[glTF export] image '{image_name}' vanished during export")
+            return
+        image_data, mime_type = self._get_image_bytes(blender_image)
+        img.mime_type = mime_type
         if self.settings.export_format == "GLB":
-            bv_index = self.buffer.add_image_data(blob)
-            self.images.append(Image(
-                buffer_view=bv_index,
-                mime_type="image/ktx2",
-                name=blender_image.name,
-            ))
+            img.buffer_view = self.buffer.add_image_data(image_data)
         elif self.settings.export_format == "GLTF_EMBEDDED":
             import base64
-            encoded = base64.b64encode(blob).decode("ascii")
-            self.images.append(Image(
-                uri=f"data:image/ktx2;base64,{encoded}",
-                mime_type="image/ktx2",
-                name=blender_image.name,
-            ))
+            encoded = base64.b64encode(image_data).decode("ascii")
+            img.uri = f"data:{mime_type};base64,{encoded}"
         else:
             from pathlib import Path
-            filename = blender_image.name + ".ktx2"
-            (Path(self.settings.filepath).parent / filename).write_bytes(blob)
-            self.images.append(Image(
-                uri=filename,
-                mime_type="image/ktx2",
-                name=blender_image.name,
-            ))
-        return index
+            ext = ".jpg" if mime_type == "image/jpeg" else ".png"
+            filename = image_name + ext
+            (Path(self.settings.filepath).parent / filename).write_bytes(image_data)
+            img.uri = filename
 
     def _pack_image_to_buffer(self, blender_image: "bpy.types.Image") -> int:
         """Pack image data into the GLB buffer."""

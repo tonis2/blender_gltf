@@ -154,9 +154,21 @@ class GltfExporter:
 
     def build(self) -> tuple[dict, bytes]:
         """Gather and assemble the glTF, returning (gltf_dict, binary) without
-        writing to disk. Reused to produce external sub-assets in memory."""
+        writing to disk. Reused to produce external sub-assets in memory.
+        Blocks on background KTX2 encodes; the export operator instead calls
+        build_begin(), waits modally, then build_finish()."""
+        self.build_begin()
+        return self.build_finish()
+
+    def build_begin(self) -> None:
+        """Everything that reads bpy data (main thread): scene, physics,
+        animations. KTX2 texture encodes gathered here keep running on the
+        background worker after this returns; poll
+        texture_exporter.ktx_pending_done() before build_finish()."""
         # 1. Gather scene data
         scenes, active_scene = self.scene_exporter.gather(self.context)
+        self._scenes = scenes
+        self._active_scene = active_scene
 
         # 1b. Physics joint post-pass (needs node mapping from scene pass)
         if self.physics_exporter:
@@ -170,8 +182,8 @@ class GltfExporter:
             self._assign_uids()
 
         # 2. Gather animations (needs node mapping from scene pass)
-        animations = None
-        animation_exporter = None
+        self._animations = None
+        self._animation_exporter = None
         if self.settings.export_animations:
             animation_exporter = AnimationExporter(
                 self.buffer,
@@ -186,8 +198,20 @@ class GltfExporter:
             else:
                 exported_scenes = [self.context.scene]
             animation_exporter.gather(self.context, scenes=exported_scenes)
+            self._animation_exporter = animation_exporter
             if animation_exporter.animations:
-                animations = animation_exporter.animations
+                self._animations = animation_exporter.animations
+
+    def build_finish(self) -> tuple[dict, bytes]:
+        """Assemble the glTF from gathered state. Blocks until any still-
+        running KTX2 encodes finish and lands them in the buffer first."""
+        scenes = self._scenes
+        active_scene = self._active_scene
+        animations = self._animations
+        animation_exporter = self._animation_exporter
+
+        # 2b. Land background-encoded KTX2 images before the buffer freezes.
+        self.texture_exporter.resolve_ktx_images()
 
         # 3. Finalize buffer
         accessors, buffer_views, buffer_desc, binary = self.buffer.finalize()
@@ -281,6 +305,9 @@ class GltfExporter:
 
     def export(self) -> None:
         gltf_dict, binary = self.build()
+        self.write_output(gltf_dict, binary)
+
+    def write_output(self, gltf_dict: dict, binary: bytes) -> None:
         path = Path(self.settings.filepath)
 
         if self.settings.export_format == "GLB":
