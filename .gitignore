@@ -7,9 +7,11 @@ opencode.json
 # C extensions
 *.so
 
-# ...but the bundled ktx native libraries (bin/<triple>/ktx.so|dylib|dll,
-# built by ktx.c3's native/build-shared.sh) ship with the addon.
-!bin/**
+# The ktx native libraries are NOT bundled with the addon: ktx_download.py
+# fetches the one matching the user's platform from ktx.c3's GitHub releases
+# (legacy installs download into bin/<triple>/; a dev can also drop a local
+# build there via ktx.c3's native/bundle-blender.sh). Keep them out of git.
+bin/
 
 # Distribution / packaging
 .Python

@@ -1,7 +1,13 @@
-"""ctypes bindings for the bundled libktx shared library (KTX2 encode/decode).
+"""ctypes bindings for the libktx shared library (KTX2 encode/decode).
 
-The library is built from https://github.com/tonis2/ktx.c3 (src/capi) by
-native/build-shared.sh and bundled per platform under bin/<os>-<arch>/.
+The library is built from https://github.com/tonis2/ktx.c3 (src/capi) and
+published per platform as a raw asset on that repo's GitHub releases
+(ktx-<os>-<arch>.{so,dylib,dll}). It is NOT bundled with the addon: the
+operator in ktx_download.py asks the user once and fetches only the asset
+matching this machine into download_dest(). A lib placed in bin/<os>-<arch>/
+next to this file (e.g. by ktx.c3's native/bundle-blender.sh during
+development) takes precedence over a downloaded one.
+
 It encodes raw RGBA8 pixels to a complete KTX2 blob (BCn, ETC1S, UASTC,
 mipmaps, supercompression) and decodes/transcodes any of those back to RGBA8
 — no temp files or subprocesses involved.
@@ -11,6 +17,10 @@ from __future__ import annotations
 import ctypes
 import platform
 from pathlib import Path
+
+GITHUB_REPO = "tonis2/ktx.c3"
+# Release tag whose assets are downloaded; None means the newest release.
+RELEASE_TAG: str | None = None
 
 _LIB_NAMES = {
     ("Linux", "x86_64"): ("linux-x64", "ktx.so"),
@@ -24,19 +34,93 @@ _lib = None
 _load_error: str | None = None
 
 
+def _entry() -> tuple[str, str] | None:
+    """(target triple, lib filename) for this machine, or None."""
+    return _LIB_NAMES.get((platform.system(), platform.machine()))
+
+
+def _download_root(create: bool = False) -> Path:
+    """Directory downloaded libs live under (<root>/<triple>/<filename>).
+
+    As a Blender 4.2+ extension the addon directory is replaced on every
+    update, so downloads go to the extension's persistent user dir. Legacy
+    scripts/addons installs fall back to the addon's own bin/ — the same
+    place the libs used to be bundled.
+    """
+    pkg = __package__ or ""
+    if pkg.startswith("bl_ext."):
+        import bpy
+        return Path(bpy.utils.extension_path_user(pkg, path="bin", create=create))
+    return Path(__file__).parent / "bin"
+
+
+def asset_name() -> str | None:
+    """Release asset for this machine, e.g. 'ktx-macos-aarch64.dylib'."""
+    entry = _entry()
+    if entry is None:
+        return None
+    triple, filename = entry
+    return f"ktx-{triple}.{filename.rsplit('.', 1)[1]}"
+
+
+def download_url() -> str | None:
+    asset = asset_name()
+    if asset is None:
+        return None
+    base = f"https://github.com/{GITHUB_REPO}/releases"
+    if RELEASE_TAG is None:
+        return f"{base}/latest/download/{asset}"
+    return f"{base}/download/{RELEASE_TAG}/{asset}"
+
+
+def download_dest(create: bool = False) -> Path | None:
+    """Where ktx_download.py installs the lib for this machine."""
+    entry = _entry()
+    if entry is None:
+        return None
+    triple, filename = entry
+    dest_dir = _download_root(create) / triple
+    if create:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    return dest_dir / filename
+
+
+def _candidates() -> list[Path]:
+    entry = _entry()
+    if entry is None:
+        return []
+    triple, filename = entry
+    paths = [Path(__file__).parent / "bin" / triple / filename,
+             _download_root() / triple / filename]
+    return list(dict.fromkeys(paths))
+
+
+def installed_path() -> Path | None:
+    """First existing lib (dev-bundled or downloaded), or None."""
+    return next((p for p in _candidates() if p.is_file()), None)
+
+
+def reset() -> None:
+    """Forget the cached handle/error so the next call retries loading."""
+    global _lib, _load_error
+    _lib = None
+    _load_error = None
+
+
 def _load():
     global _lib, _load_error
     if _lib is not None or _load_error is not None:
         return _lib
-    key = (platform.system(), platform.machine())
-    entry = _LIB_NAMES.get(key)
+    entry = _entry()
     if entry is None:
-        _load_error = f"no bundled ktx library for {key[0]}/{key[1]}"
+        _load_error = (f"no prebuilt ktx library for "
+                       f"{platform.system()}/{platform.machine()}")
         return None
-    triple, filename = entry
-    path = Path(__file__).parent / "bin" / triple / filename
-    if not path.is_file():
-        _load_error = f"bundled ktx library missing: {path}"
+    path = installed_path()
+    if path is None:
+        _load_error = ("ktx native library is not installed — use the "
+                       "'Download KTX Binaries' button in the export "
+                       "dialog's Material panel")
         return None
     try:
         lib = ctypes.CDLL(str(path))

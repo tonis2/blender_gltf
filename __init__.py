@@ -16,6 +16,7 @@ from . import importer
 from . import layer_node
 from . import interactivity_nodes
 from . import ktx_lib
+from . import ktx_download
 from .gltf import constants, types, buffer, serialize
 from .export import converter, mesh, material, texture, scene, animation, skin, physics, particles, interactivity, quantize, audio
 from .import_ import (
@@ -43,6 +44,7 @@ if _needs_reload:
     buffer = importlib.reload(buffer)
     serialize = importlib.reload(serialize)
     ktx_lib = importlib.reload(ktx_lib)
+    ktx_download = importlib.reload(ktx_download)
     # Shared node tables used by the export/import submodules. layer_node is
     # a package whose __init__ deep-reloads its own submodules on re-execution.
     interactivity_nodes = importlib.reload(interactivity_nodes)
@@ -81,6 +83,7 @@ if _needs_reload:
 
 
 def register():
+    ktx_download.register()
     operator.register()
     layer_node.register()
     interactivity_nodes.register()
@@ -90,3 +93,4 @@ def unregister():
     interactivity_nodes.unregister()
     layer_node.unregister()
     operator.unregister()
+    ktx_download.unregister()

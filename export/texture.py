@@ -238,7 +238,7 @@ class TextureExporter:
         return ktx_lib.encode_rgba(rgba, w, h, fmt, mipmaps=True)
 
     def _gather_image_ktx2(self, blender_image: "bpy.types.Image") -> int:
-        """Emit a KTX2 image via the bundled ktx library (all export modes)."""
+        """Emit a KTX2 image via the ktx native library (all export modes)."""
         blob = self._encode_ktx2(blender_image)
 
         index = len(self.images)

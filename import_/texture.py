@@ -98,7 +98,7 @@ class TextureImporter:
     def _load_from_bytes(self, name: str, data: bytes, mime_type: str | None) -> "bpy.types.Image":
         import bpy
 
-        # Blender cannot load KTX2 itself; decode via the bundled ktx library.
+        # Blender cannot load KTX2 itself; decode via the ktx native library.
         if ktx_lib.is_ktx2(data) or (mime_type or "") == "image/ktx2":
             return self._load_ktx2(name, data)
 

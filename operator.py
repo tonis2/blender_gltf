@@ -2,6 +2,7 @@ import bpy
 from bpy.props import EnumProperty, BoolProperty, StringProperty, FloatProperty, FloatVectorProperty
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
+from . import ktx_lib
 from .exporter import ExportSettings, GltfExporter
 from .importer import ImportSettings, GltfImporter
 
@@ -399,8 +400,8 @@ _EXPORT_PROP_DEFS: dict[str, tuple] = {
             ("AUTO", "Auto", "Keep the original image format"),
             ("JPEG", "JPEG", "Export all textures as JPEG"),
             ("PNG", "PNG", "Export all textures as PNG"),
-            ("KTX2", "KTX2 (Basis)", "GPU-compressed KTX2 via the bundled "
-             "ktx library (KHR_texture_basisu)"),
+            ("KTX2", "KTX2 (Basis)", "GPU-compressed KTX2 via the ktx "
+             "library, downloaded on demand (KHR_texture_basisu)"),
         ],
         default="AUTO",
     )),
@@ -484,6 +485,15 @@ def _make_export_props() -> dict:
 
 # Collapsible panel layout for the export/import file browser sidebars:
 # (panel_id, label, prop_names). Panel ids persist open/closed state.
+def _draw_ktx_status(body, owner):
+    """Offer the KTX binaries download when KTX2 is selected but missing."""
+    if owner.image_format != "KTX2" or ktx_lib.is_available():
+        return
+    col = body.column()
+    col.label(text="KTX binaries are not installed", icon="ERROR")
+    col.operator("gltf_custom.download_ktx", icon="IMPORT")
+
+
 _EXPORT_PANELS = (
     ("GLTF_export_mesh", "Mesh", (
         "export_normals",
@@ -494,7 +504,7 @@ _EXPORT_PANELS = (
     )),
     ("GLTF_export_material", "Material", (
         "export_materials", "image_format", "ktx_codec", "bake_materials", "bake_resolution",
-    )),
+    ), _draw_ktx_status),
     ("GLTF_export_animation", "Animation", (
         "export_animations",
         "export_animation_events",
@@ -533,13 +543,16 @@ _IMPORT_PANELS = (
 
 
 def _draw_panels(layout, owner, panels):
-    """Draw collapsible panels from a (panel_id, label, prop_names) table."""
-    for panel_id, label, prop_names in panels:
+    """Draw collapsible panels from a (panel_id, label, prop_names[, extra])
+    table; the optional extra is a callback drawing below the properties."""
+    for panel_id, label, prop_names, *extra in panels:
         header, body = layout.panel(panel_id, default_closed=True)
         header.label(text=label)
         if body:
             for prop in prop_names:
                 body.prop(owner, prop)
+            for draw_extra in extra:
+                draw_extra(body, owner)
 
 
 class GltfExportSceneSettings(bpy.types.PropertyGroup):
@@ -581,6 +594,14 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
             filepath=self.filepath,
             **{prop: getattr(self, prop) for prop in _EXPORT_PROPS},
         )
+
+        if settings.image_format == "KTX2" and not ktx_lib.is_available():
+            # Ask to download the native lib instead of failing mid-export.
+            bpy.ops.gltf_custom.download_ktx("INVOKE_DEFAULT")
+            self.report({"ERROR"},
+                        "KTX2 textures need the ktx native library — confirm "
+                        "the download, then export again")
+            return {"CANCELLED"}
 
         exporter = GltfExporter(context, settings)
         try:
