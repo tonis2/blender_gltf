@@ -53,12 +53,18 @@ class TextureExporter:
         self,
         image_node: "bpy.types.ShaderNodeTexImage",
         tex_coord: int = 0,
+        usage: str = "color",
     ) -> TextureInfo | None:
-        """Create a TextureInfo for an Image Texture node. Returns None if no image."""
+        """Create a TextureInfo for an Image Texture node. Returns None if no image.
+
+        usage ("color" / "normal" / "height") routes KTX2 encoding: normal and
+        height maps get the dedicated codec/quality settings since they need
+        more detail than color textures survive with.
+        """
         if image_node.image is None:
             return None
 
-        texture_index = self._gather_texture(image_node)
+        texture_index = self._gather_texture(image_node, usage)
         extensions = self._gather_texture_transform(image_node)
         return TextureInfo(
             index=texture_index,
@@ -139,9 +145,11 @@ class TextureExporter:
         self.extensions_used.add(EXT_TEXTURE_TRANSFORM)
         return {EXT_TEXTURE_TRANSFORM: transform}
 
-    def _gather_texture(self, image_node: "bpy.types.ShaderNodeTexImage") -> int:
+    def _gather_texture(
+        self, image_node: "bpy.types.ShaderNodeTexImage", usage: str = "color",
+    ) -> int:
         sampler_index = self._gather_sampler(image_node)
-        image_index = self._gather_image(image_node.image)
+        image_index = self._gather_image(image_node.image, usage)
 
         key = (image_index, sampler_index)
         if key in self._texture_cache:
@@ -202,14 +210,19 @@ class TextureExporter:
         self._sampler_cache[key] = index
         return index
 
-    def _gather_image(self, blender_image: "bpy.types.Image") -> int:
+    def _gather_image(
+        self, blender_image: "bpy.types.Image", usage: str = "color",
+    ) -> int:
+        # Cache is keyed by image name only, so an image reused with different
+        # usages (e.g. as both color and normal map) encodes once with
+        # whichever usage is gathered first — a pathological setup anyway.
         if blender_image.name in self._image_cache:
             return self._image_cache[blender_image.name]
 
         image_index = None
         if self.settings.image_format == "KTX2":
             try:
-                image_index = self._gather_image_ktx2(blender_image)
+                image_index = self._gather_image_ktx2(blender_image, usage)
                 self._ktx2_images.add(image_index)
             except Exception as e:
                 print(f"[glTF export] KTX2 encode failed for "
@@ -237,7 +250,9 @@ class TextureExporter:
         self._image_cache[blender_image.name] = image_index
         return image_index
 
-    def _extract_rgba(self, blender_image: "bpy.types.Image") -> tuple[bytes, int, int, str]:
+    def _extract_rgba(
+        self, blender_image: "bpy.types.Image", usage: str = "color",
+    ) -> tuple[bytes, int, int, str]:
         """Pull top-down RGBA8 pixels + ktx format string. Main thread only
         (touches bpy data); the returned bytes are safe to hand to a worker."""
         import numpy as np
@@ -254,11 +269,15 @@ class TextureExporter:
         ).astype(np.uint8).tobytes()
 
         cs = getattr(blender_image.colorspace_settings, "name", "sRGB")
-        codec = self.settings.ktx_codec or "uastc"
+        detail = usage in ("normal", "height")
+        codec = (self.settings.ktx_normal_codec if detail
+                 else self.settings.ktx_codec) or "uastc"
         fmt = codec if cs == "sRGB" else codec + "-linear"
         return rgba, w, h, fmt
 
-    def _gather_image_ktx2(self, blender_image: "bpy.types.Image") -> int:
+    def _gather_image_ktx2(
+        self, blender_image: "bpy.types.Image", usage: str = "color",
+    ) -> int:
         """Queue a KTX2 image for background encoding and emit a placeholder.
 
         Pixels are extracted here (bpy access needs the main thread), the
@@ -267,13 +286,40 @@ class TextureExporter:
         placeholder once the blob exists; until then the Image has only a
         name/mime_type. ktx_lib availability was checked by the operator.
         """
-        rgba, w, h, fmt = self._extract_rgba(blender_image)
+        rgba, w, h, fmt = self._extract_rgba(blender_image, usage)
+        detail = usage in ("normal", "height")
+        quality = (self.settings.ktx_normal_quality if detail
+                   else self.settings.ktx_quality)
+        # normal_map only matters on the VkFormat path (mip renormalization);
+        # passing it for basis codecs is a harmless no-op.
         future = _executor().submit(
-            ktx_lib.encode_rgba, rgba, w, h, fmt, mipmaps=True)
+            ktx_lib.encode_rgba, rgba, w, h, fmt, mipmaps=True,
+            normal_map=(usage == "normal"), quality=quality,
+            effort=self.settings.ktx_effort)
 
         index = len(self.images)
         self.images.append(Image(mime_type="image/ktx2", name=blender_image.name))
         self._pending_ktx.append((index, future, blender_image.name))
+        return index
+
+    def add_ktx_blob(self, blob: bytes, name: str) -> int:
+        """Append an already-encoded KTX2 blob as an image, returning its index.
+
+        For payloads built outside the bpy.types.Image path — the environment
+        cubemap, for one. Placement follows the same GLB-buffer / sidecar-file
+        rule as resolve_ktx_images().
+        """
+        index = len(self.images)
+        img = Image(mime_type="image/ktx2", name=name)
+        if self.settings.export_format == "GLB":
+            img.buffer_view = self.buffer.add_image_data(blob)
+        else:
+            from pathlib import Path
+            filename = name + ".ktx2"
+            (Path(self.settings.filepath).parent / filename).write_bytes(blob)
+            img.uri = filename
+        self.images.append(img)
+        self._ktx2_images.add(index)
         return index
 
     def ktx_progress(self) -> tuple[int, int]:

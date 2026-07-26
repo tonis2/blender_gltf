@@ -20,6 +20,7 @@ from .export.particles import ParticleExporter
 from .export.interactivity import InteractivityExporter
 from .export.audio import AudioExporter
 from .export.walkability import WalkabilityExporter
+from .export.environment import EnvironmentExporter
 
 if TYPE_CHECKING:
     import bpy
@@ -47,11 +48,18 @@ class ExportSettings:
     export_interactivity: bool = True
     export_audio: bool = True
     export_walkability: bool = True
+    export_environment_map: bool = True
+    environment_map_size: str = "AUTO"  # "AUTO", or a face size like "512"
+    environment_map_codec: str = "rgba8"  # "rgba8", "bc7", "uastc", "etc1s"
     export_only_visible: bool = False
     export_all_scenes: bool = False
     export_camera_y_up: bool = True
     image_format: str = "AUTO"  # "AUTO", "JPEG", "PNG", or "KTX2"
-    ktx_codec: str = "uastc"  # "uastc" or "etc1s" (KTX2 only)
+    ktx_codec: str = "uastc"  # "uastc" or "etc1s" — color textures (KTX2 only)
+    ktx_quality: int = 90  # 0-100, color textures (KTX2 only)
+    ktx_normal_codec: str = "uastc"  # "uastc" or "etc1s" — normal + height maps
+    ktx_normal_quality: int = 100  # 0-100, normal + height maps (KTX2 only)
+    ktx_effort: int = 2  # 0-10 encoder search effort, all KTX2 encodes
     bake_materials: bool = False
     bake_resolution: str = "1024"  # "512" / "1024" / "2048" / "4096"
     force_64bit: bool = False
@@ -94,6 +102,9 @@ class GltfExporter:
         self.walkability_exporter = WalkabilityExporter(
             self.texture_exporter, settings,
         ) if settings.export_walkability else None
+        self.environment_exporter = EnvironmentExporter(
+            self.texture_exporter, settings,
+        ) if settings.export_environment_map else None
         self.scene_exporter = SceneExporter(
             self.mesh_exporter, self.material_exporter, self.buffer, settings,
             skin_exporter=self.skin_exporter,
@@ -170,6 +181,21 @@ class GltfExporter:
         self._scenes = scenes
         self._active_scene = active_scene
 
+        # 1a. KHR_environment_map. Scenes come back named after the bpy scene
+        # they were gathered from, which is the only handle back to the world;
+        # a collection-scoped sub-export matches nothing here and is skipped.
+        if self.environment_exporter:
+            import bpy
+            for scene in scenes:
+                bl_scene = bpy.data.scenes.get(scene.name or "")
+                if bl_scene is None:
+                    continue
+                ext = self.environment_exporter.gather_scene(bl_scene)
+                if ext:
+                    merged = dict(scene.extensions or {})
+                    merged.update(ext)
+                    scene.extensions = merged
+
         # 1b. Physics joint post-pass (needs node mapping from scene pass)
         if self.physics_exporter:
             self.physics_exporter.gather_joints(
@@ -237,6 +263,8 @@ class GltfExporter:
             all_extensions |= self.audio_exporter.extensions_used
         if self.walkability_exporter:
             all_extensions |= self.walkability_exporter.extensions_used
+        if self.environment_exporter:
+            all_extensions |= self.environment_exporter.extensions_used
         required = []
         if self.mesh_exporter.used_quantization:
             # Quantized attribute types are invalid core glTF, so loaders
@@ -273,6 +301,12 @@ class GltfExporter:
             audio_root = self.audio_exporter.get_root_extension()
             if audio_root:
                 root_extensions.update(audio_root)
+
+        # 5f. KHR_environment_map root extension
+        if self.environment_exporter:
+            environment_root = self.environment_exporter.get_root_extension()
+            if environment_root:
+                root_extensions.update(environment_root)
 
         # 6. Assemble glTF
         gltf = Gltf(

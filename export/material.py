@@ -866,7 +866,7 @@ class MaterialExporter:
         if image_node is None:
             return None
 
-        tex_info = self.texture_exporter.gather_texture_info(image_node)
+        tex_info = self.texture_exporter.gather_texture_info(image_node, usage="normal")
         if tex_info is None:
             return None
 
@@ -1013,7 +1013,7 @@ class MaterialExporter:
         image_node = self._get_connected_image_node(node, socket_name)
         if image_node is None:
             return None
-        tex_info = self.texture_exporter.gather_texture_info(image_node)
+        tex_info = self.texture_exporter.gather_texture_info(image_node, usage="normal")
         if tex_info is None:
             return None
         scale = None
@@ -1305,7 +1305,7 @@ class MaterialExporter:
         img = self._walk_to_image(socket)
         if img is None:
             return None
-        ti = self.texture_exporter.gather_texture_info(img)
+        ti = self.texture_exporter.gather_texture_info(img, usage="normal")
         if ti is None:
             return None
         scale = self._normal_map_scale(socket)
@@ -1355,7 +1355,7 @@ class MaterialExporter:
         if himg is None:
             # A Bump node with no Height map carries no depth data to preserve.
             return None, None
-        height_ti = self.texture_exporter.gather_texture_info(himg)
+        height_ti = self.texture_exporter.gather_texture_info(himg, usage="height")
         if height_ti is None:
             return None, None
         bump = {}

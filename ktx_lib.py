@@ -135,6 +135,17 @@ def _load():
         ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
         ctypes.POINTER(ctypes.c_size_t),
     ]
+    # Only libs built after the cubemap entry point landed export this, so it
+    # is bound conditionally and reported by is_cube_available(); callers can
+    # then degrade instead of dying on an attribute lookup.
+    if hasattr(lib, "ktx_encode_cube"):
+        lib.ktx_encode_cube.restype = ctypes.c_int
+        lib.ktx_encode_cube.argtypes = [
+            ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint, ctypes.c_char_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
     lib.ktx_decode.restype = ctypes.c_int
     lib.ktx_decode.argtypes = [
         ctypes.c_char_p, ctypes.c_size_t,
@@ -155,6 +166,48 @@ def is_available() -> bool:
 def load_error() -> str | None:
     _load()
     return _load_error
+
+
+def is_cube_available() -> bool:
+    """Whether the loaded lib can encode cubemaps (ktx_encode_cube)."""
+    lib = _load()
+    return lib is not None and hasattr(lib, "ktx_encode_cube")
+
+
+def encode_cube(faces: "list[bytes]", size: int, fmt: str, *,
+                mipmaps: bool = True, quality: int = 90, effort: int = 2,
+                zstd_level: int = 0) -> bytes:
+    """Encode six square RGBA8 faces to a KTX2 cubemap blob (faceCount 6).
+
+    faces must be in KTX order — +X, -X, +Y, -Y, +Z, -Z — each holding
+    size*size*4 top-down bytes. fmt takes the same names as encode_rgba.
+    """
+    lib = _load()
+    if lib is None:
+        raise RuntimeError(_load_error)
+    if not hasattr(lib, "ktx_encode_cube"):
+        raise RuntimeError(
+            "the installed ktx library predates cubemap support — re-download "
+            "it from the export dialog's Material panel")
+    if len(faces) != 6:
+        raise ValueError(f"need exactly 6 faces, got {len(faces)}")
+    expect = size * size * 4
+    for i, f in enumerate(faces):
+        if len(f) != expect:
+            raise ValueError(f"face {i}: expected {expect} bytes, got {len(f)}")
+
+    arr = (ctypes.c_char_p * 6)(*faces)
+    out = ctypes.POINTER(ctypes.c_ubyte)()
+    n = ctypes.c_size_t()
+    rc = lib.ktx_encode_cube(arr, size, fmt.encode(), int(mipmaps), 0,
+                             quality, effort, zstd_level,
+                             ctypes.byref(out), ctypes.byref(n))
+    if rc != 0:
+        raise RuntimeError(f"ktx cube encode ({fmt}): {lib.ktx_last_error().decode()}")
+    try:
+        return bytes(ctypes.cast(out, ctypes.POINTER(ctypes.c_ubyte * n.value)).contents)
+    finally:
+        lib.ktx_free(out)
 
 
 def encode_rgba(rgba: bytes, width: int, height: int, fmt: str, *,

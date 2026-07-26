@@ -1,5 +1,5 @@
 import bpy
-from bpy.props import EnumProperty, BoolProperty, StringProperty, FloatProperty, FloatVectorProperty
+from bpy.props import EnumProperty, BoolProperty, StringProperty, FloatProperty, FloatVectorProperty, IntProperty
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 from . import ktx_lib
@@ -374,6 +374,35 @@ _EXPORT_PROP_DEFS: dict[str, tuple] = {
         description="Export per-object walkability masks as CUSTOM_walkability_mask",
         default=True,
     )),
+    "export_environment_map": (BoolProperty, dict(
+        name="Environment Map",
+        description=("Export the scene world's equirectangular environment as a "
+                     "KTX2 cubemap plus irradiance SH, via KHR_environment_map"),
+        default=True,
+    )),
+    "environment_map_size": (EnumProperty, dict(
+        name="Cubemap Size",
+        description="Face resolution of the exported environment cubemap",
+        items=[
+            ("AUTO", "Auto", "Quarter of the equirect width, rounded down to a power of two"),
+            ("256", "256", "256x256 per face"),
+            ("512", "512", "512x512 per face"),
+            ("1024", "1024", "1024x1024 per face"),
+            ("2048", "2048", "2048x2048 per face"),
+        ],
+        default="AUTO",
+    )),
+    "environment_map_codec": (EnumProperty, dict(
+        name="Cubemap Codec",
+        description="Texture format for the exported environment cubemap",
+        items=[
+            ("rgba8", "RGBA8", "Uncompressed, lossless, largest"),
+            ("bc7", "BC7", "Block compressed, desktop GPUs"),
+            ("uastc", "UASTC", "Basis Universal, transcodes to any GPU format"),
+            ("etc1s", "ETC1S", "Basis Universal, smallest, lossiest"),
+        ],
+        default="rgba8",
+    )),
     "export_only_visible": (BoolProperty, dict(
         name="Only Visible",
         description="Only export objects that are visible in the viewport",
@@ -406,13 +435,40 @@ _EXPORT_PROP_DEFS: dict[str, tuple] = {
         default="AUTO",
     )),
     "ktx_codec": (EnumProperty, dict(
-        name="KTX2 Codec",
-        description="Basis Universal codec for KTX2 textures",
+        name="Color Codec",
+        description="Basis Universal codec for color/data KTX2 textures "
+                    "(base color, emission, roughness, masks, ...)",
         items=[
             ("uastc", "UASTC", "Higher quality, larger files (Zstd-compressed)"),
             ("etc1s", "ETC1S", "Smallest files, lower quality (BasisLZ)"),
         ],
         default="uastc",
+    )),
+    "ktx_quality": (IntProperty, dict(
+        name="Color Quality",
+        description="Encoding quality for color/data KTX2 textures",
+        min=0, max=100, default=90, subtype="PERCENTAGE",
+    )),
+    "ktx_normal_codec": (EnumProperty, dict(
+        name="Normal Codec",
+        description="Basis Universal codec for normal and height/bump maps, "
+                    "which need more detail than color textures",
+        items=[
+            ("uastc", "UASTC", "Higher quality, larger files (Zstd-compressed)"),
+            ("etc1s", "ETC1S", "Smallest files, lower quality (BasisLZ)"),
+        ],
+        default="uastc",
+    )),
+    "ktx_normal_quality": (IntProperty, dict(
+        name="Normal Quality",
+        description="Encoding quality for normal and height/bump maps",
+        min=0, max=100, default=100, subtype="PERCENTAGE",
+    )),
+    "ktx_effort": (IntProperty, dict(
+        name="Effort",
+        description="Encoder search effort for all KTX2 textures "
+                    "(higher is slower but compresses better)",
+        min=0, max=10, default=2,
     )),
     "bake_materials": (BoolProperty, dict(
         name="Bake Materials",
@@ -485,13 +541,19 @@ def _make_export_props() -> dict:
 
 # Collapsible panel layout for the export/import file browser sidebars:
 # (panel_id, label, prop_names). Panel ids persist open/closed state.
-def _draw_ktx_status(body, owner):
-    """Offer the KTX binaries download when KTX2 is selected but missing."""
-    if owner.image_format != "KTX2" or ktx_lib.is_available():
-        return
-    col = body.column()
-    col.label(text="KTX binaries are not installed", icon="ERROR")
-    col.operator("gltf_custom.download_ktx", icon="IMPORT")
+def _draw_material_extras(body, owner):
+    """KTX2 encoder settings (only while KTX2 is selected) + bake options."""
+    if owner.image_format == "KTX2":
+        col = body.column()
+        for prop in ("ktx_codec", "ktx_quality",
+                     "ktx_normal_codec", "ktx_normal_quality", "ktx_effort"):
+            col.prop(owner, prop)
+        if not ktx_lib.is_available():
+            # Offer the KTX binaries download when they are missing.
+            col.label(text="KTX binaries are not installed", icon="ERROR")
+            col.operator("gltf_custom.download_ktx", icon="IMPORT")
+    body.prop(owner, "bake_materials")
+    body.prop(owner, "bake_resolution")
 
 
 _EXPORT_PANELS = (
@@ -503,8 +565,8 @@ _EXPORT_PANELS = (
         "export_quantization",
     )),
     ("GLTF_export_material", "Material", (
-        "export_materials", "image_format", "ktx_codec", "bake_materials", "bake_resolution",
-    ), _draw_ktx_status),
+        "export_materials", "image_format",
+    ), _draw_material_extras),
     ("GLTF_export_animation", "Animation", (
         "export_animations",
         "export_animation_events",
@@ -519,6 +581,11 @@ _EXPORT_PANELS = (
     ("GLTF_export_interactivity", "Interactivity", ("export_interactivity",)),
     ("GLTF_export_audio", "Audio", ("export_audio",)),
     ("GLTF_export_walkability", "Walkability", ("export_walkability",)),
+    ("GLTF_export_environment", "Environment Map", (
+        "export_environment_map",
+        "environment_map_size",
+        "environment_map_codec",
+    )),
     ("GLTF_export_extras", "Extras", ("export_extras", "export_uids")),
     ("GLTF_export_external", "External Assets", (
         "export_external_assets",
@@ -621,7 +688,9 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         if win is None:
             windows = list(getattr(context.window_manager, "windows", []))
             win = windows[0] if windows else None
-        if win is not None and not tex.ktx_pending_done():
+        # Background mode may still expose a window (Blender 5.x) but runs no
+        # event loop, so the modal timer would never fire — stay blocking.
+        if not bpy.app.background and win is not None and not tex.ktx_pending_done():
             wm = context.window_manager
             try:
                 wm.modal_handler_add(self)

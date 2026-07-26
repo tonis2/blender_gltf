@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rtk grep *)",
+      "Bash(rtk ls *)"
+    ]
+  },
+  "enabledMcpjsonServers": [
+    "blender"
+  ]
+}
