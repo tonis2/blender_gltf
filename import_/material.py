@@ -142,10 +142,76 @@ class MaterialImporter:
             principled.inputs["Roughness"].default_value = pbr.roughness_factor
 
         if pbr.base_color_texture:
-            self._apply_texture(tree, principled, "Base Color", pbr.base_color_texture, y_offset=0)
+            tex_node = self._apply_texture(
+                tree, principled, "Base Color", pbr.base_color_texture, y_offset=0,
+            )
+            self._apply_base_color_alpha(tree, principled, tex_node, pbr, gltf_mat)
 
         if pbr.metallic_roughness_texture:
             self._apply_metallic_roughness_texture(tree, principled, pbr, gltf_mat, mat)
+
+    def _apply_base_color_alpha(self, tree, principled, tex_node, pbr, gltf_mat) -> None:
+        """Wire the base color texture's Alpha into Principled.Alpha.
+
+        Without this a MASK or BLEND material got its `surface_render_method`
+        set and nothing to drive it: Principled.Alpha stayed at
+        `baseColorFactor[3]`, so the mesh drew fully opaque and the cut-out parts
+        of the texture showed as **black** -- Blender premultiplies a straight-
+        alpha image on load, so the RGB under a zero alpha is multiplied away
+        before it ever reaches the Color output. Foliage and netting exported as
+        alpha-masked quads arrived as solid black cards.
+
+        Two halves, and both are needed:
+
+        - the link, so the alpha the file carries actually reaches the shader;
+        - `alpha_mode = 'CHANNEL_PACKED'` on the image, so Blender stops
+          premultiplying it. glTF's base color alpha is a coverage mask sitting
+          beside an independent color, which is exactly what CHANNEL_PACKED
+          means. It also stops the dark fringe that premultiplied black bleeds
+          into the kept texels at every mip level.
+
+        glTF defines the final alpha as `baseColorFactor.a * texture.a`, and
+        `_wire_channel_factor` already spells that: a factor of 1 links straight
+        through, anything else goes through a MULTIPLY.
+
+        MASK additionally means "fully on or fully off at `alphaCutoff`", which
+        `surface_render_method` alone does not say -- Blender 4.2 dropped the
+        CLIP method and `alpha_threshold` with it -- so the comparison is
+        rebuilt as a GREATER_THAN node.
+        """
+        if tex_node is None:
+            return
+        alpha_out = tex_node.outputs.get("Alpha")
+        if alpha_out is None or "Alpha" not in principled.inputs:
+            return
+
+        mode = getattr(gltf_mat, "alpha_mode", None)
+        if mode not in ("BLEND", "MASK"):
+            return
+
+        # Straight alpha, not premultiplied -- see the docstring.
+        if tex_node.image is not None:
+            try:
+                tex_node.image.alpha_mode = "CHANNEL_PACKED"
+            except (AttributeError, TypeError, ValueError):
+                pass
+
+        factor = pbr.base_color_factor[3] if (
+            pbr.base_color_factor and len(pbr.base_color_factor) > 3
+        ) else 1.0
+
+        target = principled.inputs["Alpha"]
+        if mode == "MASK":
+            cutoff = gltf_mat.alpha_cutoff
+            cutoff = 0.5 if cutoff is None else float(cutoff)
+            cut = tree.nodes.new("ShaderNodeMath")
+            cut.operation = "GREATER_THAN"
+            cut.inputs[1].default_value = cutoff
+            cut.location = (principled.location[0] - 200, principled.location[1] - 100)
+            tree.links.new(cut.outputs["Value"], target)
+            target = cut.inputs[0]
+
+        self._wire_channel_factor(tree, alpha_out, target, factor)
 
     def _apply_metallic_roughness_texture(self, tree, principled, pbr, gltf_mat=None, mat=None) -> None:
         """glTF packs roughness in the G channel and metallic in the B channel of
@@ -234,16 +300,21 @@ class MaterialImporter:
         tree.links.new(from_socket, mul.inputs[0])
         tree.links.new(mul.outputs["Value"], to_socket)
 
-    def _apply_texture(self, tree, principled, socket_name, texture_info, y_offset=0) -> None:
+    def _apply_texture(self, tree, principled, socket_name, texture_info, y_offset=0):
         """Wire a color texture into `socket_name`. Builds the Image Texture
         node (with sampler + KHR_texture_transform) via _make_texture_node so
-        the node-creation path is uniform across all texture slots."""
+        the node-creation path is uniform across all texture slots.
+
+        Returns the Image Texture node, so a caller that needs the image's other
+        outputs -- the base color slot needs Alpha -- does not build it twice.
+        """
         tex_node = self._make_texture_node(
             tree, self._ti_to_dict(texture_info), principled, (-400, y_offset),
         )
         if tex_node is None:
-            return
+            return None
         tree.links.new(tex_node.outputs["Color"], principled.inputs[socket_name])
+        return tex_node
 
     def _apply_normal_texture(self, tree, principled, normal_info) -> None:
         """Wire a normal texture through a Normal Map node into Principled.Normal.
