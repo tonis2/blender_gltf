@@ -1648,8 +1648,13 @@ class MaterialExporter:
         emissive_texture, emissive_factor, emissive_strength = self._gather_emission(base)
         alpha_mode, alpha_cutoff = self._gather_alpha(blender_material, base)
 
-        # Base height/bump has no core glTF slot -> extension.base.
+        # Base height/bump has no core glTF slot -> extension.base. Neither
+        # does the base layer's name: the material's own name is the object's,
+        # not the layer's, and every other layer keeps its label.
         base_extra: dict = {}
+        base_props = node.layers[0] if n_layers else None
+        if base_props is not None and base_props.layer_name:
+            base_extra["name"] = base_props.layer_name
         base_height, base_bump = self._layer_bump_info(node, 0)
         if base_height is not None:
             base_extra["heightTexture"] = base_height
@@ -1838,6 +1843,26 @@ def _socket_to_channel(name: str) -> str:
     return "R"
 
 
+def _gltf_color_slot(attr: str) -> str:
+    """The glTF attribute name (COLOR_n) for a Blender colour attribute name.
+
+    A mask node names a Blender attribute; glTF addresses vertex colours by
+    slot, in the order export/mesh.py writes them (mesh.color_attributes).
+    Emitting the Blender name would leave `mask.attribute` naming something no
+    glTF reader — this importer included — can resolve. Materials are exported
+    independently of the meshes that use them, so the slot is resolved through
+    the first mesh that actually carries an attribute by that name; a scene
+    with one colour-attribute layout (the normal case) resolves exactly.
+    """
+    import bpy
+
+    for mesh in bpy.data.meshes:
+        names = [ca.name for ca in mesh.color_attributes]
+        if attr in names:
+            return f"COLOR_{names.index(attr)}"
+    return "COLOR_0"
+
+
 def _vertex_color_mask(src, channel: str) -> dict:
     attr = ""
     if src.type == "VERTEX_COLOR":
@@ -1845,8 +1870,9 @@ def _vertex_color_mask(src, channel: str) -> dict:
     else:
         attr = getattr(src, "attribute_name", "") or ""
     mask = {"source": "VERTEX_COLOR"}
-    if attr and attr != "COLOR_0":
-        mask["attribute"] = attr
+    slot = _gltf_color_slot(attr) if attr else "COLOR_0"
+    if slot != "COLOR_0":
+        mask["attribute"] = slot
     if channel != "R":
         mask["channel"] = channel
     return mask

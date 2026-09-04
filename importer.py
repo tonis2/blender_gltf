@@ -68,12 +68,37 @@ class ImportSettings:
     import_external_assets: bool = True
 
 
+@dataclass
+class _PipelineState:
+    """What ``_pipeline_begin`` hands to ``_pipeline_finish``."""
+    gltf: "Gltf"
+    base_dir: Path
+    buffer_reader: "BufferReader"
+    texture_importer: "TextureImporter"
+    file_resolver: "FileResolver | None"
+    target_collection: "bpy.types.Collection | None"
+    external_depth: int
+
+
 class GltfImporter:
     def __init__(self, context: "bpy.types.Context", settings: ImportSettings) -> None:
         self.context = context
         self.settings = settings
+        self._state: "_PipelineState | None" = None
 
     def import_file(self) -> None:
+        """Blocking import — begin, wait out the KTX2 decodes, finish."""
+        self.import_begin()
+        self.import_finish()
+
+    def import_begin(self) -> None:
+        """Read the file and queue the KTX2 decodes; touch nothing in the scene.
+
+        Split out of import_file so the operator can go modal while the decode
+        worker runs, the same way the exporter splits build_begin/build_finish
+        around its encode worker. Nothing exists in bpy.data yet at this point,
+        so cancelling between the two halves leaves no half-built import.
+        """
         path = Path(self.settings.filepath)
 
         # 1. Read file. Detect the container by content (GLB starts with the
@@ -89,7 +114,29 @@ class GltfImporter:
         # 2. Deserialize
         gltf = Gltf.from_dict(gltf_dict)
 
-        self._run_pipeline(gltf, binary, path.parent)
+        self._state = self._pipeline_begin(gltf, binary, path.parent)
+
+    def import_finish(self) -> dict:
+        """Land the decoded textures and run the rest of the pipeline."""
+        state, self._state = self._state, None
+        if state is None:
+            raise RuntimeError("import_finish() called before import_begin()")
+        return self._pipeline_finish(state)
+
+    # -- KTX2 decode progress, driven by the operator's modal timer ---------
+
+    def pump_ktx(self) -> tuple[int, int]:
+        if self._state is None:
+            return 0, 0
+        return self._state.texture_importer.pump_ktx()
+
+    def ktx_pending_done(self) -> bool:
+        return self._state is None or self._state.texture_importer.ktx_pending_done()
+
+    def cancel_ktx(self) -> None:
+        if self._state is not None:
+            self._state.texture_importer.cancel_ktx()
+            self._state = None
 
     def _run_pipeline(
         self,
@@ -106,6 +153,21 @@ class GltfImporter:
         collection instead of creating Blender scenes — used when instantiating
         a glTF 2.1 [DRAFT] external/packaged sub-asset. Returns node->object map.
         """
+        state = self._pipeline_begin(
+            gltf, binary, base_dir,
+            target_collection=target_collection, external_depth=external_depth,
+        )
+        return self._pipeline_finish(state)
+
+    def _pipeline_begin(
+        self,
+        gltf: "Gltf",
+        binary: bytes | None,
+        base_dir: Path,
+        *,
+        target_collection: "bpy.types.Collection | None" = None,
+        external_depth: int = 0,
+    ) -> _PipelineState:
         # 2b. Warn about required extensions we don't support — the resulting
         # import may be incomplete or visually wrong.
         required = set(gltf.extensions_required or [])
@@ -125,8 +187,33 @@ class GltfImporter:
         if gltf.files and self.settings.import_external_assets:
             file_resolver = FileResolver(gltf, buffer_reader, base_dir)
 
-        # 4. Import textures
+        # 4. Queue the KTX2 decodes. Everything else about the textures waits
+        # for _pipeline_finish, so the caller can drain the worker in between.
         texture_importer = TextureImporter(gltf, buffer_reader, self.settings, base_dir)
+        if self.settings.import_materials:
+            texture_importer.prefetch_ktx()
+
+        return _PipelineState(
+            gltf=gltf,
+            base_dir=base_dir,
+            buffer_reader=buffer_reader,
+            texture_importer=texture_importer,
+            file_resolver=file_resolver,
+            target_collection=target_collection,
+            external_depth=external_depth,
+        )
+
+    def _pipeline_finish(self, state: _PipelineState) -> dict:
+        gltf = state.gltf
+        base_dir = state.base_dir
+        buffer_reader = state.buffer_reader
+        texture_importer = state.texture_importer
+        file_resolver = state.file_resolver
+        target_collection = state.target_collection
+        external_depth = state.external_depth
+
+        # 4b. Import textures (lands any decode the caller did not already
+        # drain, then loads the PNG/JPEG images).
         if self.settings.import_materials:
             texture_importer.import_all()
 

@@ -902,14 +902,68 @@ class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
             import_external_assets=self.import_external_assets,
         )
 
+        self._importer = GltfImporter(context, settings)
+        self._timer = None
         try:
-            importer = GltfImporter(context, settings)
-            importer.import_file()
-            self.report({"INFO"}, f"Imported from {self.filepath}")
+            self._importer.import_begin()
         except Exception as e:
             self.report({"ERROR"}, str(e))
             return {"CANCELLED"}
 
+        # KTX2 decodes run on a background thread; go modal so Blender stays
+        # responsive while they finish. Same fallbacks as the exporter:
+        # scripted calls have no window in their context, so borrow one from
+        # the window manager, and background mode (which may still expose a
+        # window but runs no event loop) stays blocking.
+        win = context.window
+        if win is None:
+            windows = list(getattr(context.window_manager, "windows", []))
+            win = windows[0] if windows else None
+        if (not bpy.app.background and win is not None
+                and not self._importer.ktx_pending_done()):
+            wm = context.window_manager
+            try:
+                wm.modal_handler_add(self)
+            except RuntimeError:
+                return self._finish(context)  # no UI loop to keep responsive
+            self._timer = wm.event_timer_add(0.1, window=win)
+            return {"RUNNING_MODAL"}
+
+        return self._finish(context)
+
+    def modal(self, context, event):
+        if event.type == "ESC":
+            self._end_modal(context)
+            self._importer.cancel_ktx()
+            self.report({"WARNING"}, "glTF import cancelled")
+            return {"CANCELLED"}
+        if event.type != "TIMER":
+            # Let the user keep working while the decodes run.
+            return {"PASS_THROUGH"}
+        done, total = self._importer.pump_ktx()
+        if not self._importer.ktx_pending_done():
+            if context.workspace is not None:
+                context.workspace.status_text_set(
+                    f"glTF import: decoding KTX2 textures ({done}/{total} "
+                    f"done, Esc to cancel)")
+            return {"RUNNING_MODAL"}
+        self._end_modal(context)
+        return self._finish(context)
+
+    def _end_modal(self, context):
+        if self._timer is not None:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+        if context.workspace is not None:
+            context.workspace.status_text_set(None)
+
+    def _finish(self, context):
+        try:
+            self._importer.import_finish()
+        except Exception as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Imported from {self.filepath}")
         return {"FINISHED"}
 
     def draw(self, context):

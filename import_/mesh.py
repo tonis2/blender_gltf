@@ -201,8 +201,14 @@ class MeshImporter:
         uv_layer.uv.foreach_set("vector", vert_uvs[loop_vidx].flatten())
 
     def _apply_color_layer(self, mesh, layer_idx, color_parts, total_verts, loop_vidx) -> None:
+        # Named after the glTF attribute it came from, not "Color": a
+        # CUSTOM_materials_layers mask addresses its vertex colours by name,
+        # the exporter writes that name as a COLOR_n slot, and the material
+        # importer wires the Color Attribute node to the same string. Call the
+        # attribute anything else and every one of those nodes points at a
+        # layer the mesh does not have — which Blender renders as flat red.
         color_attr = mesh.color_attributes.new(
-            name="Color" if layer_idx == 0 else f"Color.{layer_idx:03d}",
+            name=f"COLOR_{layer_idx}",
             type="FLOAT_COLOR",
             domain="CORNER",
         )

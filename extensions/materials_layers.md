@@ -153,6 +153,7 @@ Viewers that don't implement height/parallax can ignore `heightTexture`/`bump` a
 
 | Property | Type | Required | Description |
 |----------|------|----------|-------------|
+| `name` | string | No | Authoring label for layer 0 (the base), matching a layer's `name` |
 | `heightTexture` | textureInfo | No | Base-material height / displacement (bump) map (same meaning as a layer's `heightTexture`) |
 | `bump` | object | No | Base-material bump parameters — `{ "strength", "distance" }` |
 
@@ -167,7 +168,7 @@ The `mask` object itself is optional on a layer — omit it for a layer that is 
 | `source` | string | Yes | `"TEXTURE"` or `"VERTEX_COLOR"` |
 | `channel` | string | No | One of `"R"`, `"G"`, `"B"`, `"A"`. Default `"R"` |
 | `texture` | textureInfo | If `source = "TEXTURE"` | Mask texture |
-| `attribute` | string | No | Vertex color attribute name when `source = "VERTEX_COLOR"`. Default `"COLOR_0"` |
+| `attribute` | string | No | Which glTF vertex color attribute to read when `source = "VERTEX_COLOR"` — `"COLOR_0"`, `"COLOR_1"`, … Default `"COLOR_0"` |
 | `invert` | boolean | No | If true, use `1 - m`. Default `false` |
 
 **Channel packing.** A single 4-channel mask texture can drive up to four layers — layer A reads `R`, layer B reads `G`, etc. This is the standard splat-map technique.

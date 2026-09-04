@@ -561,6 +561,8 @@ class MaterialImporter:
         """
         ld: dict = {}
         base_extra = (ext or {}).get("base") or {}
+        if base_extra.get("name"):
+            ld["name"] = base_extra["name"]
         if base_extra.get("heightTexture") is not None:
             ld["heightTexture"] = base_extra["heightTexture"]
         if base_extra.get("bump") is not None:
@@ -866,7 +868,12 @@ class MaterialImporter:
                 tex_node.outputs.get(out_socket_name)
                 or tex_node.outputs["Color"]
             )
-            if channel in ("G", "B"):
+            # R is the spec default, so an R mask arrives with no `channel`
+            # key -- and it still has to be separated out. Linking the Color
+            # output into the float Mask socket instead makes Blender average
+            # RGB, which for a splat map or a vertex-painted mask is a wholly
+            # different, usually much larger, coverage.
+            if channel in ("R", "G", "B"):
                 sep = tree.nodes.new("ShaderNodeSeparateColor")
                 sep.location = sep_loc
                 tree.links.new(tex_node.outputs["Color"], sep.inputs["Color"])
@@ -887,7 +894,8 @@ class MaterialImporter:
             from_socket = (
                 vc.outputs["Alpha"] if channel == "A" else vc.outputs["Color"]
             )
-            if channel in ("G", "B"):
+            # See the texture branch: R needs separating just like G and B.
+            if channel in ("R", "G", "B"):
                 sep = tree.nodes.new("ShaderNodeSeparateColor")
                 sep.location = sep_loc
                 tree.links.new(vc.outputs["Color"], sep.inputs["Color"])
