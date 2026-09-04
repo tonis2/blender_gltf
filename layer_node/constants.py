@@ -57,6 +57,44 @@ N_CH = len(CHANNELS)
 CH_TO_IDX = {c[0]: i for i, c in enumerate(CHANNELS)}
 CHANNEL_BY_NAME = {c[0]: c for c in CHANNELS}
 
+
+def channel_is_stated(socket, default):
+    """Whether a layer says anything at all on this channel.
+
+    A linked socket always states something. An unlinked one states something
+    only once it has been moved off the channel's default: an untouched layer
+    has no opinion, and blending its default over the layers below it is not a
+    no-op. That is the difference between adding a layer to tint some dirt and
+    adding one that also drags roughness to 0.5, forces metalness to 0 and
+    blacks out every emission underneath.
+
+    The Normal channel always followed this rule; every channel follows it now.
+    It is also the rule the glTF side needs. `CUSTOM_materials_layers` has no
+    spelling for "unstated", so a reader takes an all-default pbr block to mean
+    the layer left the surface alone -- and an exporter that cannot produce one
+    cannot express a colour-only layer.
+
+    Duck-typed on purpose: this module stays bpy-free so the export and import
+    material modules can share it.
+    """
+    if socket is None or default is None:
+        return False
+    if getattr(socket, "is_linked", False):
+        return True
+    try:
+        value = socket.default_value
+    except AttributeError:
+        return False
+    try:
+        seq = tuple(value)
+    except TypeError:
+        try:
+            return abs(float(value) - float(default)) > 1e-6
+        except (TypeError, ValueError):
+            return False
+    ref = tuple(default) if hasattr(default, "__len__") else (default,)
+    return any(abs(float(a) - float(b)) > 1e-6 for a, b in zip(seq, ref))
+
 # Sub-section grouping inside each layer panel.
 # (panel_name_or_None, [channel_names]).  None means "directly under the
 # layer panel"; otherwise the channels live in a nested sub-panel of the

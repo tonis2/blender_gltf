@@ -19,7 +19,9 @@ import bpy
 from bpy.props import CollectionProperty
 from bpy.types import ShaderNodeCustomGroup
 
-from .constants import CHANNELS, N_CH, CH_TO_IDX, CHANNEL_BY_NAME, SUBSECTIONS
+from .constants import (
+    CHANNELS, N_CH, CH_TO_IDX, CHANNEL_BY_NAME, SUBSECTIONS, channel_is_stated,
+)
 from .properties import StackLayerProperties
 from .utils import get_node_id
 
@@ -500,29 +502,32 @@ class BSDFStackNode(ShaderNodeCustomGroup):
                 else:
                     nt.links.new(prev_output, mix.inputs[a_idx])
 
-                # Normal: a layer only perturbs the surface where it actually
-                # has a normal map wired. An unlinked upper layer must NOT
-                # stamp a geometry/literal vector over the layers below it —
-                # with a default (1.0) mask that would flatten everything
-                # beneath a maskless layer.
-                if ch_name == "Normal":
-                    parent_socket = self._socket_for(i, normal_ci)
-                    linked = (
-                        parent_socket is not None and parent_socket.is_linked
+                # A layer only touches a channel it actually STATES -- one it
+                # has something wired into, or whose value it moved off the
+                # default. An untouched upper layer must NOT stamp its socket
+                # default over the layers below it: at a default (1.0) mask
+                # that erases them, so a layer added to tint some dirt would
+                # also pull their roughness to 0.5, force their metalness to 0
+                # and black out their emission. Passing the accumulated value
+                # into B makes B == A, and the mix a no-op, at any mask.
+                #
+                # Normal always worked this way; the rule is simply no longer
+                # special-cased to it.
+                stated = channel_is_stated(
+                    self._socket_for(i, ch_idx), CHANNELS[ch_idx][2],
+                )
+                if stated:
+                    nt.links.new(channel_out, mix.inputs[b_idx])
+                elif prev_output is not None:
+                    nt.links.new(prev_output, mix.inputs[b_idx])
+                elif ch_name == "Normal":
+                    # Base layer, no map → start from the true surface normal.
+                    nt.links.new(
+                        _get_geometry().outputs["Normal"],
+                        mix.inputs[b_idx],
                     )
-                    if linked:
-                        nt.links.new(channel_out, mix.inputs[b_idx])
-                    elif prev_output is None:
-                        # Base layer, no map → start from the true surface normal.
-                        nt.links.new(
-                            _get_geometry().outputs["Normal"],
-                            mix.inputs[b_idx],
-                        )
-                    else:
-                        # Upper layer, no map → pass the accumulated normal
-                        # through unchanged (B == A makes the mix a no-op).
-                        nt.links.new(prev_output, mix.inputs[b_idx])
                 else:
+                    # Base layer → its socket default IS the material.
                     nt.links.new(channel_out, mix.inputs[b_idx])
 
                 prev_output = mix.outputs[out_idx]

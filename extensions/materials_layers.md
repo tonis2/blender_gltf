@@ -78,6 +78,21 @@ Same shape as the [glTF 2.0 pbrMetallicRoughness](https://registry.khronos.org/g
 | `roughnessFactor` | number | (default `1.0`) |
 | `metallicRoughnessTexture` | textureInfo | Combined MR texture (G=roughness, B=metallic, per glTF convention) |
 
+**A default is not a statement.** There is no way to spell "this layer leaves the
+surface alone", so a layer whose `metallicFactor` and `roughnessFactor` are both
+absent (or both `1.0`) and which carries no `metallicRoughnessTexture` MUST be
+read as saying nothing about metal or roughness — the base material's values pass
+through it unchanged. A layer that genuinely means fully rough and fully metallic
+states it with a map, the same way a layer that means white paint does.
+
+Without that rule a colour-only layer is unexpressible: every layer would carry a
+metal and a roughness whether it meant to or not, and a stack of tints would flatten
+the base material's roughness map everywhere its masks reached.
+
+**The pair travels together.** Writing one factor leaves the other at its `1.0`
+default, so a dirt layer stating `roughnessFactor` alone arrives *fully metallic*.
+Writers MUST emit both whenever they emit either.
+
 `KHR_texture_transform` is supported on each `textureInfo` and is the recommended way to encode per-layer UV tiling (e.g., gravel tiles 4× while grass tiles 1×).
 
 ### height & bump

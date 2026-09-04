@@ -8,8 +8,80 @@ from ..gltf.types import (
     NormalTextureInfo,
     OcclusionTextureInfo,
 )
-from ..layer_node.constants import N_CH, CH_TO_IDX, BLEND_MODES
+from ..layer_node.constants import (
+    N_CH, CH_TO_IDX, BLEND_MODES, CHANNEL_BY_NAME, channel_is_stated,
+)
 from .texture import TextureExporter
+
+
+# Principled socket name -> BSDF Stack channel name. Anything absent here (Coat,
+# Sheen, IOR, Transmission) simply has no channel on the stack yet, and the
+# gatherers already handle a missing socket by emitting nothing -- the same
+# branch they take on a Blender too old to expose it.
+_STACK_AS_PRINCIPLED = {
+    "Base Color": "Color",
+    "Metallic": "Metallic",
+    "Roughness": "Roughness",
+    "Normal": "Normal",
+    "Alpha": "Alpha",
+    "Emission Color": "Emission Color",
+    "Emission Strength": "Emission Strength",
+    "Subsurface Weight": "Subsurface Weight",
+    "Subsurface Radius": "Subsurface Radius",
+}
+
+
+class _StackSocketMap:
+    """`.inputs` for _StackLayerAsPrincipled: Principled names in, the layer's
+    own sockets out."""
+
+    __slots__ = ("_node", "_index")
+
+    def __init__(self, node, index):
+        self._node = node
+        self._index = index
+
+    def get(self, name, default=None):
+        channel = _STACK_AS_PRINCIPLED.get(name)
+        if channel is None:
+            return default
+        idx = self._index * N_CH + CH_TO_IDX[channel]
+        if 0 <= idx < len(self._node.inputs):
+            return self._node.inputs[idx]
+        return default
+
+    def __getitem__(self, name):
+        socket = self.get(name)
+        if socket is None:
+            raise KeyError(name)
+        return socket
+
+    def __contains__(self, name):
+        return self.get(name) is not None
+
+
+class _StackLayerAsPrincipled:
+    """One BSDF Stack layer, dressed as a Principled BSDF.
+
+    Every _gather_* function reaches its node only through `.inputs`, so a
+    layer that answers to Principled socket names can travel exactly the code
+    the Principled path travels. That is the point: a one-layer stack IS a
+    plain material and has to export as one.
+
+    The alternative -- the `_layer_*` twins this replaces -- is what let the
+    two paths drift. The twins missed the RGB-node colour case
+    _read_color_socket had handled for years, and dropped emission strength on
+    the floor, so a glowing stack lost its KHR_materials_emissive_strength.
+    Both were invisible until someone diffed the two exports.
+    """
+
+    __slots__ = ("_node", "_index", "type", "inputs")
+
+    def __init__(self, node, index):
+        self._node = node
+        self._index = index
+        self.type = "BSDF_PRINCIPLED"
+        self.inputs = _StackSocketMap(node, index)
 
 if TYPE_CHECKING:
     import bpy
@@ -108,6 +180,22 @@ class MaterialExporter:
     def _material_needs_bake(self, blender_material: "bpy.types.Material") -> bool:
         """Heuristic: does any glTF-relevant Principled channel depend on
         procedural nodes (so it would be lost without baking)?"""
+        # Stack first, matching the export dispatch. A stack's Principled BSDF
+        # lives INSIDE its node group, so _find_principled_bsdf cannot see it
+        # and this answered False for every layered material: a layer driven by
+        # a Noise or a ColorRamp exported as nothing, silently, with baking
+        # switched on. (It would also have found a disconnected Principled left
+        # over from converting a material, and answered about the wrong node.)
+        stack = self._find_bsdf_stack_node(blender_material)
+        if stack is not None:
+            return any(
+                self._socket_needs_bake(self._layer_socket(stack, i, channel))
+                for i in range(len(stack.layers))
+                for channel in (
+                    "Color", "Metallic", "Roughness", "Normal", "Emission Color",
+                )
+            )
+
         principled = self._find_principled_bsdf(blender_material)
         if principled is None:
             return False  # custom/surface-group materials are not auto-baked
@@ -550,8 +638,12 @@ class MaterialExporter:
             # CUSTOM_materials_layers extension.
             (
                 pbr, normal_texture, emissive_texture, emissive_factor,
-                alpha_mode, alpha_cutoff, layers, base_extra,
+                emissive_strength, alpha_mode, alpha_cutoff, layers, base_extra,
             ) = self._extract_from_bsdf_stack(blender_material, stack_node)
+            # Layer 0 dressed as a Principled, so the coat/sheen gatherers below
+            # run for a stack material too instead of being skipped by a path
+            # check. They answer None until the node grows Coat/Sheen channels.
+            principled = self._layer_as_principled(stack_node, 0)
         else:
             principled = self._find_principled_bsdf(blender_material)
 
@@ -756,6 +848,18 @@ class MaterialExporter:
                 upstream.inputs.get("Normal"),
                 _group_stack, _visited, _depth + 1,
             )
+        if t == "DISPLACEMENT":
+            # A Displacement node sitting between a depth map and a Bump node's
+            # Height is what several asset-library material setups produce, and
+            # it used to dead-end this walk: the heightTexture was silently
+            # dropped for every material wired that way, while a material whose
+            # depth map went straight into the Bump exported it fine. Its Height
+            # input is the map.
+            return self._walk_to_image(
+                upstream.inputs.get("Height"),
+                _group_stack, _visited, _depth + 1,
+            )
+
         if t == "GROUP":
             tree = getattr(upstream, "node_tree", None)
             if tree is None:
@@ -851,6 +955,30 @@ class MaterialExporter:
         if mr_node:
             mr_texture = self.texture_exporter.gather_texture_info(mr_node)
 
+        # glTF carries opacity in baseColorFactor[3]. Blender carries it on the
+        # shader's own Alpha socket, which _read_color_socket never sees -- it
+        # reads Base Color, whose alpha is a different number and is essentially
+        # always 1.0. Without this a material set to 50% alpha exported as
+        # alphaMode BLEND over a fully opaque colour. A LINKED Alpha socket is
+        # left alone on purpose: then the base colour texture's A drives it and
+        # a factor would scale it twice.
+        alpha_socket = principled.inputs.get("Alpha")
+        if alpha_socket is not None and not getattr(alpha_socket, "is_linked", False):
+            try:
+                alpha_value = float(alpha_socket.default_value)
+            except (TypeError, ValueError):
+                alpha_value = 1.0
+            if alpha_value != 1.0:
+                rgb = base_color_factor or [1.0, 1.0, 1.0, 1.0]
+                base_color_factor = [rgb[0], rgb[1], rgb[2], alpha_value]
+
+        # [1,1,1,1] is glTF's own default for baseColorFactor, so writing it is
+        # bytes that say nothing -- and _read_color_socket hands back exactly
+        # that for every texture-driven base colour, which is most materials.
+        # The value is still right; it just does not need serializing.
+        if base_color_factor == [1.0, 1.0, 1.0, 1.0]:
+            base_color_factor = None
+
         return MaterialPBRMetallicRoughness(
             base_color_factor=base_color_factor,
             base_color_texture=base_color_texture,
@@ -870,15 +998,11 @@ class MaterialExporter:
         if tex_info is None:
             return None
 
-        # Get normal strength from Normal Map node
-        scale = None
-        normal_socket = principled.inputs.get("Normal")
-        if normal_socket and normal_socket.is_linked:
-            normal_map_node = normal_socket.links[0].from_node
-            if normal_map_node.type == "NORMAL_MAP":
-                strength = normal_map_node.inputs.get("Strength")
-                if strength and strength.default_value != 1.0:
-                    scale = float(strength.default_value)
+        # Normal-map strength, through the helper that also looks THROUGH a
+        # Bump node. The inline check this replaces saw BUMP on the common
+        # "height + normal map into Bump into Normal" wiring, stopped, and
+        # silently exported a scale of 1.0.
+        scale = self._normal_map_scale(principled.inputs.get("Normal"))
 
         return NormalTextureInfo(
             index=tex_info.index,
@@ -1212,6 +1336,11 @@ class MaterialExporter:
             return node
         return None
 
+    def _layer_as_principled(self, node, layer_index):
+        """Layer `layer_index` of a BSDFStackNode, readable by the _gather_*
+        functions as though it were a Principled BSDF."""
+        return _StackLayerAsPrincipled(node, layer_index)
+
     def _layer_socket(self, node, layer_index, channel_name):
         """Look up a BSDFStackNode input socket by (layer, channel name)."""
         idx = layer_index * N_CH + CH_TO_IDX[channel_name]
@@ -1272,30 +1401,67 @@ class MaterialExporter:
     def _layer_pbr_dict(self, node, i):
         """Build a pbrMetallicRoughness dict for layer i (factors + textures)."""
         pbr: dict = {}
-        rgb = self._layer_color_factor(node, i, "Color")
+        # _read_color_socket, the same reader the base material uses: it
+        # returns a white factor beside a texture (so glTF's factor x texture
+        # cannot double-apply), the node's own value for a constant RGB
+        # upstream, and the socket default when nothing is linked.
+        factor, bc_tex = self._read_color_socket(self._layer_socket(node, i, "Color"))
+        rgb = None if factor is None else [factor[0], factor[1], factor[2]]
         alpha = self._layer_float(node, i, "Alpha")
         a = alpha if alpha is not None else 1.0
         if rgb is not None and (rgb != [1.0, 1.0, 1.0] or a != 1.0):
             pbr["baseColorFactor"] = [rgb[0], rgb[1], rgb[2], a]
-        elif rgb is None and a != 1.0 and self._layer_socket(node, i, "Color") is not None:
-            # Color is texture-driven; only the layer alpha needs a factor.
-            pbr["baseColorFactor"] = [1.0, 1.0, 1.0, a]
-        bc_tex = self._layer_image_tex(node, i, "Color")
         if bc_tex is not None:
             pbr["baseColorTexture"] = bc_tex
-        m = self._layer_scalar_factor(node, i, "Metallic")
-        if m is not None and m != 1.0:
-            pbr["metallicFactor"] = m
-        r = self._layer_scalar_factor(node, i, "Roughness")
-        if r is not None and r != 1.0:
-            pbr["roughnessFactor"] = r
         mr_tex = (
             self._layer_image_tex(node, i, "Metallic")
             or self._layer_image_tex(node, i, "Roughness")
         )
+        # Metallic and roughness travel together or not at all.
+        #
+        # The extension cannot spell "this layer leaves the surface alone", so
+        # a reader takes metallic 1 + roughness 1 + no map to mean exactly
+        # that. Two consequences, and both are load-bearing:
+        #
+        #  - Write only ONE of the pair and the other defaults to 1.0 at the
+        #    far end. A dirt layer that states roughness 0.9 and stays quiet
+        #    about metal would arrive FULLY METALLIC.
+        #  - Write them whenever they are merely at their Blender defaults and
+        #    every layer states 0.5 roughness and 0 metalness, which is how a
+        #    colour-only layer came to flatten the base's roughness map
+        #    everywhere its mask reached.
+        #
+        # So: both when the layer states either, neither when it states
+        # neither. Omitting a value that happens to equal glTF's own 1.0
+        # default stays correct, because absent and 1.0 are the same number.
+        states_surface = (
+            mr_tex is not None
+            or self._layer_states(node, i, "Metallic")
+            or self._layer_states(node, i, "Roughness")
+        )
+        if states_surface:
+            m = self._layer_scalar_factor(node, i, "Metallic")
+            if m is not None and m != 1.0:
+                pbr["metallicFactor"] = m
+            r = self._layer_scalar_factor(node, i, "Roughness")
+            if r is not None and r != 1.0:
+                pbr["roughnessFactor"] = r
         if mr_tex is not None:
             pbr["metallicRoughnessTexture"] = mr_tex
         return pbr or None
+
+    def _layer_states(self, node, layer_index, channel_name):
+        """Whether layer `layer_index` says anything on `channel_name`.
+
+        The exporter's half of the rule the BSDF Stack node blends by, so the
+        viewport and the exported file agree about which layers touch what.
+        """
+        entry = CHANNEL_BY_NAME.get(channel_name)
+        if entry is None:
+            return False
+        return channel_is_stated(
+            self._layer_socket(node, layer_index, channel_name), entry[2],
+        )
 
     def _layer_normal_info(self, node, i):
         """NormalTextureInfo for layer i's Normal channel, or None."""
@@ -1364,16 +1530,43 @@ class MaterialExporter:
             bump["strength"] = float(strength.default_value)
         distance = src.inputs.get("Distance")
         if distance is not None:
-            bump["distance"] = float(distance.default_value)
+            # A Displacement node in front of the Bump scales the height before
+            # it arrives, so what the viewport shows is Scale x Distance. The
+            # extension carries ONE height-to-displacement number, so the two
+            # fold together or the engine's parallax sits at a different depth
+            # than Blender's. Midlevel needs no handling: the extension already
+            # defines 0.5 as the surface the mesh has.
+            bump["distance"] = float(distance.default_value) * self._displacement_scale(
+                src.inputs.get("Height"),
+            )
         return height_ti, (bump or None)
+
+    def _displacement_scale(self, socket):
+        """The Scale of a Displacement node feeding `socket`, else 1.0."""
+        depth = 0
+        while socket is not None and socket.is_linked and depth < 16:
+            node = socket.links[0].from_node
+            t = getattr(node, "type", "")
+            if t == "DISPLACEMENT":
+                scale = node.inputs.get("Scale")
+                if scale is None or scale.is_linked:
+                    return 1.0
+                try:
+                    return float(scale.default_value)
+                except (TypeError, ValueError):
+                    return 1.0
+            if t != "REROUTE" or not node.inputs:
+                return 1.0
+            socket = node.inputs[0]
+            depth += 1
+        return 1.0
 
     def _layer_emission(self, node, i):
         """Return (emissive_factor list|None, TextureInfo|None) for layer i."""
-        tex = self._layer_image_tex(node, i, "Emission Color")
-        rgb = self._layer_color_factor(node, i, "Emission Color")
-        if rgb is None and tex is not None:
-            # Texture-driven emission: the linked socket's default is ignored.
-            rgb = [1.0, 1.0, 1.0]
+        factor, tex = self._read_color_socket(
+            self._layer_socket(node, i, "Emission Color"),
+        )
+        rgb = None if factor is None else [factor[0], factor[1], factor[2]]
         strength = self._layer_float(node, i, "Emission Strength")
         if rgb is None:
             return None, None
@@ -1396,7 +1589,8 @@ class MaterialExporter:
 
     def _extract_from_bsdf_stack(self, blender_material, node):
         """Map a BSDFStackNode to (pbr, normal, emis_tex, emis_factor,
-        alpha_mode, alpha_cutoff, layers, base_extra). Layer 0 -> base material;
+        emis_strength, alpha_mode, alpha_cutoff, layers, base_extra).
+        Layer 0 -> base material;
         layers 1..N -> the CUSTOM_materials_layers `layers` array. `base_extra`
         carries layer-0 data with no core glTF slot (heightTexture/bump) and
         becomes extension.base.
@@ -1404,31 +1598,16 @@ class MaterialExporter:
         n_layers = len(node.layers)
 
         # ---- Layer 0 -> base material ----
-        # _layer_color_factor: None when the Color socket is linked (Blender
-        # ignores the default there; the texture alone carries the color).
-        rgb = self._layer_color_factor(node, 0, "Color") or [1.0, 1.0, 1.0]
-        alpha = self._layer_float(node, 0, "Alpha")
-        a = alpha if alpha is not None else 1.0
-        base_factor = [rgb[0], rgb[1], rgb[2], a]
-        metallic = self._layer_scalar_factor(node, 0, "Metallic")
-        roughness = self._layer_scalar_factor(node, 0, "Roughness")
-        pbr = MaterialPBRMetallicRoughness(
-            base_color_factor=(
-                base_factor if base_factor != [1.0, 1.0, 1.0, 1.0] else None
-            ),
-            base_color_texture=self._layer_image_tex(node, 0, "Color"),
-            metallic_factor=metallic,
-            roughness_factor=roughness,
-            metallic_roughness_texture=(
-                self._layer_image_tex(node, 0, "Metallic")
-                or self._layer_image_tex(node, 0, "Roughness")
-            ),
-        )
-        normal_texture = self._layer_normal_info(node, 0)
-        emissive_factor, emissive_texture = self._layer_emission(node, 0)
-        alpha_mode, alpha_cutoff = self._alpha_mode_for_material(
-            blender_material, self._layer_socket(node, 0, "Alpha"),
-        )
+        # Through the SAME gatherers the Principled path uses. Layer 0 is not
+        # "like" a plain material, it IS one, so it reads with the same code
+        # and gains everything that code knows: the RGB-node colour case, the
+        # emission-strength extension, the alpha fold, normal strength through
+        # a Bump. Every one of those was a place the twins had drifted.
+        base = self._layer_as_principled(node, 0)
+        pbr = self._gather_pbr(base)
+        normal_texture = self._gather_normal(base)
+        emissive_texture, emissive_factor, emissive_strength = self._gather_emission(base)
+        alpha_mode, alpha_cutoff = self._gather_alpha(blender_material, base)
 
         # Base height/bump has no core glTF slot -> extension.base.
         base_extra: dict = {}
@@ -1447,7 +1626,8 @@ class MaterialExporter:
 
         return (
             pbr, normal_texture, emissive_texture, emissive_factor,
-            alpha_mode, alpha_cutoff, (layers or None), (base_extra or None),
+            emissive_strength, alpha_mode, alpha_cutoff,
+            (layers or None), (base_extra or None),
         )
 
     def _gather_bsdf_layer(self, node, i):
