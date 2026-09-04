@@ -143,6 +143,10 @@ class EnvironmentExporter:
         if codec in ("rgba8", "bc7") and cs == "sRGB":
             fmt = codec + "-srgb"
         try:
+            # Always mipped, and deliberately not following ktx_mipmaps: an
+            # environment map's levels are the prefiltered radiance a shader
+            # indexes by roughness, not a cheaper copy of level 0. Dropping
+            # them makes every glossy reflection mirror-sharp.
             return ktx_lib.encode_cube(
                 faces, size, fmt, mipmaps=True,
                 quality=self.settings.ktx_quality,

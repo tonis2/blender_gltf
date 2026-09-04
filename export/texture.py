@@ -292,8 +292,16 @@ class TextureExporter:
                    else self.settings.ktx_quality)
         # normal_map only matters on the VkFormat path (mip renormalization);
         # passing it for basis codecs is a harmless no-op.
+        #
+        # The chain is optional because for an ETC1S/UASTC file it is often
+        # bytes nobody reads: a reader that transcodes level 0 and lets the
+        # device build its own chain — this addon's importer, and three.c3 —
+        # downloads the other levels and discards them, at about 33% of the
+        # payload. A viewer that samples the file's levels does need them,
+        # which is why it stays on by default.
         future = _executor().submit(
-            ktx_lib.encode_rgba, rgba, w, h, fmt, mipmaps=True,
+            ktx_lib.encode_rgba, rgba, w, h, fmt,
+            mipmaps=self.settings.ktx_mipmaps,
             normal_map=(usage == "normal"), quality=quality,
             effort=self.settings.ktx_effort)
 

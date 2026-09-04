@@ -470,6 +470,15 @@ _EXPORT_PROP_DEFS: dict[str, tuple] = {
                     "(higher is slower but compresses better)",
         min=0, max=10, default=2,
     )),
+    "ktx_mipmaps": (BoolProperty, dict(
+        name="Mipmaps",
+        description="Write a mip chain into each KTX2, about 33% more bytes. "
+                    "Needed by viewers that sample the file's own levels; "
+                    "readers that transcode only level 0 (this addon's "
+                    "importer, and three.c3 for ETC1S/UASTC) download and "
+                    "discard the rest, so turning it off costs them nothing",
+        default=True,
+    )),
     "bake_materials": (BoolProperty, dict(
         name="Bake Materials",
         description=(
@@ -546,7 +555,8 @@ def _draw_material_extras(body, owner):
     if owner.image_format == "KTX2":
         col = body.column()
         for prop in ("ktx_codec", "ktx_quality",
-                     "ktx_normal_codec", "ktx_normal_quality", "ktx_effort"):
+                     "ktx_normal_codec", "ktx_normal_quality", "ktx_effort",
+                     "ktx_mipmaps"):
             col.prop(owner, prop)
         if not ktx_lib.is_available():
             # Offer the KTX binaries download when they are missing.
