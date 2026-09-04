@@ -9,55 +9,10 @@ from ..gltf.types import (
     OcclusionTextureInfo,
 )
 from ..layer_node.constants import (
-    N_CH, CH_TO_IDX, BLEND_MODES, CHANNEL_BY_NAME, channel_is_stated,
+    BLEND_MODES, CHANNEL_BY_NAME, PrincipledSocketView, channel_is_stated,
+    socket_index,
 )
 from .texture import TextureExporter
-
-
-# Principled socket name -> BSDF Stack channel name. Anything absent here (Coat,
-# Sheen, IOR, Transmission) simply has no channel on the stack yet, and the
-# gatherers already handle a missing socket by emitting nothing -- the same
-# branch they take on a Blender too old to expose it.
-_STACK_AS_PRINCIPLED = {
-    "Base Color": "Color",
-    "Metallic": "Metallic",
-    "Roughness": "Roughness",
-    "Normal": "Normal",
-    "Alpha": "Alpha",
-    "Emission Color": "Emission Color",
-    "Emission Strength": "Emission Strength",
-    "Subsurface Weight": "Subsurface Weight",
-    "Subsurface Radius": "Subsurface Radius",
-}
-
-
-class _StackSocketMap:
-    """`.inputs` for _StackLayerAsPrincipled: Principled names in, the layer's
-    own sockets out."""
-
-    __slots__ = ("_node", "_index")
-
-    def __init__(self, node, index):
-        self._node = node
-        self._index = index
-
-    def get(self, name, default=None):
-        channel = _STACK_AS_PRINCIPLED.get(name)
-        if channel is None:
-            return default
-        idx = self._index * N_CH + CH_TO_IDX[channel]
-        if 0 <= idx < len(self._node.inputs):
-            return self._node.inputs[idx]
-        return default
-
-    def __getitem__(self, name):
-        socket = self.get(name)
-        if socket is None:
-            raise KeyError(name)
-        return socket
-
-    def __contains__(self, name):
-        return self.get(name) is not None
 
 
 class _StackLayerAsPrincipled:
@@ -81,7 +36,8 @@ class _StackLayerAsPrincipled:
         self._node = node
         self._index = index
         self.type = "BSDF_PRINCIPLED"
-        self.inputs = _StackSocketMap(node, index)
+        self.inputs = PrincipledSocketView(node, index)
+
 
 if TYPE_CHECKING:
     import bpy
@@ -745,8 +701,11 @@ class MaterialExporter:
             self.extensions_used.add(EXT_EMISSIVE_STRENGTH)
 
         # KHR_materials_clearcoat / KHR_materials_sheen: the Principled BSDF's
-        # Coat and Sheen layers. Only emitted for the standard Principled path
-        # (the BSDFStack path routes its coat/sheen through CUSTOM_materials_layers).
+        # Coat and Sheen layers. Both paths reach here -- for a stack,
+        # `principled` is layer 0 dressed as one, so the base material's coat
+        # and sheen land in the standard extensions and a viewer that ignores
+        # CUSTOM_materials_layers still sees them. Layers 1..N carry their own
+        # coat/sheen inside the layer objects instead (_gather_bsdf_layer).
         if principled is not None:
             clearcoat = self._gather_clearcoat(principled)
             if clearcoat is not None:
@@ -1012,7 +971,7 @@ class MaterialExporter:
         )
 
     def _gather_clearcoat(
-        self, principled: "bpy.types.ShaderNodeBsdfPrincipled"
+        self, principled: "bpy.types.ShaderNodeBsdfPrincipled", stated=None,
     ) -> dict | None:
         """KHR_materials_clearcoat from the Principled BSDF Coat inputs.
 
@@ -1020,114 +979,194 @@ class MaterialExporter:
         Coat Roughness -> clearcoatRoughnessFactor/clearcoatRoughnessTexture (G),
         Coat Normal -> clearcoatNormalTexture. glTF clearcoat has no IOR or tint,
         so Coat IOR / Coat Tint are intentionally dropped.
+
+        `stated` is how an upper BSDF Stack layer asks for only the sockets it
+        actually touched: a `socket_name -> bool` predicate, per the rule in
+        layer_node.constants.channel_is_stated. Pass None -- the base material
+        and every plain Principled -- and every socket counts, because there
+        the socket defaults ARE the material. Pass the predicate and the fields
+        gate one at a time, so a layer can roughen the coat below it without
+        also restating its strength.
         """
+        def says(name):
+            return stated is None or stated(name)
+
         weight_socket = principled.inputs.get("Coat Weight")
         if weight_socket is None:
             return None  # Blender too old to expose a Coat layer
 
-        weight_val = self._get_socket_default(principled, "Coat Weight")
-        weight_val = float(weight_val) if weight_val is not None else 0.0
-
-        weight_node = self._get_connected_image_node(principled, "Coat Weight")
-        rough_node = self._get_connected_image_node(principled, "Coat Roughness")
-        normal_node = self._get_connected_image_node(principled, "Coat Normal")
-
-        # Inactive coat: zero weight, nothing linked -> no extension.
-        if (
-            weight_val == 0.0 and not weight_socket.is_linked
-            and weight_node is None and rough_node is None and normal_node is None
-        ):
-            return None
-
-        ext: dict = {}
-        # A linked socket's default_value is ignored by Blender, so the glTF
-        # factor must stay at 1.0 to avoid scaling the texture down on import.
-        if weight_socket.is_linked:
-            ext["clearcoatFactor"] = 1.0
-        elif weight_val != 0.0:  # spec default is 0.0
-            ext["clearcoatFactor"] = weight_val
+        states_weight = says("Coat Weight")
+        weight_val, weight_tex = self._read_scalar_socket(weight_socket)
+        if weight_val is None:
+            weight_val = 0.0
 
         rough_socket = principled.inputs.get("Coat Roughness")
-        if rough_socket is not None:
-            if rough_socket.is_linked:
-                ext["clearcoatRoughnessFactor"] = 1.0
-            else:
-                rv = self._get_socket_default(principled, "Coat Roughness")
-                if rv is not None and float(rv) != 0.0:
-                    ext["clearcoatRoughnessFactor"] = float(rv)
+        states_rough = says("Coat Roughness") and rough_socket is not None
+        rough_val, rough_tex = (
+            self._read_scalar_socket(rough_socket) if states_rough else (None, None)
+        )
 
-        if weight_node is not None:
-            ti = self.texture_exporter.gather_texture_info(weight_node)
-            if ti is not None:
-                ext["clearcoatTexture"] = ti
-        if rough_node is not None:
-            ti = self.texture_exporter.gather_texture_info(rough_node)
-            if ti is not None:
-                ext["clearcoatRoughnessTexture"] = ti
-        if normal_node is not None:
-            nti = self._gather_normal_for_socket(principled, "Coat Normal")
-            if nti is not None:
-                ext["clearcoatNormalTexture"] = nti
+        normal_ti = (
+            self._gather_normal_for_socket(principled, "Coat Normal")
+            if says("Coat Normal") else None
+        )
+
+        if stated is None:
+            # Base material: an inactive coat (zero weight, nothing wired) is
+            # not a coat, whatever the roughness slider happens to read.
+            if (
+                weight_val == 0.0 and not weight_socket.is_linked
+                and weight_tex is None and rough_tex is None and normal_ti is None
+            ):
+                return None
+
+        ext: dict = {}
+
+        def put(key, value, spec_default):
+            """Write `key` unless it is the base material restating a default.
+
+            A layer either states a value or says nothing at all, so a 0.0 from
+            one means "strip this", not "omit me" -- dropping it would make it
+            unstated and pass the coat below straight through, the exact
+            opposite. The base material can drop a spec default safely, because
+            there the object exists only when the lobe is active at all.
+            """
+            if stated is not None or value != spec_default:
+                ext[key] = value
+
+        if states_weight:
+            put("clearcoatFactor", weight_val, 0.0)
+            if weight_tex is not None:
+                ext["clearcoatTexture"] = weight_tex
+
+        if states_rough and rough_val is not None:
+            put("clearcoatRoughnessFactor", rough_val, 0.0)
+            if rough_tex is not None:
+                ext["clearcoatRoughnessTexture"] = rough_tex
+
+        if normal_ti is not None:
+            ext["clearcoatNormalTexture"] = normal_ti
 
         return ext or None
 
     def _gather_sheen(
-        self, principled: "bpy.types.ShaderNodeBsdfPrincipled"
+        self, principled: "bpy.types.ShaderNodeBsdfPrincipled", stated=None,
     ) -> dict | None:
         """KHR_materials_sheen from the Principled BSDF Sheen inputs.
 
         glTF stores a sheen *color*; Blender splits it into Sheen Weight
         (scalar) x Sheen Tint (color), so sheenColorFactor = tint * weight.
         Sheen Roughness -> sheenRoughnessFactor (texture uses the A channel).
+
+        `stated` gates per field for a BSDF Stack layer; see _gather_clearcoat.
+        Weight and tint are gated together because they fold into one number:
+        a layer that restates only the tint still means "tint x whatever weight
+        I am carrying", which is the weight socket's value either way.
         """
+        def says(name):
+            return stated is None or stated(name)
+
         weight_socket = principled.inputs.get("Sheen Weight")
         if weight_socket is None:
             return None
 
-        weight_val = self._get_socket_default(principled, "Sheen Weight")
-        weight_val = float(weight_val) if weight_val is not None else 0.0
-
+        states_color = says("Sheen Weight") or says("Sheen Tint")
+        # allow_texture=False: glTF has no sheen-weight texture, so resolving an
+        # image here would register one into the file that nothing references.
+        weight_val, _ = self._read_scalar_socket(weight_socket, allow_texture=False)
+        if weight_val is None:
+            weight_val = 0.0
         color_node = self._get_connected_image_node(principled, "Sheen Tint")
-        rough_node = self._get_connected_image_node(principled, "Sheen Roughness")
-
-        if (
-            weight_val == 0.0 and not weight_socket.is_linked
-            and color_node is None and rough_node is None
-        ):
-            return None
-
-        ext: dict = {}
-        # Weight scales the tint into the color factor. A linked weight socket's
-        # default is ignored, so fold a unit weight and let the texture drive it.
-        wscale = 1.0 if weight_socket.is_linked else weight_val
-        tint = self._get_socket_default(principled, "Sheen Tint")
-        if tint is not None and hasattr(tint, "__len__") and len(tint) >= 3:
-            color = [float(tint[0]) * wscale, float(tint[1]) * wscale, float(tint[2]) * wscale]
-        else:
-            # Scalar/!color tint (older Blender) or none: greyscale by weight.
-            color = [wscale, wscale, wscale]
-        if color != [0.0, 0.0, 0.0]:  # spec default is [0,0,0]
-            ext["sheenColorFactor"] = color
+        color_tex = (
+            self.texture_exporter.gather_texture_info(color_node)
+            if color_node is not None else None
+        )
 
         rough_socket = principled.inputs.get("Sheen Roughness")
-        if rough_socket is not None:
-            if rough_socket.is_linked:
-                ext["sheenRoughnessFactor"] = 1.0
-            else:
-                rv = self._get_socket_default(principled, "Sheen Roughness")
-                if rv is not None and float(rv) != 0.0:
-                    ext["sheenRoughnessFactor"] = float(rv)
+        states_rough = says("Sheen Roughness") and rough_socket is not None
+        rough_val, rough_tex = (
+            self._read_scalar_socket(rough_socket) if states_rough else (None, None)
+        )
 
-        if color_node is not None:
-            ti = self.texture_exporter.gather_texture_info(color_node)
-            if ti is not None:
-                ext["sheenColorTexture"] = ti
-        if rough_node is not None:
-            ti = self.texture_exporter.gather_texture_info(rough_node)
-            if ti is not None:
-                ext["sheenRoughnessTexture"] = ti
+        if stated is None:
+            if (
+                weight_val == 0.0 and not weight_socket.is_linked
+                and color_tex is None and rough_tex is None
+            ):
+                return None
+
+        ext: dict = {}
+
+        def put(key, value, spec_default):
+            """See the twin in _gather_clearcoat: a layer's default is a
+            statement, the base material's is a default."""
+            if stated is not None or value != spec_default:
+                ext[key] = value
+
+        if states_color:
+            # Weight scales the tint into the color factor.
+            tint = self._get_socket_default(principled, "Sheen Tint")
+            if tint is not None and hasattr(tint, "__len__") and len(tint) >= 3:
+                color = [
+                    float(tint[0]) * weight_val,
+                    float(tint[1]) * weight_val,
+                    float(tint[2]) * weight_val,
+                ]
+            else:
+                # Scalar/!color tint (older Blender) or none: greyscale by weight.
+                color = [weight_val, weight_val, weight_val]
+            put("sheenColorFactor", color, [0.0, 0.0, 0.0])
+            if color_tex is not None:
+                ext["sheenColorTexture"] = color_tex
+
+        if states_rough and rough_val is not None:
+            put("sheenRoughnessFactor", rough_val, 0.0)
+            if rough_tex is not None:
+                ext["sheenRoughnessTexture"] = rough_tex
 
         return ext or None
+
+    def _read_scalar_socket(self, socket, allow_texture=True):
+        """Resolve a scalar socket to (factor, TextureInfo) -- the float twin of
+        _read_color_socket, and it follows the same three cases.
+
+        `allow_texture=False` is for a socket glTF has no texture slot for
+        (Sheen Weight): resolving an image there would register it into the
+        file with nothing referencing it. A linked socket still reads as 1.0,
+        which is what it means -- Blender ignores a linked socket's default.
+
+        An Image Texture upstream wins and the factor stays at 1.0, because
+        glTF multiplies factor x texture and Blender ignores a linked socket's
+        own default. A Value node upstream is read for its number: without that
+        a linked-but-constant socket exported as 1.0, which is not merely
+        imprecise for a coat weight -- it is the one value that means "fully
+        coated", and it is what a layer wiring a constant 0.0 to strip the coat
+        beneath it would have got. Unlinked, the socket's default is the answer.
+        """
+        if socket is None:
+            return None, None
+
+        image_node = self._walk_to_image(socket) if allow_texture else None
+        if image_node is not None:
+            return 1.0, self.texture_exporter.gather_texture_info(image_node)
+
+        if socket.is_linked:
+            from_node = socket.links[0].from_node
+            if getattr(from_node, "type", None) == "VALUE":
+                v = getattr(socket.links[0].from_socket, "default_value", None)
+                if v is not None:
+                    try:
+                        return float(v), None
+                    except (TypeError, ValueError):
+                        pass
+            # Some other shader upstream: no number to read, so leave the glTF
+            # factor at 1.0 and let whatever texture-less thing it is be lost.
+            return 1.0, None
+
+        try:
+            return float(socket.default_value), None
+        except (TypeError, ValueError):
+            return None, None
 
     def _gather_normal_for_socket(
         self, node: "bpy.types.ShaderNode", socket_name: str
@@ -1343,7 +1382,7 @@ class MaterialExporter:
 
     def _layer_socket(self, node, layer_index, channel_name):
         """Look up a BSDFStackNode input socket by (layer, channel name)."""
-        idx = layer_index * N_CH + CH_TO_IDX[channel_name]
+        idx = socket_index(layer_index, channel_name)
         if 0 <= idx < len(node.inputs):
             return node.inputs[idx]
         return None
@@ -1661,6 +1700,21 @@ class MaterialExporter:
         subsurface = self._layer_subsurface(node, i)
         if subsurface is not None:
             layer["subsurface"] = subsurface
+
+        # Coat and Sheen through the very gatherers the base material uses, with
+        # a predicate saying which sockets this layer actually touched. Same
+        # field names as KHR_materials_clearcoat / KHR_materials_sheen, because
+        # a layer's coat is the same thing as the material's coat, just masked.
+        def layer_states(socket_name):
+            return self._layer_states(node, i, socket_name)
+
+        layer_bsdf = self._layer_as_principled(node, i)
+        clearcoat = self._gather_clearcoat(layer_bsdf, layer_states)
+        if clearcoat is not None:
+            layer["clearcoat"] = clearcoat
+        sheen = self._gather_sheen(layer_bsdf, layer_states)
+        if sheen is not None:
+            layer["sheen"] = sheen
 
         # Mask (optional): omit for a full-opacity unmasked layer.
         mask = self._gather_layer_mask(self._layer_socket(node, i, "Mask"))

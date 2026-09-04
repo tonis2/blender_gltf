@@ -57,13 +57,56 @@ classes = (
 )
 
 
+def _shader_trees():
+    """Every shader node tree a BSDFStackNode can live in."""
+    for mat in bpy.data.materials:
+        if mat.node_tree is not None:
+            yield mat.node_tree
+    for world in bpy.data.worlds:
+        if world.node_tree is not None:
+            yield world.node_tree
+    for group in bpy.data.node_groups:
+        yield group
+
+
+@bpy.app.handlers.persistent
+def _migrate_stack_nodes(_dummy=None):
+    """Bring every BSDFStackNode in the freshly loaded file up to the current
+    channel table.
+
+    Sockets are addressed by ``layer_index * N_CH + channel_index`` in this
+    node, in the glTF exporter and in the importer, so a file saved before a
+    channel was added addresses them all one channel short: layer 1's Color
+    read as layer 0's Coat Weight, and so on, silently. ensure_layout() is a
+    no-op for an up-to-date node, so this costs one length comparison per node
+    in the common case.
+    """
+    for tree in _shader_trees():
+        try:
+            nodes = list(tree.nodes)
+        except Exception:
+            continue
+        for node in nodes:
+            if getattr(node, "bl_idname", "") != BSDFStackNode.bl_idname:
+                continue
+            try:
+                node.ensure_layout()
+            except Exception:
+                pass
+
+
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.NODE_MT_add.append(stack_menu_draw)
+    if _migrate_stack_nodes not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_migrate_stack_nodes)
 
 
 def unregister():
+    if _migrate_stack_nodes in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_migrate_stack_nodes)
+
     # Drop any queued deferred rebuilds and their flush timer so a stale
     # timer can't fire after the addon is disabled/reloaded.
     if bpy.app.timers.is_registered(bsdf_node._flush_pending_rebuilds):

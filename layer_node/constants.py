@@ -14,7 +14,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-# constants.py — Blend modes and the per-layer channel table
+# constants.py — Blend modes, the per-layer channel table, and the socket
+# addressing every reader of a BSDFStackNode shares.
 #
 # This module is intentionally bpy-free: the glTF export/import material
 # modules import the channel table from here without a Blender runtime.
@@ -51,11 +52,29 @@ CHANNELS = [
     ("Emission Strength", "NodeSocketFloat",  0.0,                  "Emission Strength", "FLOAT",  False),
     ("Subsurface Weight", "NodeSocketFloat",  0.0,                  "Subsurface Weight", "FLOAT",  False),
     ("Subsurface Radius", "NodeSocketVector", (1.0, 0.2, 0.1),      "Subsurface Radius", "VECTOR", False),
+    # Coat and Sheen mirror the Principled sockets of the same names, including
+    # their defaults (Coat Roughness 0.03, Sheen Roughness 0.5), so a layer that
+    # has not been touched reads as untouched by channel_is_stated below.
+    # Coat IOR and Coat Tint are deliberately absent: glTF's clearcoat has no
+    # slot for either, so a socket for them would only promise what no exported
+    # file can carry.
+    ("Coat Weight",       "NodeSocketFloat",  0.0,                  "Coat Weight",       "FLOAT",  False),
+    ("Coat Roughness",    "NodeSocketFloat",  0.03,                 "Coat Roughness",    "FLOAT",  False),
+    ("Coat Normal",       "NodeSocketVector", (0.0, 0.0, 1.0),      "Coat Normal",       "VECTOR", True),
+    ("Sheen Weight",      "NodeSocketFloat",  0.0,                  "Sheen Weight",      "FLOAT",  False),
+    ("Sheen Tint",        "NodeSocketColor",  (1.0, 1.0, 1.0, 1.0), "Sheen Tint",        "RGBA",   False),
+    ("Sheen Roughness",   "NodeSocketFloat",  0.5,                  "Sheen Roughness",   "FLOAT",  False),
 ]
 
 N_CH = len(CHANNELS)
 CH_TO_IDX = {c[0]: i for i, c in enumerate(CHANNELS)}
 CHANNEL_BY_NAME = {c[0]: c for c in CHANNELS}
+
+# Channels holding a tangent-space normal. They are the exceptions in the mix
+# chain: an unstated base layer starts from the true geometry normal rather than
+# from a socket default, and the blended result is renormalized before it
+# reaches the BSDF instead of being wired straight in.
+NORMAL_CHANNELS = ("Normal", "Coat Normal")
 
 
 def channel_is_stated(socket, default):
@@ -104,4 +123,99 @@ SUBSECTIONS = [
     ("PBR",        ["Roughness", "Metallic", "Alpha"]),
     ("Emission",   ["Emission Color", "Emission Strength"]),
     ("Subsurface", ["Subsurface Weight", "Subsurface Radius"]),
+    ("Coat",       ["Coat Weight", "Coat Roughness", "Coat Normal"]),
+    ("Sheen",      ["Sheen Weight", "Sheen Tint", "Sheen Roughness"]),
 ]
+
+# The two tables above are one table seen twice, and nothing enforces that at
+# the point of edit: CHANNELS fixes the socket INDEX a channel is addressed by
+# (CH_TO_IDX, and layer_index * N_CH + index everywhere else), while SUBSECTIONS
+# fixes the order the sockets are actually CREATED in. Let them disagree and
+# every lookup silently reads the neighbouring channel -- a roughness that comes
+# back as a metalness, with nothing raising. Catch it at import instead.
+_SUBSECTION_ORDER = [name for _panel, names in SUBSECTIONS for name in names]
+if _SUBSECTION_ORDER != [c[0] for c in CHANNELS]:
+    raise RuntimeError(
+        "CHANNELS and SUBSECTIONS disagree; socket indices would be wrong.\n"
+        f"  CHANNELS:    {[c[0] for c in CHANNELS]}\n"
+        f"  SUBSECTIONS: {_SUBSECTION_ORDER}"
+    )
+
+
+# Principled BSDF socket name -> BSDF Stack channel name.
+#
+# One layer of a stack IS a Principled material, so the glTF exporter reads a
+# layer through the same _gather_* functions a plain Principled goes through and
+# the importer writes one through the same _apply_* functions. Both need this
+# map, and it lives here rather than in either of them because a channel added
+# on one side and forgotten on the other is exactly the silent drop the two
+# halves keep being rebuilt to avoid.
+#
+# Absent names (IOR, Transmission, Coat IOR/Tint) have no channel on the stack.
+# A socket view returns None for them, which every gatherer already reads as
+# "this Blender has no such socket" and handles by emitting nothing.
+STACK_AS_PRINCIPLED = {
+    "Base Color": "Color",
+    "Metallic": "Metallic",
+    "Roughness": "Roughness",
+    "Normal": "Normal",
+    "Alpha": "Alpha",
+    "Emission Color": "Emission Color",
+    "Emission Strength": "Emission Strength",
+    "Subsurface Weight": "Subsurface Weight",
+    "Subsurface Radius": "Subsurface Radius",
+    # Coat and Sheen carry the same name on both sides; listed anyway, because
+    # an absent key means "no such socket".
+    "Coat Weight": "Coat Weight",
+    "Coat Roughness": "Coat Roughness",
+    "Coat Normal": "Coat Normal",
+    "Sheen Weight": "Sheen Weight",
+    "Sheen Tint": "Sheen Tint",
+    "Sheen Roughness": "Sheen Roughness",
+}
+
+
+def socket_index(layer_index, channel_name):
+    """Index of a (layer, channel) socket in a BSDFStackNode's flat input list.
+
+    Sockets are laid out layer by layer, N_CH of them each, in CHANNELS order.
+    The formula is written once here because every place that gets it wrong
+    fails the same silent way: a valid socket of the wrong channel, read as if
+    it were the right one.
+    """
+    return layer_index * N_CH + CH_TO_IDX[channel_name]
+
+
+class PrincipledSocketView:
+    """A BSDF Stack layer's sockets, addressed by Principled BSDF socket name.
+
+    Enough of a `node.inputs` to satisfy the glTF material code, which reaches
+    a shader node only through `.get`, `[]` and `in`. Wrapping a layer in one
+    lets a stack travel the exact code path a plain Principled travels -- the
+    point being that a one-layer stack is not *like* a plain material, it is
+    one, and has to export and import as one.
+    """
+
+    __slots__ = ("_node", "_index")
+
+    def __init__(self, node, index):
+        self._node = node
+        self._index = index
+
+    def get(self, name, default=None):
+        channel = STACK_AS_PRINCIPLED.get(name)
+        if channel is None:
+            return default
+        idx = socket_index(self._index, channel)
+        if 0 <= idx < len(self._node.inputs):
+            return self._node.inputs[idx]
+        return default
+
+    def __getitem__(self, name):
+        socket = self.get(name)
+        if socket is None:
+            raise KeyError(name)
+        return socket
+
+    def __contains__(self, name):
+        return self.get(name) is not None

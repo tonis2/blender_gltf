@@ -20,7 +20,8 @@ from bpy.props import CollectionProperty
 from bpy.types import ShaderNodeCustomGroup
 
 from .constants import (
-    CHANNELS, N_CH, CH_TO_IDX, CHANNEL_BY_NAME, SUBSECTIONS, channel_is_stated,
+    CHANNELS, N_CH, CH_TO_IDX, CHANNEL_BY_NAME, SUBSECTIONS, NORMAL_CHANNELS,
+    channel_is_stated,
 )
 from .properties import StackLayerProperties
 from .utils import get_node_id
@@ -145,15 +146,15 @@ class BSDFStackNode(ShaderNodeCustomGroup):
         """Schedule a rebuild when external Normal links change.
 
         Blender calls update() whenever the containing tree's links change.
-        The Normal channel wires its mix-chain based on each layer's
-        Normal-socket ``is_linked`` state at build time (an unlinked layer
-        falls back to the geometry normal). Because connecting a normal map
-        does not otherwise trigger a rebuild, the map would be ignored until
-        the next add/remove/move-layer. We detect a change in the set of
-        linked Normal sockets here, guarded by an ID-property so the very
-        frequent update() calls don't queue redundant rebuilds. Other channels
-        wire their group input through unconditionally, so they already react
-        live and need no rebuild.
+        The normal-like channels wire their mix-chain based on each layer's
+        socket ``is_linked`` state at build time (an unlinked layer falls back
+        to the geometry normal). Because connecting a normal map does not
+        otherwise trigger a rebuild, the map would be ignored until the next
+        add/remove/move-layer. We detect a change in the set of linked normal
+        sockets here, guarded by an ID-property so the very frequent update()
+        calls don't queue redundant rebuilds. Other channels wire their group
+        input through unconditionally, so they already react live and need no
+        rebuild.
 
         IMPORTANT: this method must NOT modify the node tree directly.
         update() can fire during depsgraph evaluation / material-preview shader
@@ -163,13 +164,22 @@ class BSDFStackNode(ShaderNodeCustomGroup):
         """
         if not self.node_tree:
             return
+        # A tree saved before a channel was added still has the old number of
+        # sockets per layer, so every _socket_for() below would read the wrong
+        # one. Relayout first; the queued rebuild does it (see ensure_layout).
+        if len(self.inputs) != len(self.layers) * N_CH:
+            _request_rebuild(self)
+            return
         try:
-            normal_ci = CH_TO_IDX["Normal"]
             mask = 0
-            for i in range(len(self.layers)):
-                sock = self._socket_for(i, normal_ci)
-                if sock is not None and sock.is_linked:
-                    mask |= (1 << i)
+            bit = 0
+            for ch_name in NORMAL_CHANNELS:
+                ci = CH_TO_IDX[ch_name]
+                for i in range(len(self.layers)):
+                    sock = self._socket_for(i, ci)
+                    if sock is not None and sock.is_linked:
+                        mask |= (1 << bit)
+                    bit += 1
         except Exception:
             return
         if self.get("_normal_link_mask", -1) != mask:
@@ -194,6 +204,32 @@ class BSDFStackNode(ShaderNodeCustomGroup):
             return g_in.outputs[idx]
         return None
 
+    def ensure_layout(self):
+        """Bring the socket interface in line with the current CHANNELS table.
+
+        A .blend saved before a channel existed still holds the old number of
+        sockets per layer, and every lookup in this node, the exporter and the
+        importer addresses a socket as ``layer_index * N_CH + channel_index``.
+        Until the interface is rebuilt those indices land on the wrong sockets:
+        a roughness read as a metalness, a mask read as an alpha, and nothing
+        raising anywhere. So this runs before anything reads them -- from the
+        load_post handler in this package's __init__, and defensively from
+        rebuild_internals() and update().
+
+        The rebuild is lossless: _snapshot_state keys saved defaults and links
+        by channel NAME, so existing wiring lands back on the same channels and
+        the new ones come up at their defaults, which channel_is_stated then
+        reads as "this layer has no opinion".
+
+        Returns True if a rebuild was needed.
+        """
+        if self.node_tree is None:
+            return False
+        if len(self.inputs) == len(self.layers) * N_CH:
+            return False
+        self.rebuild_group(old_to_new=None)
+        return True
+
     def add_layer_to_group(self):
         """Add sockets for a new layer.
 
@@ -214,20 +250,42 @@ class BSDFStackNode(ShaderNodeCustomGroup):
         """
         parent_tree = self.id_data
 
-        # Determine old layer count from existing input socket count (N_CH
-        # sockets per layer). This avoids depending on panel structure.
-        old_layer_count = len(self.inputs) // N_CH
+        old_layer_count, old_stride = self._old_socket_layout()
 
         saved_sockets, old_layer_closed, old_subpanel_closed = \
-            self._snapshot_state(parent_tree, old_layer_count)
+            self._snapshot_state(parent_tree, old_layer_count, old_stride)
         new_to_old = self._resolve_layer_mapping(old_to_new, old_layer_count)
         self._clear_interface()
         self._rebuild_panels(new_to_old, old_layer_closed, old_subpanel_closed)
         self._restore_state(parent_tree, new_to_old, saved_sockets)
 
-        self.rebuild_internals()
+        # Layout is correct now, so the relayout guard in rebuild_internals()
+        # must not fire again -- it would recurse straight back into here.
+        self.rebuild_internals(_allow_relayout=False)
 
-    def _snapshot_state(self, parent_tree, old_layer_count):
+    def _old_socket_layout(self):
+        """(layer count, sockets per layer) of the interface as it stands now.
+
+        Read from the interface's own panel structure rather than assumed to be
+        N_CH: one top-level panel is one layer, so a node saved by a build with
+        fewer channels reports ITS stride, not today's. That is the difference
+        between growing CHANNELS being a migration and being a corruption --
+        snapshotting a 10-socket-per-layer node at a stride of 16 walks straight
+        off the end of layer 0 and files layer 1's sockets under layer 0's name.
+        """
+        n_inputs = len(self.inputs)
+        panels = [
+            it for it in self.node_tree.interface.items_tree
+            if _is_top_level_panel(it)
+        ]
+        count = len(panels)
+        if count <= 0 or n_inputs % count:
+            # Fresh node, or a layout we can't read: assume the current stride
+            # and let the rebuild lay the interface out from scratch.
+            return n_inputs // N_CH, N_CH
+        return count, n_inputs // count
+
+    def _snapshot_state(self, parent_tree, old_layer_count, old_stride=None):
         """Snapshot socket defaults/links and panel collapse states.
 
         Returns (saved_sockets, old_layer_closed, old_subpanel_closed) where
@@ -243,10 +301,13 @@ class BSDFStackNode(ShaderNodeCustomGroup):
                 if link.to_node == self:
                     link_from_by_socket[link.to_socket.as_pointer()] = link.from_socket
 
+        if old_stride is None:
+            old_stride = N_CH
+
         saved_sockets = {}
         for li in range(old_layer_count):
-            for offset in range(N_CH):
-                idx = li * N_CH + offset
+            for offset in range(old_stride):
+                idx = li * old_stride + offset
                 if idx >= len(self.inputs):
                     continue
                 inp = self.inputs[idx]
@@ -406,9 +467,17 @@ class BSDFStackNode(ShaderNodeCustomGroup):
     # Internal chain
     # ------------------------------------------------------------------
 
-    def rebuild_internals(self):
+    def rebuild_internals(self, _allow_relayout=True):
         """Rebuild the internal per-channel mix chains and Principled BSDF."""
         nt = self.node_tree
+        if nt is None:
+            return
+        # Interface saved by a build with a different channel count: fix the
+        # sockets first, or every _socket_for() below reads the wrong one.
+        # rebuild_group() ends by calling back here with the layout correct.
+        if _allow_relayout and len(self.inputs) != len(self.layers) * N_CH:
+            self.rebuild_group(old_to_new=None)
+            return
 
         g_in = None
         g_out = None
@@ -445,7 +514,6 @@ class BSDFStackNode(ShaderNodeCustomGroup):
             return geometry
 
         mask_ci = CH_TO_IDX["Mask"]
-        normal_ci = CH_TO_IDX["Normal"]
         channel_outputs = {}
 
         for ch_idx, (ch_name, _sock_type, _default, _bsdf, mix_type, _hv) in enumerate(CHANNELS):
@@ -520,7 +588,7 @@ class BSDFStackNode(ShaderNodeCustomGroup):
                     nt.links.new(channel_out, mix.inputs[b_idx])
                 elif prev_output is not None:
                     nt.links.new(prev_output, mix.inputs[b_idx])
-                elif ch_name == "Normal":
+                elif ch_name in NORMAL_CHANNELS:
                     # Base layer, no map → start from the true surface normal.
                     nt.links.new(
                         _get_geometry().outputs["Normal"],
@@ -535,24 +603,36 @@ class BSDFStackNode(ShaderNodeCustomGroup):
             channel_outputs[ch_name] = prev_output
 
         for ch_name, _sock_type, _default, bsdf_name, _mix, _hv in CHANNELS:
-            if bsdf_name is None or ch_name == "Normal":
+            if bsdf_name is None or ch_name in NORMAL_CHANNELS:
                 continue
             out = channel_outputs.get(ch_name)
             if out is not None and bsdf_name in bsdf.inputs:
                 nt.links.new(out, bsdf.inputs[bsdf_name])
 
-        any_normal_linked = any(
-            self._socket_for(i, normal_ci) is not None
-            and self._socket_for(i, normal_ci).is_linked
-            for i in range(len(self.layers))
-        )
-        if any_normal_linked and channel_outputs.get("Normal") is not None:
+        # Normal and Coat Normal take the same two exceptions. They reach the
+        # BSDF only through a Normalize, because mixing two unit vectors
+        # componentwise shortens the result; and only when some layer actually
+        # supplies one, because an unconnected BSDF normal socket means "the
+        # shading normal" and that is exactly what an all-default stack wants.
+        for ch_name in NORMAL_CHANNELS:
+            ci = CH_TO_IDX.get(ch_name)
+            out = channel_outputs.get(ch_name)
+            bsdf_name = CHANNEL_BY_NAME[ch_name][3]
+            if ci is None or out is None or bsdf_name not in bsdf.inputs:
+                continue
+            linked = False
+            for i in range(len(self.layers)):
+                sock = self._socket_for(i, ci)
+                if sock is not None and sock.is_linked:
+                    linked = True
+                    break
+            if not linked:
+                continue
             normalize = nt.nodes.new('ShaderNodeVectorMath')
             normalize.operation = 'NORMALIZE'
-            normalize.location = (150, -normal_ci * 200)
-            nt.links.new(channel_outputs["Normal"], normalize.inputs[0])
-            if "Normal" in bsdf.inputs:
-                nt.links.new(normalize.outputs[0], bsdf.inputs["Normal"])
+            normalize.location = (150, -ci * 200)
+            nt.links.new(out, normalize.inputs[0])
+            nt.links.new(normalize.outputs[0], bsdf.inputs[bsdf_name])
 
         nt.links.new(bsdf.outputs["BSDF"], g_out.inputs[0])
         nt.update_tag()

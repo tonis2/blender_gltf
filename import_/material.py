@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ..gltf.constants import TextureFilter, TextureWrap
-from ..layer_node.constants import N_CH, CH_TO_IDX, BLEND_MODES
+from ..layer_node.constants import BLEND_MODES, PrincipledSocketView, socket_index
 
 if TYPE_CHECKING:
     import bpy
@@ -18,6 +18,26 @@ BSDF_STACK_NODE_IDNAME = "BSDFStackNodeType"
 
 # Valid CUSTOM_materials_layers blend mode ids, derived from the shared table.
 _VALID_BLEND_MODES = {m[0] for m in BLEND_MODES}
+
+
+class _StackLayerTarget:
+    """One BSDF Stack layer, writable as though it were a Principled BSDF.
+
+    Mirror of the exporter's _StackLayerAsPrincipled, for the same reason:
+    _apply_clearcoat / _apply_sheen already know how to turn the glTF
+    extensions into Blender's Coat and Sheen inputs, and a layer's coat is a
+    material's coat with a mask on it. One writer, so there is no twin to
+    drift out of step the way the export-side twins did.
+
+    `location` stands in for the node's, since the texture-node placement
+    helpers position themselves relative to whatever they are feeding.
+    """
+
+    __slots__ = ("inputs", "location")
+
+    def __init__(self, node, index):
+        self.inputs = PrincipledSocketView(node, index)
+        self.location = node.location
 
 
 class MaterialImporter:
@@ -374,13 +394,22 @@ class MaterialImporter:
         tree.links.new(bump.outputs["Normal"], principled.inputs["Normal"])
 
     def _apply_clearcoat(self, tree, principled, extensions: dict) -> None:
-        """KHR_materials_clearcoat -> Principled Coat. Inverse of the exporter:
+        """KHR_materials_clearcoat off a material's extensions -> Coat inputs."""
+        self._apply_clearcoat_dict(
+            tree, principled, extensions.get("KHR_materials_clearcoat"),
+        )
+
+    def _apply_clearcoat_dict(self, tree, principled, cc) -> None:
+        """A clearcoat object -> Principled Coat. Inverse of the exporter:
         clearcoatFactor -> Coat Weight, clearcoatRoughnessFactor -> Coat
         Roughness, with textures wired through their glTF channels (clearcoat in
         R, clearcoat-roughness in G) honoring the scalar factors. glTF clearcoat
         has no IOR/tint, so those Blender inputs keep their defaults.
+
+        Takes the object rather than the extensions dict because it serves two
+        callers: a material's KHR_materials_clearcoat, and the identically
+        shaped `clearcoat` on a CUSTOM_materials_layers layer.
         """
-        cc = extensions.get("KHR_materials_clearcoat")
         if not cc or "Coat Weight" not in principled.inputs:
             return
         factor = cc.get("clearcoatFactor")
@@ -426,14 +455,22 @@ class MaterialImporter:
                 tree.links.new(nm.outputs["Normal"], principled.inputs["Coat Normal"])
 
     def _apply_sheen(self, tree, principled, extensions: dict) -> None:
-        """KHR_materials_sheen -> Principled Sheen. glTF stores a single sheen
+        """KHR_materials_sheen off a material's extensions -> Sheen inputs."""
+        self._apply_sheen_dict(
+            tree, principled, extensions.get("KHR_materials_sheen"),
+        )
+
+    def _apply_sheen_dict(self, tree, principled, sh) -> None:
+        """A sheen object -> Principled Sheen. glTF stores a single sheen
         *color*; Blender splits it into Sheen Weight (scalar) x Sheen Tint
         (color), so the brightest channel is recovered as the weight and the
         normalized color as the tint (mirrors the exporter's tint*weight fold).
         sheenRoughnessFactor -> Sheen Roughness; the roughness texture's value
         lives in its Alpha channel per the glTF spec.
+
+        Takes the object rather than the extensions dict: see
+        _apply_clearcoat_dict.
         """
-        sh = extensions.get("KHR_materials_sheen")
         if not sh or "Sheen Weight" not in principled.inputs:
             return
         color = sh.get("sheenColorFactor")
@@ -550,9 +587,28 @@ class MaterialImporter:
             ld["normalTexture"] = nt
         if gltf_mat.emissive_factor:
             ld["emissiveFactor"] = list(gltf_mat.emissive_factor)
+            # The base material's emission can exceed 1, and the part above 1
+            # rides in KHR_materials_emissive_strength. The Principled path has
+            # always folded it back in; this path dropped it, so a stack whose
+            # base glowed at strength 8 came back at 1 and the material looked
+            # dead in the viewport. Layers have no such extension (the exporter
+            # premultiplies strength into their factor), so they default to 1.0.
+            ld["emissiveStrength"] = self._emissive_strength_mult(gltf_mat)
         et = self._ti_to_dict(gltf_mat.emissive_texture)
         if et is not None:
             ld["emissiveTexture"] = et
+
+        # Coat and sheen: the base material carries them in the standard KHR
+        # extensions, an upper layer in identically shaped objects of its own.
+        # Same key names here so _populate_stack_layer treats layer 0 like any
+        # other layer.
+        exts = gltf_mat.extensions or {}
+        cc = exts.get("KHR_materials_clearcoat")
+        if cc:
+            ld["clearcoat"] = cc
+        sh = exts.get("KHR_materials_sheen")
+        if sh:
+            ld["sheen"] = sh
         return ld
 
     @staticmethod
@@ -605,7 +661,7 @@ class MaterialImporter:
         return d
 
     def _stack_socket(self, node, i, channel_name):
-        idx = i * N_CH + CH_TO_IDX[channel_name]
+        idx = socket_index(i, channel_name)
         if 0 <= idx < len(node.inputs):
             return node.inputs[idx]
         return None
@@ -646,8 +702,11 @@ class MaterialImporter:
         )
 
         # Layer emission: the exporter bakes full intensity into emissiveFactor
-        # (no per-layer KHR_materials_emissive_strength), so split with mult=1.
-        split = self._split_emissive(layer.get("emissiveFactor"))
+        # for layers 1..N, so their multiplier is 1. Layer 0 carries the base
+        # material's KHR_materials_emissive_strength here (see _base_layer_dict).
+        split = self._split_emissive(
+            layer.get("emissiveFactor"), float(layer.get("emissiveStrength", 1.0)),
+        )
         if split is not None:
             color, strength = split
             ec = self._stack_socket(node, i, "Emission Color")
@@ -669,6 +728,12 @@ class MaterialImporter:
             r = self._stack_socket(node, i, "Subsurface Radius")
             if r is not None and radius and len(radius) >= 3:
                 r.default_value = (radius[0], radius[1], radius[2])
+
+        # Coat and sheen through the same appliers the Principled path uses,
+        # writing into this layer's sockets instead of a Principled node's.
+        target = _StackLayerTarget(node, i)
+        self._apply_clearcoat_dict(tree, target, layer.get("clearcoat"))
+        self._apply_sheen_dict(tree, target, layer.get("sheen"))
 
         if not is_base:
             self._link_stack_mask(

@@ -59,12 +59,14 @@ The base material is layer 0 conceptually — the first entry in `layers` is lay
 | `emissiveFactor` | array of 3 numbers | No | Per-layer emissive color × strength (default `[0,0,0]`) |
 | `emissiveTexture` | textureInfo | No | Per-layer emissive map |
 | `subsurface` | object | No | Per-layer subsurface — `{ "weight": number (default 0), "radius": [r,g,b] (default [1,0.2,0.1]) }` |
+| `clearcoat` | object | No | Per-layer clearcoat, same shape as [`KHR_materials_clearcoat`](#clearcoat--sheen) |
+| `sheen` | object | No | Per-layer sheen, same shape as [`KHR_materials_sheen`](#clearcoat--sheen) |
 | `mask` | object | No | Where this layer is visible. If omitted, the layer is fully visible (mask = `1.0` everywhere) |
 | `blendMode` | string | No | How to blend with the layer below. Default `"MIX"` |
 | `opacity` | number | No | Scalar layer opacity in `[0,1]`, multiplied into the mask (default `1.0`) |
 | `enabled` | boolean | No | If `false`, the layer is skipped entirely (default `true`) |
 
-A layer with no `pbrMetallicRoughness`, `normalTexture`, or `emissiveFactor` and a full mask is a no-op.
+A layer with no `pbrMetallicRoughness`, `normalTexture`, `emissiveFactor`, `clearcoat` or `sheen` and a full mask is a no-op.
 
 #### pbrMetallicRoughness
 
@@ -94,6 +96,45 @@ default, so a dirt layer stating `roughnessFactor` alone arrives *fully metallic
 Writers MUST emit both whenever they emit either.
 
 `KHR_texture_transform` is supported on each `textureInfo` and is the recommended way to encode per-layer UV tiling (e.g., gravel tiles 4× while grass tiles 1×).
+
+### clearcoat & sheen
+
+A layer's `clearcoat` and `sheen` objects take the field names and meanings of
+[`KHR_materials_clearcoat`](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_clearcoat)
+and [`KHR_materials_sheen`](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_sheen)
+unchanged — a layer's coat is the material's coat with a mask on it, so it is
+described the same way.
+
+| `clearcoat` property | Type | Description |
+|----------------------|------|-------------|
+| `clearcoatFactor` | number | Coat strength |
+| `clearcoatTexture` | textureInfo | Coat strength map (R) |
+| `clearcoatRoughnessFactor` | number | Coat roughness |
+| `clearcoatRoughnessTexture` | textureInfo | Coat roughness map (G) |
+| `clearcoatNormalTexture` | normalTextureInfo | Coat normal map |
+
+| `sheen` property | Type | Description |
+|------------------|------|-------------|
+| `sheenColorFactor` | array of 3 numbers | Sheen color |
+| `sheenColorTexture` | textureInfo | Sheen color map |
+| `sheenRoughnessFactor` | number | Sheen roughness |
+| `sheenRoughnessTexture` | textureInfo | Sheen roughness map (A) |
+
+**The base material's coat and sheen are not here.** They live in the material's
+own `KHR_materials_clearcoat` / `KHR_materials_sheen`, like every other layer-0
+value that core glTF or a Khronos extension can already hold — so a viewer that
+ignores this extension still renders the base coat correctly. `layers[i]`
+carries only the coat of layer *i+1*.
+
+**A default is not a statement, here too.** Absent fields are unstated: whatever
+the layers below arrived with passes through. Present fields blend by the mask
+exactly as the pbr fields do. The consequence worth stating: a layer that means
+*remove* the coat — mud over a lacquered surface — MUST write
+`"clearcoatFactor": 0`, not omit it. Omitting it says "I have no opinion about
+the coat" and lets the coat underneath through untouched, which is the opposite.
+(In Blender, wire a Value node of `0.0` into the layer's Coat Weight: a socket
+left at its `0.0` default reads as untouched, a linked one always reads as
+stated. Same for Sheen Weight.)
 
 ### height & bump
 
@@ -254,7 +295,8 @@ for (int i = 0; i < u_layerCount; ++i) {
     roughness      = mix(roughness, lr, m);
     normal         = blendNormalsRNM(normal, ln, m);
     emissive       = mix(emissive, le, m);
-    // subsurface weight/radius blend the same way when supported.
+    // subsurface, clearcoat and sheen blend the same way when supported.
+    // Only fields the layer actually carries blend; absent ones pass through.
 }
 ```
 
@@ -300,7 +342,9 @@ For `t = 0` you get `n1`; for `t = 1` you get `n2`. Cheap fallback if you don't 
 |-----------|-----------------|
 | `KHR_texture_transform` | Supported per-textureInfo inside layer textures and inside `mask.texture`. Use it for per-layer tiling |
 | `KHR_materials_unlit` | If the base material is unlit, layers are blended into the unlit color. No lighting either way |
-| `KHR_materials_emissive_strength` | Per-layer emission is in scope via `emissiveFactor` (color × strength is pre-multiplied into the factor). The base material's emission still uses the standard material fields |
+| `KHR_materials_emissive_strength` | Per-layer emission is in scope via `emissiveFactor` (color × strength is pre-multiplied into the factor, so a layer factor MAY exceed 1). The base material's emission still uses the standard material fields, including this extension |
+| `KHR_materials_clearcoat` | Carries the *base* material's coat. Layers 1..N carry theirs in their own `clearcoat` object |
+| `KHR_materials_sheen` | Carries the *base* material's sheen. Layers 1..N carry theirs in their own `sheen` object |
 
 ### Fallback behavior
 
@@ -308,7 +352,9 @@ A viewer that does not implement this extension will render the base material co
 
 ## Authoring (Blender)
 
-This addon ships a single custom shader node called **`BSDF Stack`** (`Add → Custom → BSDF Stack` in the Shader Editor). One node holds the whole layer stack: each layer exposes a Principled-BSDF-style set of inputs (Color, Mask, Normal, Roughness, Metallic, Alpha, Emission, Subsurface) and they are blended internally into one Principled BSDF, so **the blend is visible live in Blender's viewport**.
+This addon ships a single custom shader node called **`BSDF Stack`** (`Add → Custom → BSDF Stack` in the Shader Editor). One node holds the whole layer stack: each layer exposes a Principled-BSDF-style set of inputs (Color, Mask, Normal, Roughness, Metallic, Alpha, Emission, Subsurface, Coat, Sheen) and they are blended internally into one Principled BSDF, so **the blend is visible live in Blender's viewport**.
+
+Coat IOR and Coat Tint have no sockets: glTF's clearcoat has no slot for either, so a socket for them would promise what no exported file can carry.
 
 To author a layered material:
 
@@ -321,7 +367,9 @@ To author a layered material:
 On export, the exporter finds the `BSDF Stack` node feeding Material Output:
 
 - **Layer 0** becomes the material's own `pbrMetallicRoughness` / `normalTexture` / emissive fields (so viewers without the extension render it correctly). Layer 0's mask/opacity/blend mode are ignored.
-- **Layers 1..N** become entries in the `layers` array, each carrying its PBR/normal/emission/subsurface inputs, mask, `blendMode`, `opacity`, and `enabled` flag.
+- **Layers 1..N** become entries in the `layers` array, each carrying its PBR/normal/emission/subsurface/coat/sheen inputs, mask, `blendMode`, `opacity`, and `enabled` flag.
+
+Every channel follows the same rule on export: a layer states a channel by wiring something into it or by moving it off its default, and an untouched channel is written nowhere. That is what makes a colour-only layer expressible — without it, adding a layer to tint some dirt would also drag the roughness under it to 0.5, force its metalness to 0 and black out its emission, all at full mask.
 
 A **Bump node** feeding a layer's Normal socket is fully supported: its `Height` input (a depth/displacement map) is exported as `heightTexture` with the Bump's `strength`/`distance` as `bump`, and its `Normal` input becomes the layer's `normalTexture`. Layer 0's bump/height goes into the extension's `base` object since core glTF has no height slot. On export the Normal socket is walked through any Normal Map and/or Bump node to find the underlying images.
 
