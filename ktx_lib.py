@@ -14,8 +14,10 @@ mipmaps, supercompression) and decodes/transcodes any of those back to RGBA8
 """
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import platform
+import struct
 from pathlib import Path
 
 GITHUB_REPO = "tonis2/ktx.c3"
@@ -235,9 +237,16 @@ def encode_rgba(rgba: bytes, width: int, height: int, fmt: str, *,
         lib.ktx_free(out)
 
 
-def decode_rgba(blob: bytes, level: int = 0, layer: int = 0,
-                face: int = 0) -> tuple[bytes, int, int]:
-    """Decode one image of a KTX2 blob to top-down RGBA8 → (pixels, w, h)."""
+@contextlib.contextmanager
+def decode_rgba_buffer(blob: bytes, level: int = 0, layer: int = 0, face: int = 0):
+    """Decode one image of a KTX2 blob and yield (buffer, w, h) without copying.
+
+    ``buffer`` is the library's own allocation exposed through the buffer
+    protocol, so ``np.frombuffer`` wraps it with no copy at all. It is freed
+    when the block exits and must not outlive it — a caller that keeps the
+    pixels has to read them out inside, which converting to float32 does
+    anyway. ``decode_rgba`` below is the copying convenience wrapper.
+    """
     lib = _load()
     if lib is None:
         raise RuntimeError(_load_error)
@@ -250,10 +259,31 @@ def decode_rgba(blob: bytes, level: int = 0, layer: int = 0,
         raise RuntimeError(f"ktx decode: {lib.ktx_last_error().decode()}")
     try:
         size = w.value * h.value * 4
-        return (bytes(ctypes.cast(out, ctypes.POINTER(ctypes.c_ubyte * size)).contents),
-                w.value, h.value)
+        yield (ctypes.cast(out, ctypes.POINTER(ctypes.c_ubyte * size)).contents,
+               w.value, h.value)
     finally:
         lib.ktx_free(out)
+
+
+def decode_rgba(blob: bytes, level: int = 0, layer: int = 0,
+                face: int = 0) -> tuple[bytes, int, int]:
+    """Decode one image of a KTX2 blob to top-down RGBA8 → (pixels, w, h)."""
+    with decode_rgba_buffer(blob, level, layer, face) as (buf, w, h):
+        return bytes(buf), w, h
+
+
+def dimensions(blob: bytes) -> tuple[int, int] | None:
+    """(width, height) straight out of the KTX2 header, decoding nothing.
+
+    The level-0 extents live at fixed offsets 20 and 24 of every KTX2 file,
+    which is what lets the importer size a decode before it runs one and keep
+    its in-flight queue to a memory budget rather than to a job count.
+    ``pixelHeight`` is 0 for a 1D texture; that reads as one row here.
+    """
+    if len(blob) < 32 or not is_ktx2(blob):
+        return None
+    w, h = struct.unpack_from("<II", blob, 20)
+    return (w, h or 1)
 
 
 KTX2_MAGIC = b"\xabKTX 20\xbb\r\n\x1a\n"

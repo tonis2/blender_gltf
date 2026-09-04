@@ -926,7 +926,12 @@ class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
                 wm.modal_handler_add(self)
             except RuntimeError:
                 return self._finish(context)  # no UI loop to keep responsive
-            self._timer = wm.event_timer_add(0.1, window=win)
+            # Faster than the exporter's tick, because this one does work rather
+            # than only reporting it: every tick lands whatever the decode workers
+            # have finished, and at 0.1s that landing rate — not the decoding —
+            # was what the import ran at. pump_ktx bounds its own main-thread
+            # time, so a short interval costs responsiveness nothing.
+            self._timer = wm.event_timer_add(1.0 / 60.0, window=win)
             return {"RUNNING_MODAL"}
 
         return self._finish(context)
