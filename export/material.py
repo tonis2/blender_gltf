@@ -51,9 +51,32 @@ EXT_MATERIALS_CLEARCOAT = "KHR_materials_clearcoat"
 EXT_MATERIALS_SHEEN = "KHR_materials_sheen"
 EXT_PACKED_TEXTURE = "CUSTOM_packed_texture"
 BSDF_STACK_NODE_IDNAME = "BSDFStackNodeType"
+# Colour-mixing node types a constant tint can hide behind: the current
+# ShaderNodeMix (type "MIX", data_type RGBA) and the legacy ShaderNodeMixRGB.
+_MIX_NODE_TYPES = ("MIX", "MIX_RGB")
 # All Blender ShaderNodeMix blend types the BSDFStackNode exposes per layer.
 _VALID_BLEND_MODES = {m[0] for m in BLEND_MODES}
 _VALID_MASK_CHANNELS = {"R", "G", "B", "A"}
+
+
+def _clamp01(x) -> float:
+    """A number as a glTF factor component: finite and inside [0, 1].
+
+    glTF's schema bounds `baseColorFactor` (and the other factors) to [0, 1];
+    Blender bounds almost none of the sockets they are read from. A stack
+    layer's Alpha socket is created through `interface.new_socket()` with no
+    min/max at all, so a stray slider drag leaves a perfectly ordinary-looking
+    material carrying an alpha of 5.7 -- which then travelled into the file
+    verbatim, because nothing between the socket and the JSON looked at the
+    range.
+    """
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return 1.0
+    if x != x:  # NaN
+        return 1.0
+    return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
 
 
 class MaterialExporter:
@@ -77,6 +100,11 @@ class MaterialExporter:
         self._vl_hidden_restore: list = []               # (obj,) view-layer hide_set
         self._temp_linked: list = []                     # (obj, collection)
         self._bake_saved: dict | None = None
+        # Diagnostics: the material being extracted (for messages), and the
+        # once-per-export flags behind them.
+        self._material_label: str = ""
+        self._warned_unfoldable_mix = False
+        self._warned_clamped: set[str] = set()
 
     def gather(
         self, blender_material: "bpy.types.Material", obj: "bpy.types.Object | None" = None
@@ -574,6 +602,7 @@ class MaterialExporter:
             self._bake_saved = None
 
     def _extract(self, blender_material: "bpy.types.Material") -> Material:
+        self._material_label = getattr(blender_material, "name", "") or ""
         pbr = None
         normal_texture = None
         emissive_texture = None
@@ -921,15 +950,20 @@ class MaterialExporter:
         # alphaMode BLEND over a fully opaque colour. A LINKED Alpha socket is
         # left alone on purpose: then the base colour texture's A drives it and
         # a factor would scale it twice.
+        rgb = base_color_factor or [1.0, 1.0, 1.0, 1.0]
+        alpha_value = rgb[3] if len(rgb) > 3 else 1.0
         alpha_socket = principled.inputs.get("Alpha")
-        if alpha_socket is not None and not getattr(alpha_socket, "is_linked", False):
-            try:
-                alpha_value = float(alpha_socket.default_value)
-            except (TypeError, ValueError):
-                alpha_value = 1.0
-            if alpha_value != 1.0:
-                rgb = base_color_factor or [1.0, 1.0, 1.0, 1.0]
-                base_color_factor = [rgb[0], rgb[1], rgb[2], alpha_value]
+        if alpha_socket is not None:
+            # A LINKED Alpha socket is left alone on purpose: then the base
+            # colour texture's A drives it and a factor would scale it twice.
+            alpha_value = 1.0
+            if not getattr(alpha_socket, "is_linked", False):
+                try:
+                    alpha_value = float(alpha_socket.default_value)
+                except (TypeError, ValueError):
+                    alpha_value = 1.0
+        # Clamped, because nothing upstream of here does: see _gltf_factor4.
+        base_color_factor = self._gltf_factor4(rgb, alpha_value)
 
         # [1,1,1,1] is glTF's own default for baseColorFactor, so writing it is
         # bytes that say nothing -- and _read_color_socket hands back exactly
@@ -1446,10 +1480,15 @@ class MaterialExporter:
         # upstream, and the socket default when nothing is linked.
         factor, bc_tex = self._read_color_socket(self._layer_socket(node, i, "Color"))
         rgb = None if factor is None else [factor[0], factor[1], factor[2]]
-        alpha = self._layer_float(node, i, "Alpha")
+        # _layer_scalar_factor, not _layer_float: a linked Alpha socket keeps a
+        # stale default that Blender ignores, and writing it would scale the
+        # layer's own alpha twice. The base material has always read it this way.
+        alpha = self._layer_scalar_factor(node, i, "Alpha")
         a = alpha if alpha is not None else 1.0
-        if rgb is not None and (rgb != [1.0, 1.0, 1.0] or a != 1.0):
-            pbr["baseColorFactor"] = [rgb[0], rgb[1], rgb[2], a]
+        if rgb is not None:
+            bcf = self._gltf_factor4(rgb, a)
+            if bcf != [1.0, 1.0, 1.0, 1.0]:
+                pbr["baseColorFactor"] = bcf
         if bc_tex is not None:
             pbr["baseColorTexture"] = bc_tex
         mr_tex = (
@@ -1737,11 +1776,152 @@ class MaterialExporter:
 
         return layer
 
+    # ------------------------------------------------------------------
+    # Constant MULTIPLY mixes, folded into the glTF factor
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mix_colour_operands(node):
+        """(factor socket, colour A, colour B) of a colour Mix node, else None.
+
+        ShaderNodeMix carries one socket pair per data type and names both
+        colour inputs "A"/"B" alongside a float pair with the same names, so
+        the operands have to be picked by socket TYPE, not by name. The legacy
+        ShaderNodeMixRGB names them Fac / Color1 / Color2.
+        """
+        t = getattr(node, "type", "")
+        if t == "MIX_RGB":
+            return (node.inputs.get("Fac"),
+                    node.inputs.get("Color1"),
+                    node.inputs.get("Color2"))
+        if t != "MIX":
+            return None
+        if getattr(node, "data_type", "RGBA") != "RGBA":
+            return None
+        fac = next((i for i in node.inputs
+                    if i.type == "VALUE" and i.name in ("Factor", "Fac")), None)
+        rgba = [i for i in node.inputs if i.type == "RGBA"]
+        if fac is None or len(rgba) != 2:
+            return None
+        return fac, rgba[0], rgba[1]
+
+    def _fold_multiply_tint(self, socket):
+        """The constant RGB multiplier sitting between `socket` and its texture.
+
+        Tinting a texture with a MULTIPLY Mix against a constant colour is the
+        ordinary way to do it in Blender, and it is exactly what glTF's
+        `factor x texture` already means -- so the mix folds into the factor
+        instead of being dropped. Before this, `_read_color_socket` saw only
+        that *an image* was reachable and returned white, which threw the tint
+        away: a plank tinted (0.70, 0.82, 0.84) exported at full brightness.
+
+        Blender computes a MULTIPLY mix as `mix(A, A*B, f)`, i.e.
+        `A * ((1-f) + f*B)`, so a linked A and a constant B fold at any factor.
+        The mirrored wiring -- constant A, linked B -- is `A*(1-f) + f*A*B`,
+        which is a scale ONLY at f == 1; a partial factor there adds a constant
+        term that no `baseColorFactor` can spell.
+
+        Returns (rgb multiplier, unfolded) where `unfolded` marks a mix that
+        was left alone (both operands linked, a driven factor, ...) so the
+        caller can say so once.
+        """
+        tint = [1.0, 1.0, 1.0]
+        unfolded = False
+        cur = socket
+        for _ in range(16):
+            if cur is None or not getattr(cur, "is_linked", False):
+                break
+            node = cur.links[0].from_node
+            t = getattr(node, "type", "")
+            if t == "REROUTE":
+                cur = node.inputs[0] if node.inputs else None
+                continue
+            if t not in _MIX_NODE_TYPES:
+                break
+            if getattr(node, "blend_type", "MIX") != "MULTIPLY":
+                break
+            operands = self._mix_colour_operands(node)
+            if operands is None:
+                break
+            fac, a, b = operands
+            if fac is None or a is None or b is None:
+                break
+            if fac.is_linked:
+                unfolded = True
+                break
+            try:
+                f = float(fac.default_value)
+            except (TypeError, ValueError):
+                unfolded = True
+                break
+            if getattr(node, "clamp_factor", True):
+                f = _clamp01(f)
+
+            if a.is_linked and not b.is_linked:
+                const = b.default_value
+                mult = [(1.0 - f) + f * float(const[i]) for i in range(3)]
+                cur = a
+            elif b.is_linked and not a.is_linked:
+                if abs(f - 1.0) > 1e-6:
+                    unfolded = True
+                    break
+                const = a.default_value
+                mult = [float(const[i]) for i in range(3)]
+                cur = b
+            else:
+                # Two linked operands: a real per-pixel blend, not a tint.
+                unfolded = True
+                break
+            tint = [tint[i] * mult[i] for i in range(3)]
+        return tint, unfolded
+
+    def _gltf_factor4(self, rgb, alpha) -> list[float]:
+        """[r, g, b, a] as glTF will accept it: every component inside [0, 1].
+
+        The range is the schema's, not Blender's. A BSDF Stack builds its float
+        channels with `interface.new_socket()`, which sets no soft or hard
+        limits, so the Alpha slider scrubs past 1 as freely as a Bump distance
+        does -- and an alpha of 5.7 then reached `baseColorFactor[3]` untouched,
+        where it means nothing a reader can honour.
+        """
+        raw = [rgb[0], rgb[1], rgb[2], alpha]
+        out = [_clamp01(c) for c in raw]
+        for r, o in zip(raw, out):
+            try:
+                ok = abs(float(r) - o) <= 1e-6
+            except (TypeError, ValueError):
+                ok = False
+            if not ok:
+                self._note_clamped_factor(raw, out)
+                break
+        return out
+
+    def _note_clamped_factor(self, raw, out) -> None:
+        """Say once per material that a factor was out of glTF's range."""
+        label = self._material_label
+        if label in self._warned_clamped:
+            return
+        self._warned_clamped.add(label)
+        print(f"[glTF export] material '{label}': baseColorFactor {list(raw)} "
+              f"is outside glTF's [0, 1] range; wrote {out}. Check the BSDF "
+              f"Stack / Principled sockets it comes from")
+
+    def _note_unfoldable_mix(self) -> None:
+        """Say once that some colour mix could not become a factor."""
+        if self._warned_unfoldable_mix:
+            return
+        self._warned_unfoldable_mix = True
+        print("[glTF export] a Mix node in front of a colour input is not a "
+              "constant MULTIPLY tint (both inputs linked, or a driven "
+              "factor) -- exporting the texture untinted, first seen on "
+              f"'{self._material_label}'")
+
     def _read_color_socket(self, socket):
         """Resolve a color socket to (factor, TextureInfo).
 
-        Handles the common upstream cases: Image Texture (texture wins, factor
-        is the socket's local default), RGB node (read its output value as the
+        Handles the common upstream cases: Image Texture (texture wins, and the
+        factor carries whatever constant MULTIPLY tint sits between the two --
+        see _fold_multiply_tint), RGB node (read its output value as the
         factor), or unlinked (read socket default).
 
         When a socket is linked through pass-through nodes (Reroute, Group)
@@ -1757,9 +1937,14 @@ class MaterialExporter:
         if image_node is not None:
             # The socket is linked (an image was reachable), so Blender ignores
             # its default_value — the factor must stay white or glTF's
-            # factor × texture would double-apply it.
+            # factor × texture would double-apply it. White, except for what a
+            # constant MULTIPLY tint in the chain contributes: that IS a factor
+            # × texture, and folding it is the only way glTF can carry it.
+            tint, unfolded = self._fold_multiply_tint(socket)
+            if unfolded:
+                self._note_unfoldable_mix()
             tex_info = self.texture_exporter.gather_texture_info(image_node)
-            return [1.0, 1.0, 1.0, 1.0], tex_info
+            return [tint[0], tint[1], tint[2], 1.0], tex_info
 
         if socket.is_linked:
             from_socket = socket.links[0].from_socket

@@ -173,6 +173,10 @@ The `mask` object itself is optional on a layer — omit it for a layer that is 
 
 **Channel packing.** A single 4-channel mask texture can drive up to four layers — layer A reads `R`, layer B reads `G`, etc. This is the standard splat-map technique.
 
+**A `VERTEX_COLOR` mask on a mesh that does not carry the named attribute reads `m = 0`, not `1`** — the layer is off there rather than covering the whole surface. This is what Blender's Color Attribute node answers for an attribute that is not on the mesh, and it is what lets one material be shared between a painted mesh and an unpainted one, which is the normal case: the material is authored once and assigned to everything made of that stuff, and only some of it gets painted. It is deliberately the opposite of core glTF's rule for a *missing* `COLOR_0`, which is white, because that rule is about a tint and this is a weight.
+
+**A masked material's `COLOR_0` is not a tint.** Core glTF says `COLOR_0` multiplies the base color; when a material carries this extension, the attribute its layers read is a set of per-layer weights and multiplying it into the base color draws the mask instead of the texture. A consumer must skip that multiply for any mesh whose material carries `CUSTOM_materials_layers` — including a stack whose `layers` array is empty, since the paint is on the mesh either way.
+
 ### blendMode
 
 How the masked layer is composited over the layer below. `m` is the mask value, `c_below` is the surface color from layers beneath, `c_layer` is this layer's color.
@@ -306,12 +310,13 @@ for (int i = 0; i < u_layerCount; ++i) {
 ```glsl
 float sampleMask(Layer L) {
     if (L.source == TEXTURE)      return texture(L.maskTex, L.maskUV)[L.channel];
-    if (L.source == VERTEX_COLOR) return v_color[L.channel];
+    // 0 where the mesh carries no such attribute — see the mask object above.
+    if (L.source == VERTEX_COLOR) return hasAttribute(L.attribute) ? v_color[L.channel] : 0.0;
     return 0.0;
 }
 ```
 
-The vertex color attribute is whatever the engine binds to `v_color` for the named `attribute` (default `COLOR_0`, glTF's standard vertex color).
+The vertex color attribute is whatever the engine binds to `v_color` for the named `attribute` (default `COLOR_0`, glTF's standard vertex color). An engine that fills `v_color` with white when the mesh has no such attribute — the usual arrangement, because white is the identity for a tint — must not let that white reach this function: a missing attribute is a weight of 0.
 
 ### Normal blending
 
