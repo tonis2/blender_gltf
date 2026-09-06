@@ -436,38 +436,47 @@ _EXPORT_PROP_DEFS: dict[str, tuple] = {
     )),
     "ktx_codec": (EnumProperty, dict(
         name="Color Codec",
-        description="Basis Universal codec for color/data KTX2 textures "
+        description="Codec for color/data KTX2 textures "
                     "(base color, emission, roughness, masks, ...)",
         items=[
             ("uastc", "UASTC", "Higher quality, larger files (Zstd-compressed)"),
             ("etc1s", "ETC1S", "Smallest files, lower quality (BasisLZ)"),
+            ("bc7", "BC7", "Block compressed, desktop GPUs upload it without "
+             "transcoding. Not Basis Universal, so a strict "
+             "KHR_texture_basisu viewer will refuse it"),
         ],
         default="uastc",
     )),
     "ktx_quality": (IntProperty, dict(
         name="Color Quality",
-        description="Encoding quality for color/data KTX2 textures",
+        description="Encoding quality for color/data KTX2 textures "
+                    "(Basis codecs only; BC7 is fixed-rate)",
         min=0, max=100, default=90, subtype="PERCENTAGE",
     )),
     "ktx_normal_codec": (EnumProperty, dict(
         name="Normal Codec",
-        description="Basis Universal codec for normal and height/bump maps, "
-                    "which need more detail than color textures",
+        description="Codec for normal and height/bump maps, which need more "
+                    "detail than color textures",
         items=[
             ("uastc", "UASTC", "Higher quality, larger files (Zstd-compressed)"),
             ("etc1s", "ETC1S", "Smallest files, lower quality (BasisLZ)"),
+            ("bc7", "BC7", "Block compressed, desktop GPUs upload it without "
+             "transcoding. Not Basis Universal, so a strict "
+             "KHR_texture_basisu viewer will refuse it"),
         ],
         default="uastc",
     )),
     "ktx_normal_quality": (IntProperty, dict(
         name="Normal Quality",
-        description="Encoding quality for normal and height/bump maps",
+        description="Encoding quality for normal and height/bump maps "
+                    "(Basis codecs only; BC7 is fixed-rate)",
         min=0, max=100, default=100, subtype="PERCENTAGE",
     )),
     "ktx_effort": (IntProperty, dict(
         name="Effort",
-        description="Encoder search effort for all KTX2 textures "
-                    "(higher is slower but compresses better)",
+        description="Encoder search effort for Basis KTX2 textures "
+                    "(higher is slower but compresses better; BC7 "
+                    "ignores it)",
         min=0, max=10, default=2,
     )),
     "ktx_mipmaps": (BoolProperty, dict(

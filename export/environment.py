@@ -139,9 +139,7 @@ class EnvironmentExporter:
             return None
         cs = getattr(image.colorspace_settings, "name", "sRGB")
         codec = self.settings.environment_map_codec or "rgba8"
-        fmt = codec if cs == "sRGB" else codec + "-linear"
-        if codec in ("rgba8", "bc7") and cs == "sRGB":
-            fmt = codec + "-srgb"
+        fmt = ktx_lib.format_name(codec, cs == "sRGB")
         try:
             # Always mipped, and deliberately not following ktx_mipmaps: an
             # environment map's levels are the prefiltered radiance a shader

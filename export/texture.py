@@ -159,6 +159,7 @@ class TextureExporter:
         if image_index in self._ktx2_images:
             # KHR_texture_basisu: the KTX2 image is referenced from the
             # extension, not texture.source (we ship no PNG fallback).
+
             self.extensions_used.add(EXT_TEXTURE_BASISU)
             self.textures.append(Texture(
                 sampler=sampler_index,
@@ -272,8 +273,7 @@ class TextureExporter:
         detail = usage in ("normal", "height")
         codec = (self.settings.ktx_normal_codec if detail
                  else self.settings.ktx_codec) or "uastc"
-        fmt = codec if cs == "sRGB" else codec + "-linear"
-        return rgba, w, h, fmt
+        return rgba, w, h, ktx_lib.format_name(codec, cs == "sRGB")
 
     def _gather_image_ktx2(
         self, blender_image: "bpy.types.Image", usage: str = "color",

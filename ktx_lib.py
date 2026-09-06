@@ -212,6 +212,20 @@ def encode_cube(faces: "list[bytes]", size: int, fmt: str, *,
         lib.ktx_free(out)
 
 
+# Codecs naming a VkFormat: the sRGB variant carries an "-srgb" suffix and the
+# linear one is the bare name. The Basis codecs suffix the other way round —
+# bare is sRGB, "-linear" is the data variant — so the two families cannot
+# share one rule. format_name() below is what callers should use.
+_VK_CODECS = frozenset({"rgba8", "bc1", "bc3", "bc5", "bc7"})
+
+
+def format_name(codec: str, srgb: bool) -> str:
+    """Spell `codec` for the given colorspace the way encode_rgba wants it."""
+    if codec in _VK_CODECS:
+        return codec + "-srgb" if srgb else codec
+    return codec if srgb else codec + "-linear"
+
+
 def encode_rgba(rgba: bytes, width: int, height: int, fmt: str, *,
                 mipmaps: bool = True, normal_map: bool = False,
                 quality: int = 90, effort: int = 2,
@@ -219,7 +233,12 @@ def encode_rgba(rgba: bytes, width: int, height: int, fmt: str, *,
     """Encode top-down RGBA8 pixels (width*height*4 bytes) to a KTX2 blob.
 
     fmt: "uastc", "etc1s" ("-linear" variants for non-color data), or a
-    VkFormat alias like "bc7-srgb" / "bc5" / "rgba8-srgb".
+    VkFormat alias like "bc7-srgb" / "bc5" / "rgba8-srgb". Build it with
+    format_name() rather than by hand — there is no "bc7-linear".
+
+    quality and effort steer the Basis encoders only; the BCn and rgba8
+    formats are fixed-rate and ignore both. normal_map renormalizes the
+    generated mips, which is a VkFormat-path option for the same reason.
     """
     lib = _load()
     if lib is None:

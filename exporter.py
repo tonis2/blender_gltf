@@ -55,9 +55,9 @@ class ExportSettings:
     export_all_scenes: bool = False
     export_camera_y_up: bool = True
     image_format: str = "AUTO"  # "AUTO", "JPEG", "PNG", or "KTX2"
-    ktx_codec: str = "uastc"  # "uastc" or "etc1s" — color textures (KTX2 only)
+    ktx_codec: str = "uastc"  # "uastc", "etc1s" or "bc7" — color textures (KTX2 only)
     ktx_quality: int = 90  # 0-100, color textures (KTX2 only)
-    ktx_normal_codec: str = "uastc"  # "uastc" or "etc1s" — normal + height maps
+    ktx_normal_codec: str = "uastc"  # "uastc", "etc1s" or "bc7" — normal + height maps
     ktx_normal_quality: int = 100  # 0-100, normal + height maps (KTX2 only)
     ktx_effort: int = 2  # 0-10 encoder search effort, all KTX2 encodes
     ktx_mipmaps: bool = True  # write a mip chain into each KTX2 (adds ~33%)
