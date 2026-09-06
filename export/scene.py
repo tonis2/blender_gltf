@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from collections import defaultdict
 from typing import TYPE_CHECKING
@@ -640,15 +641,31 @@ class SceneExporter:
             return self.camera_index_by_name[cam.name]
 
         if cam.type == "PERSP":
-            # Blender stores the vertical FOV in angle_y for VERTICAL sensor fit,
-            # and the horizontal FOV in angle_x for HORIZONTAL. glTF always wants yfov.
-            # cam.angle is the effective FOV along the sensor_fit axis.
-            # cam.angle_y is always the vertical FOV regardless of sensor_fit.
+            # glTF wants the vertical FOV as the render frames it. cam.angle is the
+            # FOV along the sensor_fit axis (AUTO fits the longer one), so on a
+            # landscape render only VERTICAL fit is already vertical; the rest is
+            # narrowed by the render's aspect. That number is only readable with
+            # aspectRatio beside it, so write both.
+            import bpy
+
+            render = bpy.context.scene.render
+            width = render.resolution_x * render.pixel_aspect_x
+            height = render.resolution_y * render.pixel_aspect_y
+            aspect = width / height if height else 1.0
+            if width >= height:
+                vertical_fit = cam.sensor_fit == "VERTICAL"
+            else:
+                vertical_fit = cam.sensor_fit != "HORIZONTAL"
+            if vertical_fit:
+                yfov = cam.angle
+            else:
+                yfov = 2.0 * math.atan(math.tan(cam.angle / 2.0) / aspect)
             gltf_cam = Camera(
                 type="perspective",
                 name=cam.name,
                 perspective=CameraPerspective(
-                    yfov=cam.angle_y,
+                    yfov=yfov,
+                    aspect_ratio=aspect,
                     znear=cam.clip_start,
                     zfar=cam.clip_end,
                 ),

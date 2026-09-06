@@ -79,6 +79,25 @@ def _clamp01(x) -> float:
     return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
 
 
+def _through_reroutes(socket):
+    """(node, from_socket) driving `socket`, stepping over Reroute nodes.
+
+    Only REROUTE is skipped -- unlike environment.py's `_upstream`, which
+    hunts for a node type -- so the from_socket survives the walk and a mask
+    can still tell Separate Color.Red from .Green. (None, None) if nothing
+    but reroutes is upstream.
+    """
+    for _ in range(16):
+        if socket is None or not getattr(socket, "is_linked", False):
+            break
+        link = socket.links[0]
+        node = link.from_node
+        if getattr(node, "type", "") != "REROUTE":
+            return node, link.from_socket
+        socket = node.inputs[0] if node.inputs else None
+    return None, None
+
+
 class MaterialExporter:
     def __init__(self, texture_exporter: TextureExporter, settings: "ExportSettings") -> None:
         self.texture_exporter = texture_exporter
@@ -156,7 +175,8 @@ class MaterialExporter:
             return False
         if self._walk_to_image(socket) is not None:
             return False  # representable as a texture as-is
-        src_type = getattr(socket.links[0].from_node, "type", "")
+        src_node, _ = _through_reroutes(socket)
+        src_type = getattr(src_node, "type", "")
         if src_type in self._CONSTANT_NODE_TYPES:
             return False  # representable as a constant factor
         return True
@@ -1185,9 +1205,9 @@ class MaterialExporter:
             return 1.0, self.texture_exporter.gather_texture_info(image_node)
 
         if socket.is_linked:
-            from_node = socket.links[0].from_node
+            from_node, from_socket = _through_reroutes(socket)
             if getattr(from_node, "type", None) == "VALUE":
-                v = getattr(socket.links[0].from_socket, "default_value", None)
+                v = getattr(from_socket, "default_value", None)
                 if v is not None:
                     try:
                         return float(v), None
@@ -1216,8 +1236,8 @@ class MaterialExporter:
         scale = None
         socket = node.inputs.get(socket_name)
         if socket and socket.is_linked:
-            src = socket.links[0].from_node
-            if src.type == "NORMAL_MAP":
+            src, _ = _through_reroutes(socket)
+            if src is not None and src.type == "NORMAL_MAP":
                 strength = src.inputs.get("Strength")
                 if strength and strength.default_value != 1.0:
                     scale = float(strength.default_value)
@@ -1355,8 +1375,9 @@ class MaterialExporter:
         if surface is None or not surface.is_linked:
             return None, None, None
 
-        group_node = surface.links[0].from_node
-        if group_node.type != "GROUP" or getattr(group_node, "node_tree", None) is None:
+        group_node, _ = _through_reroutes(surface)
+        if (group_node is None or group_node.type != "GROUP"
+                or getattr(group_node, "node_tree", None) is None):
             return None, None, None
 
         bc_socket = None
@@ -1404,7 +1425,7 @@ class MaterialExporter:
         surface = out.inputs.get("Surface")
         if surface is None or not surface.is_linked:
             return None
-        node = surface.links[0].from_node
+        node, _ = _through_reroutes(surface)
         if getattr(node, "bl_idname", "") == BSDF_STACK_NODE_IDNAME:
             return node
         return None
@@ -1564,12 +1585,12 @@ class MaterialExporter:
         """
         if socket is None or not socket.is_linked:
             return None
-        src = socket.links[0].from_node
+        src, _ = _through_reroutes(socket)
+        if src is None:
+            return None
         if src.type == "BUMP":
-            inner = src.inputs.get("Normal")
-            if inner is not None and inner.is_linked:
-                src = inner.links[0].from_node
-            else:
+            src, _ = _through_reroutes(src.inputs.get("Normal"))
+            if src is None:
                 return None
         if src.type == "NORMAL_MAP":
             strength = src.inputs.get("Strength")
@@ -1591,8 +1612,8 @@ class MaterialExporter:
         """
         if socket is None or not socket.is_linked:
             return None, None
-        src = socket.links[0].from_node
-        if src.type != "BUMP":
+        src, _ = _through_reroutes(socket)
+        if src is None or src.type != "BUMP":
             return None, None
         height_socket = src.inputs.get("Height")
         himg = self._walk_to_image(height_socket) if height_socket is not None else None
@@ -1947,11 +1968,10 @@ class MaterialExporter:
             return [tint[0], tint[1], tint[2], 1.0], tex_info
 
         if socket.is_linked:
-            from_socket = socket.links[0].from_socket
-            from_node = socket.links[0].from_node
+            from_node, from_socket = _through_reroutes(socket)
             # For RGB-style upstreams (RGB, Value->Combine, Color attribute),
-            # the output default is meaningful. For Group / Reroute / shader
-            # nodes, prefer the Principled-side default.
+            # the output default is meaningful. For Group / shader nodes,
+            # prefer the Principled-side default.
             if getattr(from_node, "type", None) in {"RGB", "VALUE", "COMBINE_COLOR", "COMBINE_RGB"}:
                 v = getattr(from_socket, "default_value", None)
                 if v is not None and hasattr(v, "__len__") and len(v) >= 3:
@@ -1975,9 +1995,12 @@ class MaterialExporter:
         if socket is None or not socket.is_linked:
             return None
 
-        link = socket.links[0]
-        src = link.from_node
-        from_socket_name = link.from_socket.name
+        # A mask usually arrives through a Reroute (Separate Color -> Reroute
+        # -> Mask); step over those, keeping the socket so R vs G survives.
+        src, from_socket = _through_reroutes(socket)
+        if src is None:
+            return None
+        from_socket_name = from_socket.name
 
         if src.type == "TEX_IMAGE":
             ti = self.texture_exporter.gather_texture_info(src)
@@ -1994,7 +2017,9 @@ class MaterialExporter:
             channel = _socket_to_channel(from_socket_name)
             color_in = src.inputs.get("Color") or src.inputs.get("Image")
             if color_in is not None and color_in.is_linked:
-                inner = color_in.links[0].from_node
+                inner, _ = _through_reroutes(color_in)
+                if inner is None:
+                    return None
                 if inner.type == "TEX_IMAGE":
                     ti = self.texture_exporter.gather_texture_info(inner)
                     if ti is None:
