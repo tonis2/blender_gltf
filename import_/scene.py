@@ -218,6 +218,10 @@ class SceneImporter:
             light_idx = node.extensions["KHR_lights_punctual"].get("light")
             if light_idx is not None:
                 obj_data = self._create_light(light_idx)
+        elif (node.extensions and "CUSTOM_lights_area" in node.extensions):
+            light_idx = node.extensions["CUSTOM_lights_area"].get("light")
+            if light_idx is not None:
+                obj_data = self._create_area_light(light_idx)
         elif (self.audio_importer and node.extensions
                 and "KHR_audio_emitter" in node.extensions):
             emitter_idx = node.extensions["KHR_audio_emitter"].get("emitter")
@@ -352,6 +356,10 @@ class SceneImporter:
             cam.type = "PERSP"
             persp = gltf_cam.perspective
             if persp is not None:
+                # glTF's yfov is explicitly the vertical field of view. AUTO
+                # may interpret `angle` on Blender's horizontal fit axis and a
+                # subsequent export then divides it by the aspect a second time.
+                cam.sensor_fit = "VERTICAL"
                 cam.angle_y = persp.yfov
                 cam.lens_unit = "FOV"
                 cam.clip_start = persp.znear
@@ -400,6 +408,26 @@ class SceneImporter:
 
         return light
 
+    def _create_area_light(self, light_index: int) -> "bpy.types.Light | None":
+        """Create a Blender area light from CUSTOM_lights_area."""
+        import bpy
+
+        root_ext = self.gltf.extensions or {}
+        lights = root_ext.get("CUSTOM_lights_area", {}).get("lights", [])
+        if light_index >= len(lights):
+            return None
+        source = lights[light_index]
+        light = bpy.data.lights.new(source.get("name", f"Area_{light_index}"), "AREA")
+        light.shape = source.get("shape", "rectangle").upper()
+        light.size = float(source.get("width", 1.0))
+        if light.shape in {"RECTANGLE", "ELLIPSE"}:
+            light.size_y = float(source.get("height", light.size))
+        light.energy = float(source.get("powerWatts", 10.0))
+        color = source.get("color", [1.0, 1.0, 1.0])
+        light.color = (color[0], color[1], color[2])
+        light.spread = float(source.get("spread", 3.141592653589793))
+        return light
+
     def _get_node_world_matrix(self, node: "Node", parent_obj: "bpy.types.Object | None"):
         """Compute the expected world matrix for a node from its TRS and parent."""
         import mathutils
@@ -421,7 +449,7 @@ class SceneImporter:
             return True
         ext = node.extensions
         return bool(ext and (
-            "KHR_lights_punctual" in ext or "KHR_audio_emitter" in ext
+            "KHR_lights_punctual" in ext or "CUSTOM_lights_area" in ext or "KHR_audio_emitter" in ext
         ))
 
     def _apply_transform(

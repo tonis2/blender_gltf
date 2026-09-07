@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 EXT_NODE_VISIBILITY = "KHR_node_visibility"
 EXT_GPU_INSTANCING = "EXT_mesh_gpu_instancing"
 EXT_LIGHTS_PUNCTUAL = "KHR_lights_punctual"
+EXT_LIGHTS_AREA = "CUSTOM_lights_area"
 EXT_MSFT_LOD = "MSFT_lod"
 
 # Sibling objects named Base_LOD0, Base_LOD1, ... form one LOD group.
@@ -77,6 +78,8 @@ class SceneExporter:
         self.camera_index_by_name: dict[str, int] = {}  # blender camera data name -> gltf index
         self.lights: list[dict] = []
         self.light_index_by_name: dict[str, int] = {}  # blender light data name -> gltf index
+        self.area_lights: list[dict] = []
+        self.area_light_index_by_name: dict[str, int] = {}
         self._lod_skip_names: set[str] = set()  # LOD1+ objects, excluded from the graph
         # glTF 2.1 [DRAFT] external assets: collection-instance empties routed to
         # the files array, plus the resulting File entries (built via an injected
@@ -472,7 +475,8 @@ class SceneExporter:
         if light_ext is not None:
             if extensions is None:
                 extensions = {}
-            extensions[EXT_LIGHTS_PUNCTUAL] = light_ext
+            extension_name = light_ext.pop("_extension", EXT_LIGHTS_PUNCTUAL)
+            extensions[extension_name] = light_ext
 
         node = Node(
             name=obj.name,
@@ -695,6 +699,31 @@ class SceneExporter:
         light = obj.data
         if light is None:
             return None
+
+        # Area lights are deliberately not approximated as punctual emitters. Their
+        # node transform places and aims the emitting surface; dimensions and watts
+        # stay in a private extension both Blender and the engine understand.
+        if light.type == "AREA":
+            if light.name in self.area_light_index_by_name:
+                return {"_extension": EXT_LIGHTS_AREA,
+                        "light": self.area_light_index_by_name[light.name]}
+            shape = light.shape.lower()
+            width = float(light.size)
+            height = float(light.size_y if light.shape in {"RECTANGLE", "ELLIPSE"} else light.size)
+            area = {
+                "name": light.name,
+                "shape": shape,
+                "width": width,
+                "height": height,
+                "color": [light.color.r, light.color.g, light.color.b],
+                "powerWatts": float(light.energy),
+                "spread": float(light.spread),
+            }
+            index = len(self.area_lights)
+            self.area_lights.append(area)
+            self.area_light_index_by_name[light.name] = index
+            self.extensions_used.add(EXT_LIGHTS_AREA)
+            return {"_extension": EXT_LIGHTS_AREA, "light": index}
 
         gltf_type = _LIGHT_TYPE_MAP.get(light.type)
         if gltf_type is None:

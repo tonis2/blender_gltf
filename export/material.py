@@ -173,6 +173,11 @@ class MaterialExporter:
         plain constant node (exportable as a factor) does NOT need baking."""
         if socket is None or not socket.is_linked:
             return False
+        # A disabled Normal Map contributes the unmodified surface normal. It
+        # needs neither a texture nor a procedural bake; baking it would replace
+        # that neutral result with a generated normal map at full strength.
+        if self._normal_map_is_disabled(socket):
+            return False
         if self._walk_to_image(socket) is not None:
             return False  # representable as a texture as-is
         src_node, _ = _through_reroutes(socket)
@@ -1003,6 +1008,9 @@ class MaterialExporter:
     def _gather_normal(
         self, principled: "bpy.types.ShaderNodeBsdfPrincipled"
     ) -> NormalTextureInfo | None:
+        socket = principled.inputs.get("Normal")
+        if self._normal_map_is_disabled(socket):
+            return None
         image_node = self._get_connected_image_node(principled, "Normal")
         if image_node is None:
             return None
@@ -1015,7 +1023,7 @@ class MaterialExporter:
         # Bump node. The inline check this replaces saw BUMP on the common
         # "height + normal map into Bump into Normal" wiring, stopped, and
         # silently exported a scale of 1.0.
-        scale = self._normal_map_scale(principled.inputs.get("Normal"))
+        scale = self._normal_map_scale(socket)
 
         return NormalTextureInfo(
             index=tex_info.index,
@@ -1227,6 +1235,9 @@ class MaterialExporter:
     ) -> NormalTextureInfo | None:
         """NormalTextureInfo for an arbitrary normal socket (e.g. "Coat Normal"),
         reading the Normal Map node's Strength as the glTF scale."""
+        socket = node.inputs.get(socket_name)
+        if self._normal_map_is_disabled(socket):
+            return None
         image_node = self._get_connected_image_node(node, socket_name)
         if image_node is None:
             return None
@@ -1234,7 +1245,6 @@ class MaterialExporter:
         if tex_info is None:
             return None
         scale = None
-        socket = node.inputs.get(socket_name)
         if socket and socket.is_linked:
             src, _ = _through_reroutes(socket)
             if src is not None and src.type == "NORMAL_MAP":
@@ -1567,6 +1577,8 @@ class MaterialExporter:
         socket = self._layer_socket(node, i, "Normal")
         if socket is None or not socket.is_linked:
             return None
+        if self._normal_map_is_disabled(socket):
+            return None
         img = self._walk_to_image(socket)
         if img is None:
             return None
@@ -1578,6 +1590,27 @@ class MaterialExporter:
             index=ti.index, tex_coord=ti.tex_coord,
             scale=scale, extensions=ti.extensions,
         )
+
+    def _normal_map_is_disabled(self, socket):
+        """Whether `socket` is fed by a constant zero-strength Normal Map."""
+        if socket is None or not socket.is_linked:
+            return False
+        src, _ = _through_reroutes(socket)
+        if src is None:
+            return False
+        if src.type == "BUMP":
+            src, _ = _through_reroutes(src.inputs.get("Normal"))
+            if src is None:
+                return False
+        if src.type != "NORMAL_MAP":
+            return False
+        strength = src.inputs.get("Strength")
+        if strength is None or strength.is_linked:
+            return False
+        try:
+            return float(strength.default_value) == 0.0
+        except (TypeError, ValueError):
+            return False
 
     def _normal_map_scale(self, socket):
         """Return the Normal Map node's Strength (!= 1.0) feeding `socket`, or

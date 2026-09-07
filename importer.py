@@ -33,6 +33,7 @@ SUPPORTED_EXTENSIONS = frozenset({
     "CUSTOM_materials_layers",
     "CUSTOM_particle_emitter",
     "CUSTOM_walkability_mask",
+    "CUSTOM_lights_area",
     "EXT_mesh_gpu_instancing",
     "KHR_audio_emitter",
     "KHR_implicit_shapes",

@@ -290,6 +290,10 @@ class GltfExporter:
             root_extensions["KHR_lights_punctual"] = {
                 "lights": self.scene_exporter.lights,
             }
+        if self.scene_exporter.area_lights:
+            root_extensions["CUSTOM_lights_area"] = {
+                "lights": self.scene_exporter.area_lights,
+            }
 
         # 5d. KHR_interactivity root extension
         if self.interactivity_exporter:
