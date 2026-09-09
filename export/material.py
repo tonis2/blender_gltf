@@ -178,10 +178,33 @@ class MaterialExporter:
         # that neutral result with a generated normal map at full strength.
         if self._normal_map_is_disabled(socket):
             return False
-        if self._walk_to_image(socket) is not None:
-            return False  # representable as a texture as-is
         src_node, _ = _through_reroutes(socket)
         src_type = getattr(src_node, "type", "")
+        if src_type in _MIX_NODE_TYPES:
+            # Finding an image somewhere below a Mix does not make the result
+            # a texture. Only a constant multiply tint maps exactly to glTF's
+            # factor * texture representation; other mixes need a real bake.
+            if getattr(src_node, "blend_type", "MIX") != "MULTIPLY":
+                return True
+            operands = self._mix_colour_operands(src_node)
+            if operands is None:
+                return True
+            factor, a, b = operands
+            if factor.is_linked:
+                return True
+            try:
+                amount = float(factor.default_value)
+            except (TypeError, ValueError):
+                return True
+            if getattr(src_node, "clamp_factor", True):
+                amount = _clamp01(amount)
+            if a.is_linked and not b.is_linked:
+                return self._socket_needs_bake(a)
+            if b.is_linked and not a.is_linked and abs(amount - 1.0) <= 1e-6:
+                return self._socket_needs_bake(b)
+            return True
+        if self._walk_to_image(socket) is not None:
+            return False  # representable as a texture as-is
         if src_type in self._CONSTANT_NODE_TYPES:
             return False  # representable as a constant factor
         return True
