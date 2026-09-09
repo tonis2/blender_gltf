@@ -719,6 +719,8 @@ class SceneExporter:
                 "powerWatts": float(light.energy),
                 "spread": float(light.spread),
             }
+            if light.use_custom_distance:
+                area["range"] = float(light.cutoff_distance)
             index = len(self.area_lights)
             self.area_lights.append(area)
             self.area_light_index_by_name[light.name] = index

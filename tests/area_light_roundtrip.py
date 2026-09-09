@@ -28,6 +28,8 @@ def main():
     data.energy = 1000.0
     data.color = (0.8, 0.5, 0.25)
     data.spread = 1.2
+    data.use_custom_distance = True
+    data.cutoff_distance = 37.0
     source = bpy.data.objects.new("Scaled ellipse", data)
     bpy.context.scene.collection.objects.link(source)
     source.location = (2.0, -3.0, 5.0)
@@ -63,6 +65,9 @@ def main():
         assert close(area["powerWatts"], 1000.0)
         assert all(close(a, b) for a, b in zip(area["color"], (0.8, 0.5, 0.25)))
         assert close(area["spread"], 1.2)
+        assert close(area["range"], 37.0)
+        rectangle_area = next(item for item in areas if item["name"] == "Scaled rectangle")
+        assert "range" not in rectangle_area
 
         bpy.ops.object.select_all(action="SELECT")
         bpy.ops.object.delete(use_global=False)
@@ -72,6 +77,7 @@ def main():
         assert restored.data.type == "AREA" and restored.data.shape == "ELLIPSE"
         assert close(restored.data.size, 4.2) and close(restored.data.size_y, 1.75)
         assert close(restored.data.energy, 1000.0) and close(restored.data.spread, 1.2)
+        assert restored.data.use_custom_distance and close(restored.data.cutoff_distance, 37.0)
         for column in range(4):
             delta = (restored.matrix_world.col[column] - before["Scaled ellipse"].col[column]).length
             assert delta < 1e-4, (column, tuple(restored.matrix_world.col[column]),
@@ -79,6 +85,7 @@ def main():
         restored_rectangle = restored_lights["Scaled rectangle"]
         assert restored_rectangle.data.shape == "RECTANGLE"
         assert close(restored_rectangle.data.size, 6.0) and close(restored_rectangle.data.size_y, 2.0)
+        assert not restored_rectangle.data.use_custom_distance
         for column in range(4):
             assert (restored_rectangle.matrix_world.col[column] - before["Scaled rectangle"].col[column]).length < 1e-4
 

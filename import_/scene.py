@@ -426,6 +426,9 @@ class SceneImporter:
         color = source.get("color", [1.0, 1.0, 1.0])
         light.color = (color[0], color[1], color[2])
         light.spread = float(source.get("spread", 3.141592653589793))
+        if "range" in source:
+            light.use_custom_distance = True
+            light.cutoff_distance = float(source["range"])
         return light
 
     def _get_node_world_matrix(self, node: "Node", parent_obj: "bpy.types.Object | None"):

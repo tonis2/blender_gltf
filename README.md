@@ -20,6 +20,7 @@ A custom Blender addon for exporting and importing scenes in glTF 2.0 format.
 | Extension | Description |
 |-----------|-------------|
 | `KHR_lights_punctual` | Point, directional, and spot lights |
+| `CUSTOM_lights_area` | Square, rectangle, disk, and ellipse area lights with Blender-compatible dimensions, radiant power, spread, and optional cutoff range — see [`extensions/lights_area.md`](extensions/lights_area.md) |
 | `KHR_node_visibility` | Per-node visibility |
 | `KHR_animation_pointer` | Material property animations |
 | `KHR_physics_rigid_bodies` | Rigid bodies, colliders, and joints |

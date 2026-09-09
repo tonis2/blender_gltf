@@ -490,9 +490,7 @@ _EXPORT_PROP_DEFS: dict[str, tuple] = {
             "Automatically bake any material whose base color, roughness, "
             "normal or emission is driven by procedural nodes (Noise, Voronoi, "
             "bumps, ...) to images, so it survives in glTF. Materials already "
-            "made of plain image textures / constant factors are left untouched. "
-            "A material's own 'Bake Textures on Export' checkbox forces baking "
-            "regardless of this option"
+            "made of plain image textures / constant factors are left untouched"
         ),
         default=False,
     )),

@@ -348,12 +348,212 @@ class MaterialExporter:
             bpy.ops.object.select_all(action="DESELECT")
             obj.select_set(True)
             bpy.context.view_layer.objects.active = obj
+            source_mat.node_tree.nodes.active = target
+            target.select = True
             if bake_type == "DIFFUSE":
                 rb.use_pass_direct = False
                 rb.use_pass_indirect = False
                 rb.use_pass_color = True
             bpy.ops.object.bake(type=bake_type)
         return img
+
+    def _bake_socket_as_emission(
+        self, obj, source_mat, target, socket, name, res, non_color,
+    ):
+        """Bake one material input without lighting changing its value."""
+        nt = source_mat.node_tree
+        out = next((n for n in nt.nodes if n.type == "OUTPUT_MATERIAL"), None)
+        if out is None:
+            raise RuntimeError("material has no output node")
+        surface = out.inputs.get("Surface")
+        if surface is None:
+            raise RuntimeError("material output has no surface input")
+
+        saved_surface = surface.links[0].from_socket if surface.is_linked else None
+        emit = nt.nodes.new("ShaderNodeEmission")
+        try:
+            if socket is not None and socket.is_linked:
+                nt.links.new(socket.links[0].from_socket, emit.inputs["Color"])
+            else:
+                value = getattr(socket, "default_value", 0.0)
+                if hasattr(value, "__len__"):
+                    rgba = tuple(value)
+                    emit.inputs["Color"].default_value = (
+                        float(rgba[0]), float(rgba[1]), float(rgba[2]),
+                        float(rgba[3]) if len(rgba) > 3 else 1.0,
+                    )
+                else:
+                    value = float(value)
+                    emit.inputs["Color"].default_value = (value, value, value, 1.0)
+            nt.links.new(emit.outputs["Emission"], surface)
+            return self._bake_pass(
+                obj, source_mat, target, name, res, "EMIT", non_color,
+            )
+        finally:
+            if saved_surface is not None:
+                nt.links.new(saved_surface, surface)
+            nt.nodes.remove(emit)
+
+    def _pack_metallic_roughness(self, img_rough, img_metal, name, res):
+        """Combine scalar bake images into glTF's G/B material texture."""
+        import bpy
+        import numpy as np
+
+        rough_px = np.empty(res * res * 4, dtype=np.float32)
+        metal_px = np.empty(res * res * 4, dtype=np.float32)
+        img_rough.pixels.foreach_get(rough_px)
+        img_metal.pixels.foreach_get(metal_px)
+
+        mr_px = np.empty(res * res * 4, dtype=np.float32)
+        mr_px[0::4] = 0.0
+        mr_px[1::4] = rough_px[0::4]
+        mr_px[2::4] = metal_px[0::4]
+        mr_px[3::4] = 1.0
+        image = bpy.data.images.new(name, res, res, alpha=False)
+        image.colorspace_settings.name = "Non-Color"
+        image.pixels.foreach_set(mr_px)
+        image.update()
+        self._temp_images.append(image)
+        return image
+
+    def _bake_stack_material(self, source_mat, obj, stack):
+        """Bake procedural sockets on every layer of a BSDF Stack."""
+        import bpy
+
+        jobs: list[tuple[int, str]] = []
+        bake_normal = False
+        for i in range(len(stack.layers)):
+            for channel in ("Color", "Emission Color"):
+                if self._socket_needs_bake(self._layer_socket(stack, i, channel)):
+                    jobs.append((i, channel))
+            bake_normal = bake_normal or self._socket_needs_bake(
+                self._layer_socket(stack, i, "Normal"),
+            )
+            if (
+                self._socket_needs_bake(self._layer_socket(stack, i, "Metallic"))
+                or self._socket_needs_bake(self._layer_socket(stack, i, "Roughness"))
+            ):
+                jobs.append((i, "Metallic Roughness"))
+        if bake_normal:
+            jobs.append((-1, "Normal"))
+        if not jobs:
+            return source_mat
+
+        res = self._bake_resolution(source_mat)
+        mesh_name = obj.data.name if obj.data is not None else obj.name
+        tag = f"{source_mat.name}__{mesh_name}".replace(" ", "_").replace(".", "_")
+        nt = source_mat.node_tree
+        saved_actives: list = []
+        try:
+            self._begin_bake_session()
+            self._ensure_uv(obj)
+
+            seen_trees = set()
+            for slot in obj.material_slots:
+                material = slot.material
+                if material is None or material is source_mat or material.node_tree is None:
+                    continue
+                tree = material.node_tree
+                if id(tree) in seen_trees:
+                    continue
+                seen_trees.add(id(tree))
+                previous = tree.nodes.active
+                selected = [n for n in tree.nodes if n.type == "TEX_IMAGE" and n.select]
+                if previous is None and not selected:
+                    continue
+                saved_actives.append((tree, previous, selected))
+                tree.nodes.active = None
+                for node in selected:
+                    node.select = False
+
+            target = self._bake_targets.get(source_mat.name)
+            if target is None or target.name not in nt.nodes:
+                target = nt.nodes.new("ShaderNodeTexImage")
+                target.location = (-1400, 700)
+                self._bake_targets[source_mat.name] = target
+                self._temp_nodes.append((nt, target))
+
+            baked: dict[tuple[int, str], object] = {}
+            for layer, channel in jobs:
+                suffix = channel.lower().replace(" ", "_")
+                name = (
+                    f"{tag}_{suffix}" if layer < 0
+                    else f"{tag}_l{layer}_{suffix}"
+                )
+                if channel == "Normal":
+                    baked[(layer, channel)] = self._bake_pass(
+                        obj, source_mat, target, name, res, "NORMAL", True,
+                    )
+                elif channel == "Metallic Roughness":
+                    rough = self._bake_socket_as_emission(
+                        obj, source_mat, target,
+                        self._layer_socket(stack, layer, "Roughness"),
+                        f"{name}_rough", res, True,
+                    )
+                    metal = self._bake_socket_as_emission(
+                        obj, source_mat, target,
+                        self._layer_socket(stack, layer, "Metallic"),
+                        f"{name}_metal", res, True,
+                    )
+                    baked[(layer, channel)] = self._pack_metallic_roughness(
+                        rough, metal, f"{name}_mr", res,
+                    )
+                else:
+                    baked[(layer, channel)] = self._bake_socket_as_emission(
+                        obj, source_mat, target,
+                        self._layer_socket(stack, layer, channel), name, res, False,
+                    )
+
+            work = source_mat.copy()
+            work.name = f"__gltf_baked__{tag}"
+            self._temp_materials.append(work)
+            wnt = work.node_tree
+            baked_stack = self._find_bsdf_stack_node(work)
+            if baked_stack is None:
+                raise RuntimeError("copied material lost its BSDF Stack")
+
+            for (layer, channel), image in baked.items():
+                image_node = wnt.nodes.new("ShaderNodeTexImage")
+                image_node.image = image
+                image_node.location = (-900, 300 - layer * 240)
+                if channel == "Normal":
+                    for i in range(len(baked_stack.layers)):
+                        socket = self._layer_socket(baked_stack, i, "Normal")
+                        for link in list(socket.links):
+                            wnt.links.remove(link)
+                    normal_map = wnt.nodes.new("ShaderNodeNormalMap")
+                    normal_map.location = (-600, 300)
+                    wnt.links.new(image_node.outputs["Color"], normal_map.inputs["Color"])
+                    wnt.links.new(
+                        normal_map.outputs["Normal"],
+                        self._layer_socket(baked_stack, 0, "Normal"),
+                    )
+                elif channel == "Metallic Roughness":
+                    wnt.links.new(
+                        image_node.outputs["Color"],
+                        self._layer_socket(baked_stack, layer, "Metallic"),
+                    )
+                    wnt.links.new(
+                        image_node.outputs["Color"],
+                        self._layer_socket(baked_stack, layer, "Roughness"),
+                    )
+                else:
+                    wnt.links.new(
+                        image_node.outputs["Color"],
+                        self._layer_socket(baked_stack, layer, channel),
+                    )
+            return work
+        except Exception as e:  # noqa: BLE001 - never let a bake abort the export
+            print(f"glTF export: bake failed for '{source_mat.name}' on '{obj.name}': {e}")
+            return None
+        finally:
+            for tree, previous, selected in saved_actives:
+                try:
+                    for node in selected:
+                        node.select = True
+                    tree.nodes.active = previous
+                except Exception:
+                    pass
 
     def _bake_material(self, source_mat, obj):
         """Bake only the *procedural* channels of source_mat for `obj` and return
@@ -372,6 +572,9 @@ class MaterialExporter:
         import bpy
         if source_mat.node_tree is None:
             return None
+        stack = self._find_bsdf_stack_node(source_mat)
+        if stack is not None:
+            return self._bake_stack_material(source_mat, obj, stack)
         ps = self._find_principled_bsdf(source_mat)
         if ps is None:
             return None  # custom / surface-group materials: nothing to bake here
@@ -486,31 +689,29 @@ class MaterialExporter:
             wnt = work.node_tree
             pw = self._find_principled_bsdf(work)
 
-            def _img_node(image, x, y, non_color):
+            def _img_node(image, x, y):
                 node = wnt.nodes.new("ShaderNodeTexImage")
                 node.image = image
                 node.location = (x, y)
-                if non_color:
-                    image.colorspace_settings.name = "Non-Color"
                 return node
 
             if pw is not None:
                 if img_base is not None:
-                    n = _img_node(img_base, -800, 300, False)
+                    n = _img_node(img_base, -800, 300)
                     wnt.links.new(n.outputs["Color"], pw.inputs["Base Color"])
                 if img_norm is not None:
-                    n = _img_node(img_norm, -1000, -300, True)
+                    n = _img_node(img_norm, -1000, -300)
                     nm = wnt.nodes.new("ShaderNodeNormalMap"); nm.location = (-600, -300)
                     wnt.links.new(n.outputs["Color"], nm.inputs["Color"])
                     wnt.links.new(nm.outputs["Normal"], pw.inputs["Normal"])
                 if img_emit is not None:
-                    n = _img_node(img_emit, -800, -600, False)
+                    n = _img_node(img_emit, -800, -600)
                     if "Emission Color" in pw.inputs:
                         wnt.links.new(n.outputs["Color"], pw.inputs["Emission Color"])
                     if "Emission Strength" in pw.inputs and not pw.inputs["Emission Strength"].is_linked:
                         pw.inputs["Emission Strength"].default_value = 1.0
                 if img_mr is not None:
-                    n = _img_node(img_mr, -800, 0, True)
+                    n = _img_node(img_mr, -800, 0)
                     wnt.links.new(n.outputs["Color"], pw.inputs["Metallic"])
                     wnt.links.new(n.outputs["Color"], pw.inputs["Roughness"])
 
