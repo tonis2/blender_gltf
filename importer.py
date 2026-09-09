@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 SUPPORTED_EXTENSIONS = frozenset({
     "CUSTOM_animation_events",
     "CUSTOM_materials_layers",
+    "CUSTOM_packed_texture",
     "CUSTOM_particle_emitter",
     "CUSTOM_walkability_mask",
     "CUSTOM_lights_area",

@@ -86,7 +86,8 @@ class MaterialImporter:
 
         principled = None
         if has_layers:
-            self._build_bsdf_stack(tree, output, gltf_mat, ext_layers)
+            stack = self._build_bsdf_stack(tree, output, gltf_mat, ext_layers)
+            self._apply_stack_packed_channels(tree, stack, mat, gltf_mat)
         else:
             principled = tree.nodes.new("ShaderNodeBsdfPrincipled")
             principled.location = (0, 0)
@@ -248,6 +249,10 @@ class MaterialImporter:
         )
         if tex_node is None:
             return
+        try:
+            tex_node.image.alpha_mode = "CHANNEL_PACKED"
+        except (AttributeError, TypeError, ValueError):
+            pass
 
         sep = tree.nodes.new("ShaderNodeSeparateColor")
         sep.location = (principled.location[0] - 400, principled.location[1] - 200)
@@ -284,6 +289,8 @@ class MaterialImporter:
         if occ is not None and getattr(occ, "index", None) == mr_index:
             if gltf_props is not None:
                 gltf_props.packed_r_channel = "OCCLUSION"
+                gltf_props.occlusion_image = tex_node.image
+                gltf_props.occlusion_channel = "R"
                 if getattr(occ, "strength", None) is not None:
                     gltf_props.occlusion_strength = float(occ.strength)
 
@@ -296,6 +303,53 @@ class MaterialImporter:
                 tree.links.new(alpha_out, principled.inputs["Alpha"])
             if gltf_props is not None:
                 gltf_props.packed_alpha = True
+
+    def _apply_stack_packed_channels(self, tree, stack, mat, gltf_mat) -> None:
+        """Restore packed base-layer AO/alpha metadata on a BSDF Stack."""
+        pbr = gltf_mat.pbr_metallic_roughness
+        if pbr is None or pbr.metallic_roughness_texture is None:
+            return
+        texture_index = pbr.metallic_roughness_texture.index
+        if self.gltf.textures is None or texture_index >= len(self.gltf.textures):
+            return
+        gltf_texture = self.gltf.textures[texture_index]
+        image_index = gltf_texture.source
+        if image_index is None and gltf_texture.extensions:
+            image_index = (gltf_texture.extensions.get("KHR_texture_basisu") or {}).get("source")
+        if image_index is None:
+            return
+        image = self.texture_importer.get_blender_image(image_index)
+        if image is None:
+            return
+        try:
+            image.alpha_mode = "CHANNEL_PACKED"
+        except (AttributeError, TypeError, ValueError):
+            pass
+
+        props = getattr(mat, "gltf_props", None)
+        occ = gltf_mat.occlusion_texture
+        if occ is not None and getattr(occ, "index", None) == texture_index and props is not None:
+            props.packed_r_channel = "OCCLUSION"
+            props.occlusion_image = image
+            props.occlusion_channel = "R"
+            if getattr(occ, "strength", None) is not None:
+                props.occlusion_strength = float(occ.strength)
+
+        extensions = gltf_mat.extensions or {}
+        packed = extensions.get(EXT_PACKED_TEXTURE)
+        if not packed or packed.get("alphaChannel") != "metallicRoughness":
+            return
+        texture_node = next(
+            (node for node in tree.nodes
+             if node.type == "TEX_IMAGE" and node.image == image),
+            None,
+        )
+        alpha_socket = self._stack_socket(stack, 0, "Alpha")
+        if texture_node is not None and alpha_socket is not None:
+            tree.links.new(texture_node.outputs["Alpha"], alpha_socket)
+            stack.rebuild_internals()
+        if props is not None:
+            props.packed_alpha = True
 
     def _wire_channel_factor(self, tree, from_socket, to_socket, factor) -> None:
         """Link a separated metallic/roughness channel into `to_socket`,
@@ -523,7 +577,7 @@ class MaterialImporter:
     # CUSTOM_materials_layers — rebuild a BSDFStackNode
     # ------------------------------------------------------------------
 
-    def _build_bsdf_stack(self, tree, output, gltf_mat, ext: dict) -> None:
+    def _build_bsdf_stack(self, tree, output, gltf_mat, ext: dict):
         """Rebuild a BSDFStackNode from the extension. Layer 0 is the base
         material; layers 1..N come from ext['layers']. The node's BSDF output
         drives Material Output.Surface so the blend is visible in the viewport.
@@ -552,6 +606,7 @@ class MaterialImporter:
         node.rebuild_internals()
 
         tree.links.new(node.outputs["BSDF"], output.inputs["Surface"])
+        return node
 
     def _base_layer_dict(self, gltf_mat, ext: dict | None = None) -> dict:
         """Normalize the base material's fields into the same dict shape used by

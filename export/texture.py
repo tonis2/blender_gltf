@@ -64,8 +64,30 @@ class TextureExporter:
         if image_node.image is None:
             return None
 
-        texture_index = self._gather_texture(image_node, usage)
-        extensions = self._gather_texture_transform(image_node)
+        return self.gather_texture_info_for_image(
+            image_node.image, image_node, tex_coord=tex_coord, usage=usage,
+        )
+
+    def gather_texture_info_for_image(
+        self,
+        blender_image: "bpy.types.Image",
+        template_node: "bpy.types.ShaderNodeTexImage | None" = None,
+        tex_coord: int = 0,
+        usage: str = "color",
+    ) -> TextureInfo:
+        """Gather an image using another texture node's sampler and UV transform.
+
+        Generated channel-packed images do not have an authoring node of their
+        own. A source node supplies the settings shared by the input maps; when
+        there is no source node, glTF's ordinary linear/repeat sampler is used.
+        """
+        texture_index = self._gather_texture(
+            blender_image, template_node, usage,
+        )
+        extensions = (
+            self._gather_texture_transform(template_node)
+            if template_node is not None else None
+        )
         return TextureInfo(
             index=texture_index,
             tex_coord=tex_coord if tex_coord > 0 else None,
@@ -146,10 +168,13 @@ class TextureExporter:
         return {EXT_TEXTURE_TRANSFORM: transform}
 
     def _gather_texture(
-        self, image_node: "bpy.types.ShaderNodeTexImage", usage: str = "color",
+        self,
+        blender_image: "bpy.types.Image",
+        template_node: "bpy.types.ShaderNodeTexImage | None",
+        usage: str = "color",
     ) -> int:
-        sampler_index = self._gather_sampler(image_node)
-        image_index = self._gather_image(image_node.image, usage)
+        sampler_index = self._gather_sampler(template_node)
+        image_index = self._gather_image(blender_image, usage)
 
         key = (image_index, sampler_index)
         if key in self._texture_cache:
@@ -163,34 +188,37 @@ class TextureExporter:
             self.extensions_used.add(EXT_TEXTURE_BASISU)
             self.textures.append(Texture(
                 sampler=sampler_index,
-                name=image_node.image.name,
+                name=blender_image.name,
                 extensions={EXT_TEXTURE_BASISU: {"source": image_index}},
             ))
         else:
             self.textures.append(Texture(
                 source=image_index,
                 sampler=sampler_index,
-                name=image_node.image.name,
+                name=blender_image.name,
             ))
         self._texture_cache[key] = tex_index
         return tex_index
 
-    def _gather_sampler(self, image_node: "bpy.types.ShaderNodeTexImage") -> int:
+    def _gather_sampler(
+        self, image_node: "bpy.types.ShaderNodeTexImage | None",
+    ) -> int:
         # Map Blender texture settings to glTF sampler
-        if image_node.interpolation == "Closest":
+        if image_node is not None and image_node.interpolation == "Closest":
             mag_filter = TextureFilter.NEAREST
             min_filter = TextureFilter.NEAREST
         else:
             mag_filter = TextureFilter.LINEAR
             min_filter = TextureFilter.LINEAR_MIPMAP_LINEAR
 
-        if image_node.extension == "REPEAT":
+        extension = image_node.extension if image_node is not None else "REPEAT"
+        if extension == "REPEAT":
             wrap = TextureWrap.REPEAT
-        elif image_node.extension == "EXTEND":
+        elif extension == "EXTEND":
             wrap = TextureWrap.CLAMP_TO_EDGE
-        elif image_node.extension == "MIRROR":
+        elif extension == "MIRROR":
             wrap = TextureWrap.MIRRORED_REPEAT
-        elif image_node.extension == "CLIP":
+        elif extension == "CLIP":
             # glTF has no "clip to transparent black"; clamp-to-edge is the
             # closest representable wrap mode.
             wrap = TextureWrap.CLAMP_TO_EDGE

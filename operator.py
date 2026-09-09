@@ -97,9 +97,8 @@ class GltfMaterialProperties(bpy.types.PropertyGroup):
         default=False,
     )
 
-    # Hand-packed ORM(A) texture support. The metallicRoughness texture holds
-    # Roughness in G and Metallic in B; its R and A channels are reinterpreted
-    # per these settings so a single artist-packed image round-trips.
+    # ORM(A) texture support. Roughness uses G and Metallic uses B; R and A are
+    # described here so generated and artist-packed images round-trip.
     packed_r_channel: EnumProperty(
         name="Packed R Channel",
         description=(
@@ -129,6 +128,23 @@ class GltfMaterialProperties(bpy.types.PropertyGroup):
         min=0.0,
         max=1.0,
     )
+    occlusion_image: bpy.props.PointerProperty(
+        name="Ambient Occlusion",
+        description="Optional AO map packed into the red channel of the exported ORM texture",
+        type=bpy.types.Image,
+    )
+    occlusion_channel: EnumProperty(
+        name="AO Source Channel",
+        description="Channel read from the ambient occlusion image",
+        items=[
+            ("R", "Red", "Read the red channel"),
+            ("G", "Green", "Read the green channel"),
+            ("B", "Blue", "Read the blue channel"),
+            ("A", "Alpha", "Read the alpha channel"),
+            ("LUMINANCE", "Color Value", "Convert the RGB color to a scalar value"),
+        ],
+        default="R",
+    )
 
 
 class MATERIAL_PT_gltf_properties(bpy.types.Panel):
@@ -151,8 +167,12 @@ class MATERIAL_PT_gltf_properties(bpy.types.Panel):
 
         box = layout.box()
         box.label(text="Packed Texture (ORM/A)")
+        box.prop(props, "occlusion_image")
+        if props.occlusion_image is not None:
+            box.prop(props, "occlusion_channel")
+            box.prop(props, "occlusion_strength")
         box.prop(props, "packed_r_channel")
-        if props.packed_r_channel == "OCCLUSION":
+        if props.packed_r_channel == "OCCLUSION" and props.occlusion_image is None:
             box.prop(props, "occlusion_strength")
         box.prop(props, "packed_alpha")
 
@@ -484,6 +504,14 @@ _EXPORT_PROP_DEFS: dict[str, tuple] = {
         description="Write a mip chain into each KTX2, about 33% more bytes. ",
         default=True,
     )),
+    "pack_pbr_textures": (BoolProperty, dict(
+        name="Pack PBR Textures",
+        description=(
+            "Combine separate ambient occlusion, roughness and metallic maps "
+            "into one glTF ORM texture (R=AO, G=roughness, B=metallic)"
+        ),
+        default=True,
+    )),
     "bake_materials": (BoolProperty, dict(
         name="Bake Materials",
         description=(
@@ -565,6 +593,7 @@ def _draw_material_extras(body, owner):
             # Offer the KTX binaries download when they are missing.
             col.label(text="KTX binaries are not installed", icon="ERROR")
             col.operator("gltf_custom.download_ktx", icon="IMPORT")
+    body.prop(owner, "pack_pbr_textures")
     body.prop(owner, "bake_materials")
     body.prop(owner, "bake_resolution")
 

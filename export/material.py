@@ -119,6 +119,8 @@ class MaterialExporter:
         self._vl_hidden_restore: list = []               # (obj,) view-layer hide_set
         self._temp_linked: list = []                     # (obj, collection)
         self._bake_saved: dict | None = None
+        self._pbr_pack_cache: dict[tuple, object] = {}
+        self._current_gltf_props = None
         # Diagnostics: the material being extracted (for messages), and the
         # once-per-export flags behind them.
         self._material_label: str = ""
@@ -552,12 +554,15 @@ class MaterialExporter:
                         self._layer_socket(baked_stack, 0, "Normal"),
                     )
                 elif channel == "Metallic Roughness":
+                    separate = wnt.nodes.new("ShaderNodeSeparateColor")
+                    separate.location = (-650, 300 - layer * 240)
+                    wnt.links.new(image_node.outputs["Color"], separate.inputs["Color"])
                     wnt.links.new(
-                        image_node.outputs["Color"],
+                        separate.outputs["Blue"],
                         self._layer_socket(baked_stack, layer, "Metallic"),
                     )
                     wnt.links.new(
-                        image_node.outputs["Color"],
+                        separate.outputs["Green"],
                         self._layer_socket(baked_stack, layer, "Roughness"),
                     )
                 else:
@@ -735,8 +740,11 @@ class MaterialExporter:
                         pw.inputs["Emission Strength"].default_value = 1.0
                 if img_mr is not None:
                     n = _img_node(img_mr, -800, 0)
-                    wnt.links.new(n.outputs["Color"], pw.inputs["Metallic"])
-                    wnt.links.new(n.outputs["Color"], pw.inputs["Roughness"])
+                    separate = wnt.nodes.new("ShaderNodeSeparateColor")
+                    separate.location = (-550, 0)
+                    wnt.links.new(n.outputs["Color"], separate.inputs["Color"])
+                    wnt.links.new(separate.outputs["Blue"], pw.inputs["Metallic"])
+                    wnt.links.new(separate.outputs["Green"], pw.inputs["Roughness"])
 
             return work
         except Exception as e:  # noqa: BLE001 - never let a bake abort the export
@@ -794,6 +802,7 @@ class MaterialExporter:
             except Exception:
                 pass
         self._temp_images.clear()
+        self._pbr_pack_cache.clear()
 
         for obj, hidden in self._hidden_restore:
             try:
@@ -852,6 +861,7 @@ class MaterialExporter:
 
     def _extract(self, blender_material: "bpy.types.Material") -> Material:
         self._material_label = getattr(blender_material, "name", "") or ""
+        self._current_gltf_props = getattr(blender_material, "gltf_props", None)
         pbr = None
         normal_texture = None
         emissive_texture = None
@@ -907,7 +917,7 @@ class MaterialExporter:
         if blender_material.use_backface_culling is False:
             double_sided = True
 
-        gltf_props = getattr(blender_material, "gltf_props", None)
+        gltf_props = self._current_gltf_props
 
         # CUSTOM_packed_texture: a hand-packed ORM(A) metallic/roughness texture.
         # Roughness (G) and Metallic (B) already flow through pbr; here the R and
@@ -921,12 +931,18 @@ class MaterialExporter:
         mr_ti = pbr.metallic_roughness_texture if pbr is not None else None
         if gltf_props and mr_ti is not None:
             r_mode = getattr(gltf_props, "packed_r_channel", "NONE")
+            if (
+                getattr(self.settings, "pack_pbr_textures", True)
+                and getattr(gltf_props, "occlusion_image", None) is not None
+            ):
+                r_mode = "OCCLUSION"
             if r_mode == "OCCLUSION":
                 strength = float(getattr(gltf_props, "occlusion_strength", 1.0))
                 occlusion_texture = OcclusionTextureInfo(
                     index=mr_ti.index,
                     tex_coord=mr_ti.tex_coord,
                     strength=None if strength == 1.0 else strength,
+                    extensions=mr_ti.extensions,
                 )
             packed_alpha = bool(getattr(gltf_props, "packed_alpha", False))
 
@@ -1158,6 +1174,297 @@ class MaterialExporter:
                     return hit
         return None
 
+    @staticmethod
+    def _source_key(source) -> tuple:
+        image = source.get("image")
+        if image is None:
+            return ("constant", round(float(source.get("value", 0.0)), 8))
+        try:
+            identity = image.as_pointer()
+        except AttributeError:
+            identity = image.name
+        return (
+            "image", identity, source.get("channel", "LUMINANCE"),
+            round(float(source.get("scale", 1.0)), 8),
+        )
+
+    def _scalar_texture_source(self, socket) -> dict:
+        """Resolve a scalar shader input to an image channel or a constant."""
+        if socket is None:
+            return {
+                "image": None, "node": None, "channel": None,
+                "value": 0.0, "scale": 1.0,
+            }
+        if not socket.is_linked:
+            try:
+                value = float(socket.default_value)
+            except (TypeError, ValueError):
+                value = 0.0
+            return {
+                "image": None, "node": None, "channel": None,
+                "value": _clamp01(value), "scale": 1.0,
+            }
+
+        node, from_socket = _through_reroutes(socket)
+        if node is not None and node.type == "TEX_IMAGE" and node.image is not None:
+            channel = "A" if from_socket.name.upper() == "ALPHA" else "LUMINANCE"
+            return {
+                "image": node.image, "node": node, "channel": channel,
+                "value": None, "scale": 1.0,
+            }
+
+        if node is not None and node.type in ("SEPARATE_COLOR", "SEPRGB"):
+            color_in = node.inputs.get("Color") or node.inputs.get("Image")
+            image_node = self._walk_to_image(color_in)
+            if image_node is not None and image_node.image is not None:
+                return {
+                    "image": image_node.image,
+                    "node": image_node,
+                    "channel": _socket_to_channel(from_socket.name),
+                    "value": None,
+                    "scale": 1.0,
+                }
+
+        if node is not None and node.type == "MATH" and node.operation == "MULTIPLY":
+            linked = [item for item in node.inputs[:2] if item.is_linked]
+            plain = [item for item in node.inputs[:2] if not item.is_linked]
+            if len(linked) == 1 and len(plain) == 1:
+                source = self._scalar_texture_source(linked[0])
+                try:
+                    factor = _clamp01(float(plain[0].default_value))
+                except (TypeError, ValueError):
+                    factor = 1.0
+                if source.get("image") is not None:
+                    source["scale"] = source.get("scale", 1.0) * factor
+                else:
+                    source["value"] = _clamp01(source.get("value", 0.0) * factor)
+                return source
+
+        if node is not None and node.type == "VALUE":
+            try:
+                value = float(from_socket.default_value)
+            except (TypeError, ValueError):
+                value = 0.0
+            return {
+                "image": None, "node": None, "channel": None,
+                "value": _clamp01(value), "scale": 1.0,
+            }
+
+        # Keep the export useful for pass-through groups the generic image
+        # walker understands. Color-to-float conversion is sampled as luminance.
+        image_node = self._walk_to_image(socket)
+        if image_node is not None and image_node.image is not None:
+            return {
+                "image": image_node.image,
+                "node": image_node,
+                "channel": "LUMINANCE",
+                "value": None,
+                "scale": 1.0,
+            }
+
+        # A linked procedural result has no scalar glTF representation. Keep
+        # the spec's neutral factor; Bake Materials handles the exact path.
+        return {
+            "image": None, "node": None, "channel": None,
+            "value": 1.0, "scale": 1.0,
+        }
+
+    @staticmethod
+    def _texture_layout_signature(node) -> tuple | None:
+        if node is None:
+            return None
+        mapping = TextureExporter._find_mapping_node(node.inputs.get("Vector"))
+        transform = None
+        if mapping is not None:
+            transform = tuple(
+                round(float(v), 8)
+                for name in ("Location", "Rotation", "Scale")
+                for v in mapping.inputs[name].default_value
+            )
+        return (node.interpolation, node.extension, transform)
+
+    @staticmethod
+    def _resample_scalar(values, width, height, target_width, target_height):
+        """Bilinearly resize one data channel without changing its value range."""
+        import numpy as np
+
+        values = values.reshape(height, width)
+        if width == target_width and height == target_height:
+            return values.ravel()
+
+        xs = (np.arange(target_width, dtype=np.float32) + 0.5) * width / target_width - 0.5
+        ys = (np.arange(target_height, dtype=np.float32) + 0.5) * height / target_height - 0.5
+        xs = np.clip(xs, 0.0, width - 1.0)
+        ys = np.clip(ys, 0.0, height - 1.0)
+        x0 = np.floor(xs).astype(np.int32)
+        y0 = np.floor(ys).astype(np.int32)
+        x1 = np.minimum(x0 + 1, width - 1)
+        y1 = np.minimum(y0 + 1, height - 1)
+        wx = xs - x0
+        wy = ys - y0
+
+        out = np.empty((target_height, target_width), dtype=np.float32)
+        for y in range(target_height):
+            top = values[y0[y], x0] * (1.0 - wx) + values[y0[y], x1] * wx
+            bottom = values[y1[y], x0] * (1.0 - wx) + values[y1[y], x1] * wx
+            out[y] = top * (1.0 - wy[y]) + bottom * wy[y]
+        return out.ravel()
+
+    def _sample_scalar_source(self, source, width, height):
+        import numpy as np
+
+        image = source.get("image")
+        if image is None:
+            return np.full(width * height, source.get("value", 0.0), dtype=np.float32)
+
+        source_width, source_height = (int(v) for v in image.size)
+        if source_width < 1 or source_height < 1:
+            raise ValueError(f"image '{image.name}' has no pixel data")
+        rgba = np.empty(source_width * source_height * 4, dtype=np.float32)
+        image.pixels.foreach_get(rgba)
+        channel = source.get("channel", "LUMINANCE")
+        if channel in ("R", "G", "B", "A"):
+            values = rgba[("R", "G", "B", "A").index(channel)::4]
+        else:
+            values = (
+                rgba[0::4] * 0.2126
+                + rgba[1::4] * 0.7152
+                + rgba[2::4] * 0.0722
+            )
+        values = np.clip(values, 0.0, 1.0)
+        values = np.clip(values * float(source.get("scale", 1.0)), 0.0, 1.0)
+        return self._resample_scalar(
+            values, source_width, source_height, width, height,
+        )
+
+    def _pack_pbr_image(self, roughness, metallic, occlusion, alpha):
+        import bpy
+        import numpy as np
+
+        sources = (occlusion, roughness, metallic, alpha)
+        images = [s["image"] for s in sources if s.get("image") is not None]
+        width = max(int(image.size[0]) for image in images)
+        height = max(int(image.size[1]) for image in images)
+        key = (
+            width, height, *(self._source_key(source) for source in sources),
+        )
+        cached = self._pbr_pack_cache.get(key)
+        if cached is not None:
+            return cached
+
+        pixels = np.empty(width * height * 4, dtype=np.float32)
+        for offset, source in enumerate(sources):
+            pixels[offset::4] = self._sample_scalar_source(source, width, height)
+
+        clean = "".join(c if c.isalnum() or c in "-_" else "_" for c in self._material_label)
+        image = bpy.data.images.new(
+            f"{clean or 'Material'}_ORM", width, height, alpha=True,
+        )
+        image.colorspace_settings.name = "Non-Color"
+        image.alpha_mode = "CHANNEL_PACKED"
+        image.pixels.foreach_set(pixels)
+        image.update()
+        self._temp_images.append(image)
+        self._pbr_pack_cache[key] = image
+        return image
+
+    def _gather_metallic_roughness(
+        self, metallic_socket, roughness_socket, include_auxiliary=True,
+    ):
+        """Return factors and a standard glTF metallic-roughness texture."""
+        metallic = self._scalar_texture_source(metallic_socket)
+        roughness = self._scalar_texture_source(roughness_socket)
+        metallic_factor = (
+            metallic.get("scale", 1.0) if metallic.get("image") is not None
+            else metallic["value"]
+        )
+        roughness_factor = (
+            roughness.get("scale", 1.0) if roughness.get("image") is not None
+            else roughness["value"]
+        )
+        if metallic.get("image") is not None and metallic_factor == 1.0:
+            metallic_factor = None
+        if roughness.get("image") is not None and roughness_factor == 1.0:
+            roughness_factor = None
+
+        if not getattr(self.settings, "pack_pbr_textures", True):
+            node = metallic.get("node") or roughness.get("node")
+            texture = self.texture_exporter.gather_texture_info(node) if node else None
+            return metallic_factor, roughness_factor, texture
+
+        props = self._current_gltf_props if include_auxiliary else None
+
+        occlusion_image = getattr(props, "occlusion_image", None) if props else None
+        if occlusion_image is not None:
+            occlusion = {
+                "image": occlusion_image,
+                "node": None,
+                "channel": getattr(props, "occlusion_channel", "R"),
+                "value": None,
+                "scale": 1.0,
+            }
+        elif props and getattr(props, "packed_r_channel", "NONE") == "OCCLUSION":
+            source = roughness if roughness.get("image") is not None else metallic
+            occlusion = dict(source)
+            occlusion["channel"] = "R"
+        else:
+            occlusion = {
+                "image": None, "node": None, "channel": None,
+                "value": 1.0, "scale": 1.0,
+            }
+
+        if props and getattr(props, "packed_alpha", False):
+            source = roughness if roughness.get("image") is not None else metallic
+            alpha = dict(source)
+            alpha["channel"] = "A"
+        else:
+            alpha = {
+                "image": None, "node": None, "channel": None,
+                "value": 1.0, "scale": 1.0,
+            }
+
+        data_sources = (roughness, metallic, occlusion, alpha)
+        if not any(source.get("image") is not None for source in data_sources):
+            return metallic_factor, roughness_factor, None
+
+        # Imported and hand-authored ORM maps already have the exact glTF
+        # channel layout. Reuse them so a round-trip never recompresses pixels.
+        shared = roughness.get("image")
+        already_packed = (
+            shared is not None
+            and metallic.get("image") is shared
+            and roughness.get("channel") == "G"
+            and metallic.get("channel") == "B"
+            and (occlusion.get("image") is None
+                 or (occlusion.get("image") is shared and occlusion.get("channel") == "R"))
+            and (alpha.get("image") is None
+                 or (alpha.get("image") is shared and alpha.get("channel") == "A"))
+        )
+        template = roughness.get("node") or metallic.get("node")
+        if already_packed:
+            return (
+                metallic_factor,
+                roughness_factor,
+                self.texture_exporter.gather_texture_info_for_image(shared, template),
+            )
+
+        layouts = {
+            self._texture_layout_signature(source.get("node"))
+            for source in (roughness, metallic)
+            if source.get("node") is not None
+        }
+        if len(layouts) > 1:
+            print(
+                f"[glTF export] material '{self._material_label}': roughness and "
+                "metallic maps use different sampler or Mapping settings; the "
+                "packed ORM texture uses the roughness map settings"
+            )
+
+        image = self._pack_pbr_image(roughness, metallic, occlusion, alpha)
+        texture = self.texture_exporter.gather_texture_info_for_image(image, template)
+        # Constants and any scalar factors have become texels in the packed map.
+        return None, None, texture
+
     def _gather_pbr(
         self, principled: "bpy.types.ShaderNodeBsdfPrincipled"
     ) -> MaterialPBRMetallicRoughness:
@@ -1165,32 +1472,11 @@ class MaterialExporter:
         base_color_socket = principled.inputs.get("Base Color")
         base_color_factor, base_color_texture = self._read_color_socket(base_color_socket)
 
-        # Metallic / Roughness scalar factors. When a socket is linked Blender
-        # ignores its default_value, so the glTF factor must stay at the spec
-        # default of 1.0 (write None). Otherwise the stale socket default would
-        # be multiplied into the texture on a spec-correct import — e.g. halving
-        # a roughness map that sits at a 0.5 default.
         metallic_socket = principled.inputs.get("Metallic")
-        if metallic_socket is not None and metallic_socket.is_linked:
-            metallic_factor = None
-        else:
-            metallic = self._get_socket_default(principled, "Metallic")
-            metallic_factor = float(metallic) if metallic is not None else None
-
         roughness_socket = principled.inputs.get("Roughness")
-        if roughness_socket is not None and roughness_socket.is_linked:
-            roughness_factor = None
-        else:
-            roughness = self._get_socket_default(principled, "Roughness")
-            roughness_factor = float(roughness) if roughness is not None else None
-
-        # Metallic/Roughness texture (if connected)
-        mr_texture = None
-        mr_node = self._get_connected_image_node(principled, "Metallic")
-        if mr_node is None:
-            mr_node = self._get_connected_image_node(principled, "Roughness")
-        if mr_node:
-            mr_texture = self.texture_exporter.gather_texture_info(mr_node)
+        metallic_factor, roughness_factor, mr_texture = (
+            self._gather_metallic_roughness(metallic_socket, roughness_socket)
+        )
 
         # glTF carries opacity in baseColorFactor[3]. Blender carries it on the
         # shader's own Alpha socket, which _read_color_socket never sees -- it
@@ -1746,9 +2032,10 @@ class MaterialExporter:
                 pbr["baseColorFactor"] = bcf
         if bc_tex is not None:
             pbr["baseColorTexture"] = bc_tex
-        mr_tex = (
-            self._layer_image_tex(node, i, "Metallic")
-            or self._layer_image_tex(node, i, "Roughness")
+        metallic_socket = self._layer_socket(node, i, "Metallic")
+        roughness_socket = self._layer_socket(node, i, "Roughness")
+        m, r, mr_tex = self._gather_metallic_roughness(
+            metallic_socket, roughness_socket, include_auxiliary=False,
         )
         # Metallic and roughness travel together or not at all.
         #
@@ -1773,10 +2060,8 @@ class MaterialExporter:
             or self._layer_states(node, i, "Roughness")
         )
         if states_surface:
-            m = self._layer_scalar_factor(node, i, "Metallic")
             if m is not None and m != 1.0:
                 pbr["metallicFactor"] = m
-            r = self._layer_scalar_factor(node, i, "Roughness")
             if r is not None and r != 1.0:
                 pbr["roughnessFactor"] = r
         if mr_tex is not None:

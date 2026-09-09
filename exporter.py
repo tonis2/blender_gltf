@@ -61,6 +61,7 @@ class ExportSettings:
     ktx_normal_quality: int = 100  # 0-100, normal + height maps (KTX2 only)
     ktx_effort: int = 2  # 0-10 encoder search effort, all KTX2 encodes
     ktx_mipmaps: bool = True  # write a mip chain into each KTX2 (adds ~33%)
+    pack_pbr_textures: bool = True
     bake_materials: bool = False
     bake_resolution: str = "1024"  # "512" / "1024" / "2048" / "4096"
     force_64bit: bool = False
