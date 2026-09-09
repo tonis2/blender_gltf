@@ -151,6 +151,37 @@ def shear_correction(matrix):
     return shear
 
 
+def split_affine_to_trs(matrix):
+    """Split an affine matrix into two exact TRS transforms.
+
+    SVD expresses the linear part as U * scale * Vt. Reflections are moved
+    into the scale so both U and Vt remain valid quaternion rotations.
+    """
+    import mathutils
+
+    linear = np.array(matrix.to_3x3(), dtype=np.float64)
+    left, scale, right = np.linalg.svd(linear)
+
+    if np.linalg.det(left) < 0.0:
+        left[:, -1] *= -1.0
+        scale[-1] *= -1.0
+    if np.linalg.det(right) < 0.0:
+        right[-1, :] *= -1.0
+        scale[-1] *= -1.0
+
+    outer = mathutils.Matrix.LocRotScale(
+        matrix.to_translation(),
+        mathutils.Matrix(left.tolist()).to_quaternion(),
+        mathutils.Vector(scale.tolist()),
+    )
+    inner = mathutils.Matrix.LocRotScale(
+        None,
+        mathutils.Matrix(right.tolist()).to_quaternion(),
+        None,
+    )
+    return outer, inner
+
+
 def gather_material_map(obj, material_exporter) -> dict[int, int]:
     """Gather an object's materials and return the mapping:
     Blender material slot index -> glTF material index."""

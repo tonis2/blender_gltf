@@ -14,6 +14,7 @@ from .converter import (
     convert_location, convert_rotation, convert_scale,
     convert_location_array, convert_rotation_array, convert_scale_array,
     trs_to_node_fields, gather_material_map, shear_correction,
+    split_affine_to_trs,
 )
 from .mesh import MeshExporter
 from .material import MaterialExporter
@@ -779,13 +780,9 @@ class SceneExporter:
         instance_groups: dict[str, list[tuple[list[float], list[float], list[float]]]] = defaultdict(list)
         source_objects: dict[str, "bpy.types.Object"] = {}
         instancer_names: set[str] = set()
-        # Instances whose world matrix carries shear (a non-uniformly scaled
-        # instancer combined with a rotated instance) can't be GPU-instanced:
-        # the EXT_mesh_gpu_instancing accessor is TRS-only, and a shared mesh
-        # can't hold a per-instance shear bake. These are collected here and
-        # emitted as individual nodes with the shear baked into a private mesh
-        # copy. Each entry: (mesh_name, (loc, rot_wxyz, scl), shear3).
-        sheared_instances: list[tuple[str, tuple, "object"]] = []
+        # EXT_mesh_gpu_instancing is TRS-only. Keep sheared instances separate,
+        # then represent each with two ordinary TRS nodes sharing one mesh.
+        sheared_instances: list[tuple[str, "object"]] = []
 
         for inst in depsgraph.object_instances:
             if not inst.is_instance:
@@ -815,7 +812,7 @@ class SceneExporter:
             if obj.name not in source_objects:
                 source_objects[obj.name] = obj
             if shear is not None:
-                sheared_instances.append((obj.name, trs, shear))
+                sheared_instances.append((obj.name, matrix_world.copy()))
                 continue
             instance_groups[obj.name].append(trs)
 
@@ -883,11 +880,9 @@ class SceneExporter:
                 if node_idx is not None:
                     result_nodes.append(node_idx)
 
-        # Emit shear-bearing instances as individual baked nodes (the shear is
-        # baked into a private mesh copy via correction_matrix).
-        for mesh_name, trs, shear in sheared_instances:
-            node_idx = self._gather_single_instance(
-                [mesh_name], source_objects, trs, correction_matrix=shear,
+        for mesh_name, matrix_world in sheared_instances:
+            node_idx = self._gather_sheared_instance(
+                mesh_name, source_objects, matrix_world,
             )
             if node_idx is not None:
                 result_nodes.append(node_idx)
@@ -946,6 +941,44 @@ class SceneExporter:
         idx = len(self.nodes)
         self.nodes.append(node)
         return idx
+
+    def _gather_sheared_instance(
+        self,
+        mesh_name: str,
+        source_objects: dict[str, "bpy.types.Object"],
+        matrix_world,
+    ) -> int | None:
+        """Emit an exact sheared transform as two TRS nodes sharing a mesh."""
+        obj = source_objects[mesh_name]
+        material_map = self._gather_materials_for_object(obj)
+        mesh_index = self.mesh_exporter.gather(obj, material_map)
+        if mesh_index is None:
+            return None
+
+        outer, inner = split_affine_to_trs(matrix_world)
+        inner_translation, inner_rotation, inner_scale = trs_to_node_fields(inner)
+        mesh_node = Node(
+            name=mesh_name,
+            mesh=mesh_index,
+            translation=inner_translation,
+            rotation=inner_rotation,
+            scale=inner_scale,
+        )
+        mesh_node_index = len(self.nodes)
+        self.nodes.append(mesh_node)
+        self._wrap_dequant(mesh_node)
+
+        translation, rotation, scale = trs_to_node_fields(outer)
+        node = Node(
+            name=f"{mesh_name}_shear",
+            children=[mesh_node_index],
+            translation=translation,
+            rotation=rotation,
+            scale=scale,
+        )
+        index = len(self.nodes)
+        self.nodes.append(node)
+        return index
 
     def _gather_gpu_instancing(
         self,
