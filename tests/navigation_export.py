@@ -12,7 +12,7 @@ from contextlib import ExitStack
 
 import bpy
 import blender_gltf
-from blender_gltf.export.navigation import NavigationExporter, _linked
+from blender_gltf.export.navigation import NavigationExporter, bake, _linked
 from blender_gltf.exporter import ExportSettings
 from blender_gltf.gltf.buffer import BufferBuilder
 
@@ -27,13 +27,20 @@ def main():
     stepped = {source, target, index(2, 2, 1)}
     assert _linked(stepped, dims, 1.0, 1.0, source, 1, 1, 1)
     try:
-        NavigationExporter(BufferBuilder(), ExportSettings(
-            navigation_cell_size=float("nan"),
-        )).gather(bpy.context, {})
+        bake(bpy.context, [], profile_name="player", cell_size=float("nan"),
+             agent_radius=0.3, agent_height=1.66, step_height=0.5, slope_limit=54.0)
     except ValueError:
         pass
     else:
         raise AssertionError("non-finite navigation setting was accepted")
+    try:
+        NavigationExporter(BufferBuilder(), ExportSettings(
+            export_navigation=True,
+        )).gather(bpy.context.scene)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("export accepted a scene with no navigation bake")
     bpy.ops.object.select_all(action="SELECT")
     bpy.ops.object.delete(use_global=False)
 
@@ -108,6 +115,30 @@ def main():
     bounds.scale = (1.0, 1.0, 0.5)
     bpy.context.view_layer.update()
 
+    # The bake is its own step now: select the ground meshes, then press the button.
+    bpy.ops.object.select_all(action="DESELECT")
+    sources = (floor, wall, sphere, capsule, hull, disabled, compound_child)
+    for obj in sources:
+        obj.select_set(True)
+    bpy.context.view_layer.objects.active = floor
+    result = bpy.ops.gltf_custom.bake_navigation(
+        profile_name="player",
+        cell_size=0.5,
+        agent_radius=0.3,
+        agent_height=1.66,
+        step_height=0.5,
+        slope_limit=54.0,
+        bounds_object="Navigation Bounds",
+    )
+    assert result == {"FINISHED"}, result
+    cache = bpy.context.scene.gltf_navigation
+    assert cache.baked and cache.cell_count > 0
+    assert list(cache.dimensions) == [23, 19, 23], list(cache.dimensions)
+    assert len(cache.sources) == len(sources)
+    preview = next(obj for obj in bpy.context.scene.objects
+                   if obj.get("gltf_navigation_preview"))
+    assert len(preview.data.polygons) > 0
+
     with ExitStack() as cleanup:
         requested = os.environ.get("NAVIGATION_TEST_OUTPUT")
         if requested:
@@ -121,11 +152,6 @@ def main():
             filepath=path,
             export_format=export_format,
             export_navigation=True,
-            navigation_cell_size=0.5,
-            navigation_agent_radius=0.3,
-            navigation_agent_height=1.66,
-            navigation_step_height=0.5,
-            navigation_slope_limit=54.0,
             export_materials=False,
             export_animations=False,
             export_environment_map=False,
@@ -147,6 +173,7 @@ def main():
             with open(os.path.join(os.path.dirname(path), document["buffers"][0]["uri"]), "rb") as handle:
                 binary = handle.read()
         assert "CUSTOM_physics_navigation" in document["extensionsUsed"]
+        assert not any(node.get("name") == "Navigation Bake" for node in document["nodes"])
         extension = document["extensions"]["CUSTOM_physics_navigation"]
         assert extension["version"] == 1 and len(extension["profiles"]) == 1
         profile = extension["profiles"][0]

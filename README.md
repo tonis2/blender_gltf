@@ -25,7 +25,7 @@ A custom Blender addon for exporting and importing scenes in glTF 2.0 format.
 | `KHR_animation_pointer` | Material property animations |
 | `KHR_physics_rigid_bodies` | Rigid bodies, colliders, and joints |
 | `KHR_implicit_shapes` | Collision shapes for physics |
-| `CUSTOM_physics_navigation` | Optional root-level precomputed navigation profiles derived from physics colliders. Export only — see [`extensions/physics_navigation.md`](extensions/physics_navigation.md) |
+| `CUSTOM_physics_navigation` | Optional root-level precomputed navigation profile, baked from the ground meshes you select in Scene Properties › glTF Navigation. Export only — see [`extensions/physics_navigation.md`](extensions/physics_navigation.md) |
 | `EXT_mesh_gpu_instancing` | Efficient GPU instancing for repeated objects |
 | `KHR_texture_basisu` | KTX2 textures, written when Image Format is KTX2. UASTC and ETC1S are the Basis Universal payloads the spec means; the **BC7** codec option writes BC7 blocks through the same reference, which a desktop GPU uploads with no transcode but a strict reader will refuse |
 | `KHR_environment_map` | World environment as a KTX2 cubemap + irradiance SH. Export only, and the upstream spec is an unmerged draft — see [`extensions/environment_map.md`](extensions/environment_map.md) |

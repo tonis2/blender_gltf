@@ -1,8 +1,15 @@
+import hashlib
+import struct
+
 import bpy
-from bpy.props import EnumProperty, BoolProperty, StringProperty, FloatProperty, FloatVectorProperty, IntProperty
+from bpy.props import (
+    EnumProperty, BoolProperty, StringProperty, FloatProperty, FloatVectorProperty,
+    IntProperty, IntVectorProperty, CollectionProperty,
+)
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 from . import ktx_lib
+from .export import navigation
 from .exporter import ExportSettings, GltfExporter
 from .importer import ImportSettings, GltfImporter
 
@@ -212,6 +219,292 @@ class PHYSICS_PT_khr_physics(bpy.types.Panel):
         col.prop(props, "restitution_combine")
 
 
+_NAV_SETTINGS = ("profile_name", "cell_size", "agent_radius", "agent_height",
+                 "step_height", "slope_limit", "bounds_object")
+_NAV_PREVIEW = "gltf_navigation_preview"
+
+
+def _navigation_preview(scene):
+    for obj in scene.objects:
+        if obj.get(_NAV_PREVIEW):
+            return obj
+    return None
+
+
+def _update_navigation_preview(self, context):
+    preview = _navigation_preview(context.scene)
+    if preview is not None:
+        preview.hide_viewport = not self.show_preview
+
+
+def _navigation_sources(context):
+    """Selected meshes, or the ones the standing bake was made from."""
+    selected = [obj for obj in context.selected_objects if obj.type == "MESH"]
+    if selected:
+        return selected
+    scene = context.scene
+    found = (scene.objects.get(entry.name) for entry in scene.gltf_navigation.sources)
+    return [obj for obj in found if obj is not None and obj.type == "MESH"]
+
+
+def _source_signature(objects):
+    """Fingerprint of what a bake was made from, cheap enough to redraw with."""
+    digest = hashlib.sha256()
+    for obj in sorted(objects, key=lambda item: item.name_full):
+        digest.update(obj.name_full.encode("utf8"))
+        digest.update(struct.pack("<16f", *[value for row in obj.matrix_world for value in row]))
+        digest.update(struct.pack("<2i", len(obj.data.vertices), len(obj.data.polygons)))
+    return digest.hexdigest()
+
+
+def _build_navigation_preview(context, cache, cells):
+    """Rebuild the walkable-floor preview, merging cells into runs along X."""
+    nx, ny, _ = cache.dimensions
+    cell = cache.cell_size
+    ox, oy, oz = cache.origin
+    lift = cell * 0.02
+
+    rows: dict[tuple[int, int], list[int]] = {}
+    for voxel in cells:
+        voxel = int(voxel)
+        rows.setdefault(((voxel // nx) % ny, voxel // (nx * ny)), []).append(voxel % nx)
+
+    verts, faces = [], []
+    for (y, z), xs in rows.items():
+        xs.sort()
+        start = previous = xs[0]
+        for x in xs[1:] + [None]:
+            if x == previous + 1:
+                previous = x
+                continue
+            # Y-up grid space back to Blender: (u, v, w) -> (u, -w, v)
+            u0, u1 = ox + start * cell, ox + (previous + 1) * cell
+            w0, w1 = oz + z * cell, oz + (z + 1) * cell
+            v = oy + y * cell + lift
+            base = len(verts)
+            verts.extend(((u0, -w0, v), (u1, -w0, v), (u1, -w1, v), (u0, -w1, v)))
+            faces.append((base, base + 1, base + 2, base + 3))
+            if x is None:
+                break
+            start = previous = x
+
+    mesh = bpy.data.meshes.new("Navigation Bake")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+
+    preview = _navigation_preview(context.scene)
+    if preview is None:
+        preview = bpy.data.objects.new("Navigation Bake", mesh)
+        preview[_NAV_PREVIEW] = True
+        context.scene.collection.objects.link(preview)
+    else:
+        stale = preview.data
+        preview.data = mesh
+        if stale.users == 0:
+            bpy.data.meshes.remove(stale)
+    preview.matrix_world.identity()
+    preview.hide_select = True
+    preview.hide_render = True
+    preview.hide_viewport = not cache.show_preview
+    preview.show_wire = True
+
+
+class GltfNavigationSource(bpy.types.PropertyGroup):
+    name: StringProperty()
+
+
+class GltfNavigationBake(bpy.types.PropertyGroup):
+    """This scene's navigation grid, baked on demand and saved with the .blend."""
+
+    profile_name: StringProperty(name="Profile", default="player")
+    cell_size: FloatProperty(name="Cell Size", min=0.01, default=0.42, unit="LENGTH")
+    agent_radius: FloatProperty(name="Agent Radius", min=0.0, default=0.30, unit="LENGTH")
+    agent_height: FloatProperty(name="Agent Height", min=0.01, default=1.66, unit="LENGTH")
+    step_height: FloatProperty(name="Step Height", min=0.0, default=0.42, unit="LENGTH")
+    slope_limit: FloatProperty(name="Slope Limit (degrees)", min=0.0, max=89.9, default=54.0)
+    bounds_object: StringProperty(name="Bounds Object")
+
+    baked: BoolProperty(default=False)
+    origin: FloatVectorProperty(size=3)
+    dimensions: IntVectorProperty(size=3)
+    components: IntProperty()
+    largest_component: IntProperty()
+    solid_cells: IntProperty()
+    floor_cells: IntProperty()
+    cell_count: IntProperty()
+    source_hash: StringProperty()
+    source_signature: StringProperty()
+    sources: CollectionProperty(type=GltfNavigationSource)
+    # base64 of the zlib-compressed uint32 cell indices; IDProperties hold no bytes.
+    cells: StringProperty()
+    show_preview: BoolProperty(
+        name="Show Preview", default=True, update=_update_navigation_preview,
+    )
+
+
+class SCENE_OT_gltf_navigation_bake(bpy.types.Operator):
+    """Bake a navigation grid over the selected ground meshes and store it in this scene"""
+
+    bl_idname = "gltf_custom.bake_navigation"
+    bl_label = "Bake Navigation"
+    bl_options = {"REGISTER", "UNDO"}
+
+    profile_name: StringProperty(name="Profile", default="player")
+    cell_size: FloatProperty(name="Cell Size", min=0.01, default=0.42, unit="LENGTH")
+    agent_radius: FloatProperty(name="Agent Radius", min=0.0, default=0.30, unit="LENGTH")
+    agent_height: FloatProperty(name="Agent Height", min=0.01, default=1.66, unit="LENGTH")
+    step_height: FloatProperty(name="Step Height", min=0.0, default=0.42, unit="LENGTH")
+    slope_limit: FloatProperty(name="Slope Limit (degrees)", min=0.0, max=89.9, default=54.0)
+    bounds_object: StringProperty(name="Bounds Object")
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene is not None
+
+    def invoke(self, context, event):
+        if not _navigation_sources(context):
+            self.report({"ERROR"}, "Select the ground meshes to bake navigation over")
+            return {"CANCELLED"}
+        cache = context.scene.gltf_navigation
+        for prop in _NAV_SETTINGS:
+            setattr(self, prop, getattr(cache, prop))
+        return context.window_manager.invoke_props_dialog(self, width=340)
+
+    def draw(self, context):
+        layout = self.layout
+        count = len(_navigation_sources(context))
+        layout.label(text=f"Baking {count} mesh{'' if count == 1 else 'es'}.", icon="MESH_GRID")
+        col = layout.column()
+        for prop in _NAV_SETTINGS[:-1]:
+            col.prop(self, prop)
+        col.prop_search(self, "bounds_object", context.scene, "objects")
+        col.label(text="Leave Bounds Object empty to fit the baked meshes.")
+
+    def execute(self, context):
+        sources = _navigation_sources(context)
+        try:
+            result = navigation.bake(
+                context, sources,
+                profile_name=self.profile_name,
+                cell_size=self.cell_size,
+                agent_radius=self.agent_radius,
+                agent_height=self.agent_height,
+                step_height=self.step_height,
+                slope_limit=self.slope_limit,
+                bounds_object=self.bounds_object,
+            )
+        except ValueError as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+
+        cache = context.scene.gltf_navigation
+        for prop in _NAV_SETTINGS:
+            setattr(cache, prop, getattr(self, prop))
+        cache.profile_name = result["name"]
+        cache.origin = result["origin"]
+        cache.dimensions = result["dimensions"]
+        for key in ("components", "largest_component", "solid_cells",
+                    "floor_cells", "source_hash"):
+            setattr(cache, key, result[key])
+        cache.cells = navigation.encode_cells(result["cells"])
+        cache.cell_count = len(result["cells"])
+        cache.sources.clear()
+        for obj in sorted(sources, key=lambda item: item.name_full):
+            cache.sources.add().name = obj.name
+        cache.source_signature = _source_signature(sources)
+        cache.baked = True
+
+        _build_navigation_preview(context, cache, result["cells"])
+        self.report({"INFO"}, "Baked {:,} walkable cells in {} island(s)".format(
+            cache.cell_count, cache.components))
+        return {"FINISHED"}
+
+
+class SCENE_OT_gltf_navigation_clear(bpy.types.Operator):
+    """Discard this scene's navigation bake and remove its preview"""
+
+    bl_idname = "gltf_custom.clear_navigation"
+    bl_label = "Clear Navigation Bake"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene is not None and context.scene.gltf_navigation.baked
+
+    def execute(self, context):
+        preview = _navigation_preview(context.scene)
+        if preview is not None:
+            mesh = preview.data
+            bpy.data.objects.remove(preview)
+            if mesh.users == 0:
+                bpy.data.meshes.remove(mesh)
+        cache = context.scene.gltf_navigation
+        cache.baked = False
+        cache.cells = ""
+        cache.cell_count = 0
+        cache.source_hash = ""
+        cache.source_signature = ""
+        cache.sources.clear()
+        return {"FINISHED"}
+
+
+class SCENE_PT_gltf_navigation(bpy.types.Panel):
+    """Panel in the scene properties for the glTF navigation bake."""
+
+    bl_label = "glTF Navigation"
+    bl_idname = "SCENE_PT_gltf_navigation"
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = "scene"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        cache = context.scene.gltf_navigation
+
+        layout.operator(
+            "gltf_custom.bake_navigation",
+            text="Re-bake Navigation" if cache.baked else "Bake Navigation",
+            icon="MESH_GRID",
+        )
+
+        if not cache.baked:
+            selected = len([obj for obj in context.selected_objects if obj.type == "MESH"])
+            layout.label(text=f"{selected} mesh(es) selected" if selected
+                         else "Select the ground meshes to bake over")
+            return
+
+        box = layout.box()
+        col = box.column(align=True)
+        col.label(text=f"Profile: {cache.profile_name}")
+        col.label(text="Grid: {} x {} x {} cells of {:.3g} m".format(
+            *cache.dimensions, cache.cell_size))
+        col.label(text="Agent: radius {:.3g}  height {:.3g}  step {:.3g}  slope {:.3g}".format(
+            cache.agent_radius, cache.agent_height, cache.step_height, cache.slope_limit))
+        col.label(text="Walkable {:,} of {:,} solid".format(cache.cell_count, cache.solid_cells))
+        if cache.components > 1:
+            col.label(text="Islands: {} — largest holds {:,}".format(
+                cache.components, cache.largest_component), icon="ERROR")
+        else:
+            col.label(text="One connected island", icon="CHECKMARK")
+
+        box = layout.box()
+        box.label(text="Baked from")
+        col = box.column(align=True)
+        for entry in cache.sources:
+            col.label(text=entry.name, icon="OUTLINER_OB_MESH")
+
+        live = [context.scene.objects.get(entry.name) for entry in cache.sources]
+        live = [obj for obj in live if obj is not None and obj.type == "MESH"]
+        if len(live) != len(cache.sources) or _source_signature(live) != cache.source_signature:
+            layout.label(text="Sources changed since this bake", icon="ERROR")
+
+        row = layout.row(align=True)
+        row.prop(cache, "show_preview", toggle=True,
+                 icon="HIDE_OFF" if cache.show_preview else "HIDE_ON")
+        row.operator("gltf_custom.clear_navigation", text="Clear", icon="X")
+
+
 # Single source of truth for every export option shared between the operator
 # and the per-scene settings group. bpy property definitions are one-shot
 # descriptors, so each class gets fresh instances built from these
@@ -300,16 +593,12 @@ _EXPORT_PROP_DEFS: dict[str, tuple] = {
     )),
     "export_navigation": (BoolProperty, dict(
         name="Navigation Grid",
-        description="Bake CUSTOM_physics_navigation from passive physics colliders",
+        description=(
+            "Write the scene's baked navigation grid as CUSTOM_physics_navigation. "
+            "Bake it first in Scene Properties"
+        ),
         default=False,
     )),
-    "navigation_profile_name": (StringProperty, dict(name="Profile", default="player")),
-    "navigation_cell_size": (FloatProperty, dict(name="Cell Size", min=0.01, default=0.42, unit="LENGTH")),
-    "navigation_agent_radius": (FloatProperty, dict(name="Agent Radius", min=0.0, default=0.30, unit="LENGTH")),
-    "navigation_agent_height": (FloatProperty, dict(name="Agent Height", min=0.01, default=1.66, unit="LENGTH")),
-    "navigation_step_height": (FloatProperty, dict(name="Step Height", min=0.0, default=0.42, unit="LENGTH")),
-    "navigation_slope_limit": (FloatProperty, dict(name="Slope Limit (degrees)", min=0.0, max=89.9, default=54.0)),
-    "navigation_bounds_object": (StringProperty, dict(name="Bounds Object", default="Navigation Bounds")),
     "export_extras": (BoolProperty, dict(
         name="Custom Properties",
         description="Export object custom properties as glTF node extras",
@@ -554,11 +843,7 @@ _EXPORT_PANELS = (
     ("GLTF_export_instancing", "Instancing", ("export_gpu_instancing",)),
     ("GLTF_export_lod", "LOD", ("export_lods",)),
     ("GLTF_export_cameras", "Cameras", ("export_camera_y_up",)),
-    ("GLTF_export_physics", "Physics", (
-        "export_physics", "export_navigation", "navigation_profile_name",
-        "navigation_cell_size", "navigation_agent_radius", "navigation_agent_height",
-        "navigation_step_height", "navigation_slope_limit", "navigation_bounds_object",
-    )),
+    ("GLTF_export_physics", "Physics", ("export_physics", "export_navigation")),
     ("GLTF_export_particles", "Particles", ("export_particles",)),
     ("GLTF_export_interactivity", "Interactivity", ("export_interactivity",)),
     ("GLTF_export_audio", "Audio", ("export_audio",)),
@@ -970,6 +1255,12 @@ def register():
     bpy.utils.register_class(KHR_PhysicsProperties)
     bpy.types.Object.khr_physics = bpy.props.PointerProperty(type=KHR_PhysicsProperties)
     bpy.utils.register_class(PHYSICS_PT_khr_physics)
+    bpy.utils.register_class(GltfNavigationSource)
+    bpy.utils.register_class(GltfNavigationBake)
+    bpy.types.Scene.gltf_navigation = bpy.props.PointerProperty(type=GltfNavigationBake)
+    bpy.utils.register_class(SCENE_OT_gltf_navigation_bake)
+    bpy.utils.register_class(SCENE_OT_gltf_navigation_clear)
+    bpy.utils.register_class(SCENE_PT_gltf_navigation)
     bpy.utils.register_class(GltfExportSceneSettings)
     bpy.types.Scene.gltf_export_settings = bpy.props.PointerProperty(type=GltfExportSceneSettings)
     bpy.utils.register_class(EXPORT_SCENE_OT_gltf)
@@ -985,6 +1276,12 @@ def unregister():
     bpy.utils.unregister_class(EXPORT_SCENE_OT_gltf)
     del bpy.types.Scene.gltf_export_settings
     bpy.utils.unregister_class(GltfExportSceneSettings)
+    bpy.utils.unregister_class(SCENE_PT_gltf_navigation)
+    bpy.utils.unregister_class(SCENE_OT_gltf_navigation_clear)
+    bpy.utils.unregister_class(SCENE_OT_gltf_navigation_bake)
+    del bpy.types.Scene.gltf_navigation
+    bpy.utils.unregister_class(GltfNavigationBake)
+    bpy.utils.unregister_class(GltfNavigationSource)
     bpy.utils.unregister_class(PHYSICS_PT_khr_physics)
     del bpy.types.Object.khr_physics
     bpy.utils.unregister_class(KHR_PhysicsProperties)

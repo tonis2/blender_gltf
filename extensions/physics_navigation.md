@@ -1,8 +1,16 @@
 # CUSTOM_physics_navigation
 
 An optional root extension containing versioned, precomputed navigation profiles.
-It is derived exclusively from passive, non-trigger `KHR_physics_rigid_bodies`
-collider sources and does not modify that extension.
+It is baked from a chosen set of ground meshes and does not modify any other
+extension.
+
+Baking is an explicit step, not part of export. Select the ground meshes, press
+**Bake Navigation** in Scene Properties › glTF Navigation, and confirm the agent
+settings. The grid is stored in the .blend and drawn as a non-exported preview
+object; export writes that cache without voxelizing again. A selected object that
+also carries a rigid body is baked through its collider proxy shape, so the grid
+keeps matching what the runtime collides with; anything else is baked as its own
+geometry.
 
 ```json
 {"extensions":{"CUSTOM_physics_navigation":{"version":1,"profiles":[{
@@ -27,7 +35,7 @@ cells on both intervening cardinal sides; this prevents paths cutting through a
 blocked corner. Triangles count as floor only when their winding produces an
 upward normal within `slopeLimit`; downward-facing undersides are not floors.
 
-The exporter rebuilds `BOX`, `SPHERE`, `CAPSULE`, `CYLINDER`, and `CONE` from
+The baker rebuilds `BOX`, `SPHERE`, `CAPSULE`, `CYLINDER`, and `CONE` from
 the same local dimensions written to `KHR_implicit_shapes`, using the runtime's
 16 radial segments, eight sphere rows, and four capsule rings. `CONVEX_HULL`
 uses Blender's convex-hull operation; planar or otherwise degenerate hulls fall

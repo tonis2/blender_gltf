@@ -44,13 +44,6 @@ class ExportSettings:
     export_skinning: bool = True
     export_physics: bool = True
     export_navigation: bool = False
-    navigation_profile_name: str = "player"
-    navigation_cell_size: float = 0.42
-    navigation_agent_radius: float = 0.30
-    navigation_agent_height: float = 1.66
-    navigation_step_height: float = 0.42
-    navigation_slope_limit: float = 54.0
-    navigation_bounds_object: str = "Navigation Bounds"
     export_extras: bool = True
     export_particles: bool = True
     export_interactivity: bool = True
@@ -213,15 +206,10 @@ class GltfExporter:
         if self.settings.export_uids:
             self._assign_uids()
 
-        # Navigation is derived from the same passive collider sources as the
-        # physics extension, after evaluated scene transforms are current.
+        # The grid is baked in the scene, not here: this only writes the cache.
         self._navigation_root = None
         if self.navigation_exporter:
-            if not self.physics_exporter:
-                raise ValueError("Navigation export requires Physics export")
-            self._navigation_root = self.navigation_exporter.gather(
-                self.context, self.scene_exporter.object_to_node_index,
-            )
+            self._navigation_root = self.navigation_exporter.gather(self.context.scene)
 
         # 2. Gather animations (needs node mapping from scene pass)
         self._animations = None

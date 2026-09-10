@@ -327,6 +327,10 @@ class SceneExporter:
         if obj.name in self._lod_skip_names:
             return None
 
+        # The navigation bake preview is scene furniture, never geometry.
+        if obj.get("gltf_navigation_preview"):
+            return None
+
         # If this object was already exported (shared across scenes), reuse its node
         if obj.name in self.object_to_node_index:
             return self.object_to_node_index[obj.name]
