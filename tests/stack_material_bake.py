@@ -58,7 +58,6 @@ def main():
             export_particles=False,
             export_interactivity=False,
             export_audio=False,
-            export_walkability=False,
             export_environment_map=False,
         )
         GltfExporter(bpy.context, settings).export()

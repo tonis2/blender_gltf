@@ -17,7 +17,6 @@ from .import_.physics import PhysicsImporter
 from .import_.particles import ParticleImporter
 from .import_.interactivity import InteractivityImporter
 from .import_.audio import AudioImporter
-from .import_.walkability import WalkabilityImporter
 
 if TYPE_CHECKING:
     import bpy
@@ -33,7 +32,6 @@ SUPPORTED_EXTENSIONS = frozenset({
     "CUSTOM_materials_layers",
     "CUSTOM_packed_texture",
     "CUSTOM_particle_emitter",
-    "CUSTOM_walkability_mask",
     "CUSTOM_lights_area",
     "EXT_mesh_gpu_instancing",
     "KHR_audio_emitter",
@@ -65,7 +63,6 @@ class ImportSettings:
     import_particles: bool = True
     import_interactivity: bool = True
     import_audio: bool = True
-    import_walkability: bool = True
     import_uids: bool = True
     import_external_assets: bool = True
 
@@ -274,10 +271,6 @@ class GltfImporter:
             external_depth=external_depth,
         )
         node_to_blender = scene_importer.import_scene(self.context)
-
-        # 8a. Walkability masks (needs node mapping + loaded images)
-        if self.settings.import_walkability:
-            WalkabilityImporter(gltf, texture_importer, self.settings).apply(node_to_blender)
 
         # 8b. Physics joint fixup (needs node mapping)
         if physics_importer:

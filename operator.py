@@ -177,77 +177,6 @@ class MATERIAL_PT_gltf_properties(bpy.types.Panel):
         box.prop(props, "packed_alpha")
 
 
-class GltfWalkabilityProperties(bpy.types.PropertyGroup):
-    """CUSTOM_walkability_mask: attach a painted walkability mask to a mesh.
-
-    White (above threshold) marks where the player/NPCs can walk. The engine
-    samples this mask through the mesh's UVs for grid pathfinding / movement.
-    """
-
-    enabled: BoolProperty(
-        name="Export Walkability Mask",
-        description="Attach a walkability mask to this mesh as CUSTOM_walkability_mask",
-        default=False,
-    )
-    mask: bpy.props.PointerProperty(
-        name="Mask",
-        description="Image whose channel encodes walkable areas (white = walkable)",
-        type=bpy.types.Image,
-    )
-    threshold: FloatProperty(
-        name="Threshold",
-        description="Walkable test cutoff against the sampled channel value",
-        default=0.5,
-        min=0.0,
-        max=1.0,
-    )
-    channel: EnumProperty(
-        name="Channel",
-        description="Which image channel encodes walkability",
-        items=[
-            ("R", "Red", ""),
-            ("G", "Green", ""),
-            ("B", "Blue", ""),
-            ("A", "Alpha", ""),
-        ],
-        default="R",
-    )
-    walkable_above: BoolProperty(
-        name="Walkable Above Threshold",
-        description=(
-            "When on, areas where the channel value is above the threshold are "
-            "walkable; turn off to invert (walkable below the threshold)"
-        ),
-        default=True,
-    )
-
-
-class OBJECT_PT_gltf_walkability(bpy.types.Panel):
-    """Panel in object properties for the walkability mask extension."""
-    bl_label = "glTF Walkability"
-    bl_idname = "OBJECT_PT_gltf_walkability"
-    bl_space_type = 'PROPERTIES'
-    bl_region_type = 'WINDOW'
-    bl_context = "object"
-    bl_options = {'DEFAULT_CLOSED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return obj is not None and obj.type == "MESH"
-
-    def draw(self, context):
-        layout = self.layout
-        props = context.active_object.gltf_walkability
-        layout.prop(props, "enabled")
-        col = layout.column()
-        col.enabled = props.enabled
-        col.prop(props, "mask")
-        col.prop(props, "channel")
-        col.prop(props, "threshold")
-        col.prop(props, "walkable_above")
-
-
 class PHYSICS_PT_khr_physics(bpy.types.Panel):
     """Panel in the physics properties for KHR physics extension settings."""
     bl_label = "KHR Physics Extensions"
@@ -369,6 +298,18 @@ _EXPORT_PROP_DEFS: dict[str, tuple] = {
         description="Export rigid bodies and collision shapes",
         default=True,
     )),
+    "export_navigation": (BoolProperty, dict(
+        name="Navigation Grid",
+        description="Bake CUSTOM_physics_navigation from passive physics colliders",
+        default=False,
+    )),
+    "navigation_profile_name": (StringProperty, dict(name="Profile", default="player")),
+    "navigation_cell_size": (FloatProperty, dict(name="Cell Size", min=0.01, default=0.42, unit="LENGTH")),
+    "navigation_agent_radius": (FloatProperty, dict(name="Agent Radius", min=0.0, default=0.30, unit="LENGTH")),
+    "navigation_agent_height": (FloatProperty, dict(name="Agent Height", min=0.01, default=1.66, unit="LENGTH")),
+    "navigation_step_height": (FloatProperty, dict(name="Step Height", min=0.0, default=0.42, unit="LENGTH")),
+    "navigation_slope_limit": (FloatProperty, dict(name="Slope Limit (degrees)", min=0.0, max=89.9, default=54.0)),
+    "navigation_bounds_object": (StringProperty, dict(name="Bounds Object", default="Navigation Bounds")),
     "export_extras": (BoolProperty, dict(
         name="Custom Properties",
         description="Export object custom properties as glTF node extras",
@@ -387,11 +328,6 @@ _EXPORT_PROP_DEFS: dict[str, tuple] = {
     "export_audio": (BoolProperty, dict(
         name="Audio",
         description="Export speaker objects as KHR_audio_emitter",
-        default=True,
-    )),
-    "export_walkability": (BoolProperty, dict(
-        name="Walkability",
-        description="Export per-object walkability masks as CUSTOM_walkability_mask",
         default=True,
     )),
     "export_environment_map": (BoolProperty, dict(
@@ -618,11 +554,14 @@ _EXPORT_PANELS = (
     ("GLTF_export_instancing", "Instancing", ("export_gpu_instancing",)),
     ("GLTF_export_lod", "LOD", ("export_lods",)),
     ("GLTF_export_cameras", "Cameras", ("export_camera_y_up",)),
-    ("GLTF_export_physics", "Physics", ("export_physics",)),
+    ("GLTF_export_physics", "Physics", (
+        "export_physics", "export_navigation", "navigation_profile_name",
+        "navigation_cell_size", "navigation_agent_radius", "navigation_agent_height",
+        "navigation_step_height", "navigation_slope_limit", "navigation_bounds_object",
+    )),
     ("GLTF_export_particles", "Particles", ("export_particles",)),
     ("GLTF_export_interactivity", "Interactivity", ("export_interactivity",)),
     ("GLTF_export_audio", "Audio", ("export_audio",)),
-    ("GLTF_export_walkability", "Walkability", ("export_walkability",)),
     ("GLTF_export_environment", "Environment Map", (
         "export_environment_map",
         "environment_map_size",
@@ -645,7 +584,6 @@ _IMPORT_PANELS = (
     ("GLTF_import_particles", "Particles", ("import_particles",)),
     ("GLTF_import_interactivity", "Interactivity", ("import_interactivity",)),
     ("GLTF_import_audio", "Audio", ("import_audio",)),
-    ("GLTF_import_walkability", "Walkability", ("import_walkability",)),
     ("GLTF_import_external", "External Assets", ("import_external_assets",)),
     ("GLTF_import_extras", "Extras", ("import_uids",)),
 )
@@ -904,12 +842,6 @@ class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
         default=True,
     )
 
-    import_walkability: BoolProperty(
-        name="Walkability",
-        description="Import CUSTOM_walkability_mask back onto mesh objects",
-        default=True,
-    )
-
     import_uids: BoolProperty(
         name="Unique IDs",
         description="Restore glTF 2.1 [DRAFT] node uids as gltf_uid custom properties",
@@ -939,7 +871,6 @@ class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
             import_particles=self.import_particles,
             import_interactivity=self.import_interactivity,
             import_audio=self.import_audio,
-            import_walkability=self.import_walkability,
             import_uids=self.import_uids,
             import_external_assets=self.import_external_assets,
         )
@@ -1039,9 +970,6 @@ def register():
     bpy.utils.register_class(KHR_PhysicsProperties)
     bpy.types.Object.khr_physics = bpy.props.PointerProperty(type=KHR_PhysicsProperties)
     bpy.utils.register_class(PHYSICS_PT_khr_physics)
-    bpy.utils.register_class(GltfWalkabilityProperties)
-    bpy.types.Object.gltf_walkability = bpy.props.PointerProperty(type=GltfWalkabilityProperties)
-    bpy.utils.register_class(OBJECT_PT_gltf_walkability)
     bpy.utils.register_class(GltfExportSceneSettings)
     bpy.types.Scene.gltf_export_settings = bpy.props.PointerProperty(type=GltfExportSceneSettings)
     bpy.utils.register_class(EXPORT_SCENE_OT_gltf)
@@ -1057,9 +985,6 @@ def unregister():
     bpy.utils.unregister_class(EXPORT_SCENE_OT_gltf)
     del bpy.types.Scene.gltf_export_settings
     bpy.utils.unregister_class(GltfExportSceneSettings)
-    bpy.utils.unregister_class(OBJECT_PT_gltf_walkability)
-    del bpy.types.Object.gltf_walkability
-    bpy.utils.unregister_class(GltfWalkabilityProperties)
     bpy.utils.unregister_class(PHYSICS_PT_khr_physics)
     del bpy.types.Object.khr_physics
     bpy.utils.unregister_class(KHR_PhysicsProperties)

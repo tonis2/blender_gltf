@@ -18,7 +18,7 @@ from . import interactivity_nodes
 from . import ktx_lib
 from . import ktx_download
 from .gltf import constants, types, buffer, serialize
-from .export import converter, mesh, material, texture, scene, animation, skin, physics, particles, interactivity, quantize, audio
+from .export import converter, mesh, material, texture, scene, animation, skin, physics, navigation, particles, interactivity, quantize, audio
 from .import_ import (
     converter as import_converter,
     buffer_reader,
@@ -58,6 +58,7 @@ if _needs_reload:
     animation = importlib.reload(animation)
     skin = importlib.reload(skin)
     physics = importlib.reload(physics)
+    navigation = importlib.reload(navigation)
     particles = importlib.reload(particles)
     interactivity = importlib.reload(interactivity)
     quantize = importlib.reload(quantize)

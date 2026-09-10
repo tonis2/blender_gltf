@@ -19,8 +19,8 @@ from .export.physics import PhysicsExporter
 from .export.particles import ParticleExporter
 from .export.interactivity import InteractivityExporter
 from .export.audio import AudioExporter
-from .export.walkability import WalkabilityExporter
 from .export.environment import EnvironmentExporter
+from .export.navigation import NavigationExporter
 
 if TYPE_CHECKING:
     import bpy
@@ -43,11 +43,18 @@ class ExportSettings:
     export_lods: bool = True
     export_skinning: bool = True
     export_physics: bool = True
+    export_navigation: bool = False
+    navigation_profile_name: str = "player"
+    navigation_cell_size: float = 0.42
+    navigation_agent_radius: float = 0.30
+    navigation_agent_height: float = 1.66
+    navigation_step_height: float = 0.42
+    navigation_slope_limit: float = 54.0
+    navigation_bounds_object: str = "Navigation Bounds"
     export_extras: bool = True
     export_particles: bool = True
     export_interactivity: bool = True
     export_audio: bool = True
-    export_walkability: bool = True
     export_environment_map: bool = True
     environment_map_size: str = "AUTO"  # "AUTO", or a face size like "512"
     environment_map_codec: str = "rgba8"  # "rgba8", "bc7", "uastc", "etc1s"
@@ -94,6 +101,7 @@ class GltfExporter:
         )
         self.skin_exporter = SkinExporter(self.buffer, settings) if settings.export_skinning else None
         self.physics_exporter = PhysicsExporter(settings) if settings.export_physics else None
+        self.navigation_exporter = NavigationExporter(self.buffer, settings) if settings.export_navigation else None
         self.particle_exporter = ParticleExporter(
             settings, self.mesh_exporter, self.material_exporter,
         ) if settings.export_particles else None
@@ -101,9 +109,6 @@ class GltfExporter:
             settings,
         ) if settings.export_interactivity else None
         self.audio_exporter = AudioExporter(self.buffer, settings) if settings.export_audio else None
-        self.walkability_exporter = WalkabilityExporter(
-            self.texture_exporter, settings,
-        ) if settings.export_walkability else None
         self.environment_exporter = EnvironmentExporter(
             self.texture_exporter, settings,
         ) if settings.export_environment_map else None
@@ -114,7 +119,6 @@ class GltfExporter:
             particle_exporter=self.particle_exporter,
             interactivity_exporter=self.interactivity_exporter,
             audio_exporter=self.audio_exporter,
-            walkability_exporter=self.walkability_exporter,
         )
         if self.interactivity_exporter is not None:
             self.interactivity_exporter.scene_exporter = self.scene_exporter
@@ -209,6 +213,16 @@ class GltfExporter:
         if self.settings.export_uids:
             self._assign_uids()
 
+        # Navigation is derived from the same passive collider sources as the
+        # physics extension, after evaluated scene transforms are current.
+        self._navigation_root = None
+        if self.navigation_exporter:
+            if not self.physics_exporter:
+                raise ValueError("Navigation export requires Physics export")
+            self._navigation_root = self.navigation_exporter.gather(
+                self.context, self.scene_exporter.object_to_node_index,
+            )
+
         # 2. Gather animations (needs node mapping from scene pass)
         self._animations = None
         self._animation_exporter = None
@@ -263,10 +277,10 @@ class GltfExporter:
             all_extensions |= self.interactivity_exporter.extensions_used
         if self.audio_exporter:
             all_extensions |= self.audio_exporter.extensions_used
-        if self.walkability_exporter:
-            all_extensions |= self.walkability_exporter.extensions_used
         if self.environment_exporter:
             all_extensions |= self.environment_exporter.extensions_used
+        if self.navigation_exporter:
+            all_extensions |= self.navigation_exporter.extensions_used
         required = []
         if self.mesh_exporter.used_quantization:
             # Quantized attribute types are invalid core glTF, so loaders
@@ -285,6 +299,8 @@ class GltfExporter:
             physics_root = self.physics_exporter.get_root_extensions()
             if physics_root:
                 root_extensions.update(physics_root)
+        if self._navigation_root:
+            root_extensions.update(self._navigation_root)
 
         # 5c. KHR_lights_punctual root extension
         if self.scene_exporter.lights:
@@ -407,6 +423,7 @@ def build_collection_subasset(
         base_settings,
         collection_scope=collection,
         export_all_scenes=False,
+        export_navigation=False,
     )
     sub = GltfExporter(context, sub_settings, external_seen=seen, external_depth=depth)
     return sub.build()

@@ -33,7 +33,6 @@ def export_settings(path, image_format="PNG"):
         export_particles=False,
         export_interactivity=False,
         export_audio=False,
-        export_walkability=False,
         export_environment_map=False,
     )
 
@@ -125,7 +124,6 @@ def main():
                 import_particles=False,
                 import_interactivity=False,
                 import_audio=False,
-                import_walkability=False,
             ),
         ).import_file()
 
@@ -173,7 +171,6 @@ def main():
                     import_particles=False,
                     import_interactivity=False,
                     import_audio=False,
-                    import_walkability=False,
                 ),
             ).import_file()
             ktx_material = bpy.data.materials.get("PBR pack material")
@@ -210,7 +207,6 @@ def main():
                 import_particles=False,
                 import_interactivity=False,
                 import_audio=False,
-                import_walkability=False,
             ),
         ).import_file()
         layered = bpy.data.materials.get("PBR pack material")

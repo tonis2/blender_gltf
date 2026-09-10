@@ -386,7 +386,7 @@ class TextureImporter:
         """Decode a KTX2 payload (BCn or Basis) to a packed Blender image, on
         this thread.
 
-        The fallback for payloads prefetch_ktx never queued — a walkability-only
+        The fallback for payloads prefetch_ktx never queued — an extension-only
         import, or a caller that skipped the prefetch. The queued path runs the
         same job on the worker and lands it in _land_ktx.
         """
