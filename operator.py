@@ -653,6 +653,15 @@ _EXPORT_PROP_DEFS: dict[str, tuple] = {
         description="Only export objects that are visible in the viewport",
         default=False,
     )),
+    "export_selected": (BoolProperty, dict(
+        name="Only Selected",
+        description=(
+            "Only export selected objects. Unselected children of a selected "
+            "object are skipped, and a selected object whose parent is not "
+            "selected is exported at the scene root with its world transform"
+        ),
+        default=False,
+    )),
     "export_all_scenes": (BoolProperty, dict(
         name="All Scenes",
         description="Export all Blender scenes into a single glTF file",
@@ -825,6 +834,7 @@ def _draw_material_extras(body, owner):
 
 _EXPORT_PANELS = (
     ("GLTF_export_mesh", "Mesh", (
+        "export_selected",
         "export_normals",
         "export_texcoords",
         "export_tangents",

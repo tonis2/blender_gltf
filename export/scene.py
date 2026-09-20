@@ -164,14 +164,31 @@ class SceneExporter:
             lod_groups = self._lod_pre_pass(scene)
 
         # Process armatures first to ensure skin data is available for skinned meshes
-        root_objects = [
-            obj for obj in scene.objects
-            if obj.parent is None and obj.name not in skip_objects
-        ]
+        selected_names: set[str] | None = None
+        if self.settings.export_selected:
+            selected_names = {
+                obj.name for obj in scene.objects if self._is_selected(obj)
+            }
+        if selected_names is None:
+            root_objects = [
+                obj for obj in scene.objects
+                if obj.parent is None and obj.name not in skip_objects
+            ]
+        else:
+            # A selected object whose parent is not selected is re-rooted here:
+            # it is exported at the scene root with its world transform, since
+            # the parent's node will not exist in the export.
+            root_objects = [
+                obj for obj in scene.objects
+                if obj.name in selected_names
+                and obj.name not in skip_objects
+                and (obj.parent is None or obj.parent.name not in selected_names)
+            ]
         root_objects.sort(key=lambda o: (0 if o.type == "ARMATURE" else 1))
 
         for obj in root_objects:
-            node_index = self._gather_node(obj)
+            local_matrix = obj.matrix_world if obj.parent is not None else None
+            node_index = self._gather_node(obj, local_matrix=local_matrix)
             if node_index is not None:
                 root_nodes.append(node_index)
 
@@ -243,9 +260,14 @@ class SceneExporter:
         """Collect valid LOD groups and mark LOD1+ objects for skipping.
         A group is valid when LOD0 exists and all members share a parent."""
         groups: dict[tuple[str | None, str], dict[int, "bpy.types.Object"]] = defaultdict(dict)
+        selected: set[str] | None = None
+        if self.settings.export_selected:
+            selected = {obj.name for obj in scene.objects if self._is_selected(obj)}
         for obj in scene.objects:
             match = _LOD_RE.match(obj.name)
             if match:
+                if selected is not None and obj.name not in selected:
+                    continue
                 parent_name = obj.parent.name if obj.parent else None
                 groups[(parent_name, match.group(1))][int(match.group(2))] = obj
 
@@ -313,7 +335,9 @@ class SceneExporter:
             lod0_node.extras = {}
         lod0_node.extras["MSFT_screencoverage"] = coverage
 
-    def _gather_node(self, obj: "bpy.types.Object", inherited_shear=None) -> int | None:
+    def _gather_node(
+        self, obj: "bpy.types.Object", inherited_shear=None, local_matrix=None,
+    ) -> int | None:
         """Convert a Blender object to a glTF Node. Returns node index.
 
         ``inherited_shear`` is a 4x4 shear matrix passed down from a sheared
@@ -322,6 +346,10 @@ class SceneExporter:
         matrix is baked into its mesh and the *residual* shear is threaded into
         its children here — otherwise a child of a sheared parent is displaced
         (the parent's node lost the shear that positioned the child).
+
+        ``local_matrix`` overrides the object's parent-relative matrix; the
+        scene gather passes the world matrix for re-rooted objects whose parent
+        is not part of the export.
         """
         # LOD1+ objects only exist through their LOD0 node's MSFT_lod extension
         if obj.name in self._lod_skip_names:
@@ -335,16 +363,24 @@ class SceneExporter:
         if obj.name in self.object_to_node_index:
             return self.object_to_node_index[obj.name]
 
-        # visible_get() is view-layer based and meaningless for a scoped
-        # sub-asset export (the collection isn't in any view layer), so treat
-        # sub-asset objects as visible unless render-hidden.
+        # visible_get()/select_get() are view-layer based and meaningless for a
+        # scoped sub-asset export (the collection isn't in any view layer), so
+        # treat sub-asset objects as visible and selected unless render-hidden.
         if getattr(self.settings, "collection_scope", None) is not None:
             is_visible = not obj.hide_render
+            is_selected = True
         else:
             is_visible = obj.visible_get()
+            is_selected = self._is_selected(obj)
 
         # Skip hidden objects entirely when "only visible" is enabled
         if self.settings.export_only_visible and not is_visible:
+            return None
+
+        # Skip unselected objects entirely when "only selected" is enabled.
+        # Selected objects with an unselected parent are visited as roots by
+        # the scene gather; unselected children are dropped here.
+        if self.settings.export_selected and not is_selected:
             return None
 
         # Gather mesh (if applicable)
@@ -367,7 +403,7 @@ class SceneExporter:
         # decompose and must instead be baked into the mesh geometry. The node
         # transform is taken from this same effective matrix so its clean TRS
         # plus the baked mesh reproduce the true placement exactly.
-        effective_local = obj.matrix_local
+        effective_local = obj.matrix_local if local_matrix is None else local_matrix
         if inherited_shear is not None:
             effective_local = inherited_shear @ effective_local
         shear = shear_correction(effective_local)
@@ -566,6 +602,19 @@ class SceneExporter:
         self.nodes.append(child)
         node.mesh = None
         node.children = (node.children or []) + [child_index]
+
+    @staticmethod
+    def _is_selected(obj: "bpy.types.Object") -> bool:
+        """View-layer selection. Objects outside the view layer are unselected."""
+        try:
+            return obj.select_get()
+        except RuntimeError:
+            return False
+
+    def _instance_is_kept(self, inst: "bpy.types.DepsgraphObjectInstance") -> bool:
+        """Selection test for one depsgraph instance under "only selected"."""
+        owner = inst.parent.original if inst.parent is not None else inst.object.original
+        return self._is_selected(owner)
 
     @staticmethod
     def _find_armature_modifier(obj: "bpy.types.Object"):
@@ -788,6 +837,13 @@ class SceneExporter:
                 continue
             obj = inst.object.original
             if obj.type != "MESH":
+                continue
+
+            # "Only selected": an instance belongs to the object that generates
+            # it (collection-instance empty, geometry nodes carrier, particle
+            # emitter), so it is kept when that object is selected. A parentless
+            # instance falls back to its source object.
+            if self.settings.export_selected and not self._instance_is_kept(inst):
                 continue
 
             # Track the parent (instancer) so we can skip it in normal traversal

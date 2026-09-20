@@ -52,6 +52,7 @@ class ExportSettings:
     environment_map_size: str = "AUTO"  # "AUTO", or a face size like "512"
     environment_map_codec: str = "rgba8"  # "rgba8", "bc7", "uastc", "etc1s"
     export_only_visible: bool = False
+    export_selected: bool = False
     export_all_scenes: bool = False
     export_camera_y_up: bool = True
     image_format: str = "AUTO"  # "AUTO", "JPEG", "PNG", or "KTX2"
