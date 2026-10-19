@@ -661,6 +661,7 @@ _EXPORT_PROP_DEFS: dict[str, tuple] = {
             "selected is exported at the scene root with its world transform"
         ),
         default=False,
+        options={"SKIP_SAVE"},
     )),
     "export_all_scenes": (BoolProperty, dict(
         name="All Scenes",
@@ -807,10 +808,15 @@ _EXPORT_PROP_DEFS: dict[str, tuple] = {
 
 _EXPORT_PROPS = tuple(_EXPORT_PROP_DEFS)
 
+# Per-export choices that are not stored in the scene: every export dialog
+# starts from their default, so the whole scene is exported unless asked.
+_UNSAVED_EXPORT_PROPS = frozenset({"export_selected"})
+_SAVED_EXPORT_PROPS = tuple(p for p in _EXPORT_PROPS if p not in _UNSAVED_EXPORT_PROPS)
 
-def _make_export_props() -> dict:
+
+def _make_export_props(names=_EXPORT_PROPS) -> dict:
     """Build fresh property instances (definitions must not be shared across classes)."""
-    return {name: ctor(**kwargs) for name, (ctor, kwargs) in _EXPORT_PROP_DEFS.items()}
+    return {name: _EXPORT_PROP_DEFS[name][0](**_EXPORT_PROP_DEFS[name][1]) for name in names}
 
 
 # Collapsible panel layout for the export/import file browser sidebars:
@@ -834,7 +840,6 @@ def _draw_material_extras(body, owner):
 
 _EXPORT_PANELS = (
     ("GLTF_export_mesh", "Mesh", (
-        "export_selected",
         "export_normals",
         "export_texcoords",
         "export_tangents",
@@ -922,14 +927,14 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
     def invoke(self, context, event):
         # Load saved settings from the scene
         saved = context.scene.gltf_export_settings
-        for prop in _EXPORT_PROPS:
+        for prop in _SAVED_EXPORT_PROPS:
             setattr(self, prop, getattr(saved, prop))
         return super().invoke(context, event)
 
     def execute(self, context):
         # Save settings back to the scene so they persist with the .blend
         saved = context.scene.gltf_export_settings
-        for prop in _EXPORT_PROPS:
+        for prop in _SAVED_EXPORT_PROPS:
             setattr(saved, prop, getattr(self, prop))
 
         settings = ExportSettings(
@@ -1025,6 +1030,7 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         layout.use_property_decorate = False
 
         layout.prop(self, "export_format")
+        layout.prop(self, "export_selected")
         layout.prop(self, "export_only_visible")
         layout.prop(self, "export_all_scenes")
 
@@ -1048,14 +1054,16 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         return False
 
 
-# Inject the shared export properties into both classes. Must run at module
-# level, before register(); each class gets its own fresh instances.
-for _cls in (GltfExportSceneSettings, EXPORT_SCENE_OT_gltf):
+# Inject the shared export properties into both classes (the scene settings
+# only get the saved ones). Must run at module level, before register(); each
+# class gets its own fresh instances.
+for _cls, _names in ((GltfExportSceneSettings, _SAVED_EXPORT_PROPS),
+                     (EXPORT_SCENE_OT_gltf, _EXPORT_PROPS)):
     _cls.__annotations__ = {
         **vars(_cls).get("__annotations__", {}),
-        **_make_export_props(),
+        **_make_export_props(_names),
     }
-del _cls
+del _cls, _names
 
 
 class IMPORT_SCENE_OT_gltf(bpy.types.Operator, ImportHelper):
