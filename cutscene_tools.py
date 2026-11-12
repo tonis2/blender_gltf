@@ -18,7 +18,7 @@ from bpy.props import (
     BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty,
     PointerProperty, StringProperty,
 )
-from mathutils import Matrix, Quaternion, Vector
+from mathutils import Euler, Matrix, Quaternion, Vector
 
 from .export import cutscene as cs
 from .export.animation import _BONE_FCURVE_RE, _get_fcurves, slot_handle_for
@@ -365,14 +365,18 @@ def _place_strip(strip, start: float, end: float) -> None:
 
 
 def _rotation_channels(obj, yaws, base_euler) -> dict:
-    """Rotation curves turning the object to each yaw (about Blender Z)."""
+    """Rotation curves turning the object to each yaw (about Blender Z), over
+    the lean it has at home (base_euler's X and Y). The engine turns an actor
+    the same way."""
     yaws = np.asarray(yaws, dtype=np.float64)
     if obj.rotation_mode == "QUATERNION":
+        lean = Euler((base_euler[0], base_euler[1], 0.0), "XYZ").to_quaternion()
+        turn_w, turn_z = np.cos(yaws / 2.0), np.sin(yaws / 2.0)
         return {
-            ("rotation_quaternion", 0): np.cos(yaws / 2.0),
-            ("rotation_quaternion", 1): np.zeros(len(yaws)),
-            ("rotation_quaternion", 2): np.zeros(len(yaws)),
-            ("rotation_quaternion", 3): np.sin(yaws / 2.0),
+            ("rotation_quaternion", 0): turn_w * lean.w - turn_z * lean.z,
+            ("rotation_quaternion", 1): turn_w * lean.x - turn_z * lean.y,
+            ("rotation_quaternion", 2): turn_w * lean.y + turn_z * lean.x,
+            ("rotation_quaternion", 3): turn_w * lean.z + turn_z * lean.w,
         }
     return {
         ("rotation_euler", 0): np.full(len(yaws), base_euler[0]),

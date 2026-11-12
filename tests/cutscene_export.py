@@ -584,8 +584,40 @@ def main():
 
     check_active_action_covering(scene)
     check_buried_walk_track(scene, hero)
+    check_walks_keep_the_lean(scene)
 
     print("cutscene_export: OK")
+
+
+def check_walks_keep_the_lean(scene):
+    """A walk turns the actor about the vertical and keeps the lean it stands
+    with, in Euler and in Quaternion mode alike, as the engine does."""
+    from mathutils import Vector
+
+    path = tools.polyline_to_curve(bpy.context, [(30, 0, 0), (34, 0, 0), (34, -4, 0)], "Lean path")
+    up = Vector((0, 0, 1))
+    facings = {}
+    for mode in ("XYZ", "QUATERNION"):
+        rig = make_rig(f"lean_{mode}", location=(30, 0, 0))
+        rig.rotation_mode = "XYZ"
+        rig.rotation_euler = (math.radians(-8), math.radians(10), 0.3)
+        home = rig.rotation_euler.to_quaternion()
+        leaning = math.degrees(home.to_matrix().col[2].angle(up))
+        rig.rotation_mode = mode
+        if mode == "QUATERNION":
+            rig.rotation_quaternion = home
+        tools.create_move(rig, path, 1, 41, scene, ease="LINEAR", turn=True)
+        for frame in (10, 35):  # heading along +X, then down -Y
+            scene.frame_set(frame)
+            matrix = rig.matrix_world.to_3x3()
+            lean = math.degrees(matrix.col[2].angle(up))
+            assert abs(lean - leaning) < 0.1, (mode, frame, lean, leaning)
+            facings.setdefault(frame, []).append(-matrix.col[1])
+        bpy.data.objects.remove(rig)
+    for frame, (euler, quaternion) in facings.items():
+        assert euler.angle(quaternion) < 1e-3, (frame, tuple(euler), tuple(quaternion))
+    assert facings[10][0].x > 0.9 and facings[35][0].y < -0.9, facings
+    bpy.data.objects.remove(path)
 
 
 def check_buried_walk_track(scene, hero):
