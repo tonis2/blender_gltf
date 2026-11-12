@@ -12,7 +12,8 @@ from ..layer_node.constants import (
     BLEND_MODES, CHANNEL_BY_NAME, PrincipledSocketView, channel_is_stated,
     socket_index,
 )
-from .texture import TextureExporter
+from . import bake_cache
+from .texture import TEMP_IMAGE_PROP, TextureExporter
 
 
 class _StackLayerAsPrincipled:
@@ -119,6 +120,9 @@ class MaterialExporter:
         self._vl_hidden_restore: list = []               # (obj,) view-layer hide_set
         self._temp_linked: list = []                     # (obj, collection)
         self._bake_saved: dict | None = None
+        self._bake_key: str = ""                         # fingerprint of the bake in progress
+        self.bakes_reused = 0
+        self.bakes_made = 0
         self._pbr_pack_cache: dict[tuple, object] = {}
         self._current_gltf_props = None
         # Diagnostics: the material being extracted (for messages), and the
@@ -357,30 +361,65 @@ class MaterialExporter:
             self._temp_uvs.append((me, me.uv_layers.active.name))
 
     def _bake_pass(self, obj, source_mat, target, name, res, bake_type, non_color):
+        """One baked image, ``name`` doubling as its identity in the file. A
+        bake kept from an earlier export is reused while its material and mesh
+        are unchanged; a fresh one is packed into the file for next time."""
         import bpy
-        img = bpy.data.images.get(name)
-        if img is not None:
-            bpy.data.images.remove(img)
+        cached = bake_cache.find(name, self._bake_key)
+        if cached is not None:
+            self.bakes_reused += 1
+            return cached
+        bake_cache.forget(name)
         img = bpy.data.images.new(name, res, res, alpha=False)
         img.colorspace_settings.name = "Non-Color" if non_color else "sRGB"
-        self._temp_images.append(img)
         target.image = img
 
         sc = bpy.context.scene
         rb = sc.render.bake
         ov = self._get_override()
-        with bpy.context.temp_override(**ov):
-            bpy.ops.object.select_all(action="DESELECT")
-            obj.select_set(True)
-            bpy.context.view_layer.objects.active = obj
-            source_mat.node_tree.nodes.active = target
-            target.select = True
-            if bake_type == "DIFFUSE":
-                rb.use_pass_direct = False
-                rb.use_pass_indirect = False
-                rb.use_pass_color = True
-            bpy.ops.object.bake(type=bake_type)
+        try:
+            with bpy.context.temp_override(**ov):
+                bpy.ops.object.select_all(action="DESELECT")
+                obj.select_set(True)
+                bpy.context.view_layer.objects.active = obj
+                source_mat.node_tree.nodes.active = target
+                target.select = True
+                if bake_type == "DIFFUSE":
+                    rb.use_pass_direct = False
+                    rb.use_pass_indirect = False
+                    rb.use_pass_color = True
+                self._run_bake(bake_type)
+        except Exception:
+            target.image = None
+            bpy.data.images.remove(img)
+            raise
+        bake_cache.keep(img, name, self._bake_key)
+        self.bakes_made += 1
         return img
+
+    @staticmethod
+    def _run_bake(bake_type: str) -> None:
+        import bpy
+        bpy.ops.object.bake(type=bake_type)
+
+    def _new_bake_target(self, nt):
+        """The image node every pass of a material bakes into. Tagged so the
+        bake fingerprint ignores it."""
+        target = nt.nodes.new("ShaderNodeTexImage")
+        target.location = (-1400, 700)
+        target[bake_cache.BAKE_TARGET_PROP] = True
+        self._temp_nodes.append((nt, target))
+        return target
+
+    def _temp_image(self, name, res, non_color=True):
+        """An image that lives only for this export (packed channels)."""
+        import bpy
+        image = bpy.data.images.new(name, res, res, alpha=False)
+        if non_color:
+            image.colorspace_settings.name = "Non-Color"
+        image[TEMP_IMAGE_PROP] = True
+        self._temp_images.append(image)
+        return image
 
     def _bake_socket_as_emission(
         self, obj, source_mat, target, socket, name, res, non_color,
@@ -434,11 +473,9 @@ class MaterialExporter:
         mr_px[1::4] = rough_px[0::4]
         mr_px[2::4] = metal_px[0::4]
         mr_px[3::4] = 1.0
-        image = bpy.data.images.new(name, res, res, alpha=False)
-        image.colorspace_settings.name = "Non-Color"
+        image = self._temp_image(name, res)
         image.pixels.foreach_set(mr_px)
         image.update()
-        self._temp_images.append(image)
         return image
 
     def _bake_stack_material(self, source_mat, obj, stack):
@@ -470,6 +507,7 @@ class MaterialExporter:
         nt = source_mat.node_tree
         saved_actives: list = []
         try:
+            self._bake_key = bake_cache.fingerprint(source_mat, obj, res)
             self._begin_bake_session()
             self._ensure_uv(obj)
 
@@ -493,10 +531,8 @@ class MaterialExporter:
 
             target = self._bake_targets.get(source_mat.name)
             if target is None or target.name not in nt.nodes:
-                target = nt.nodes.new("ShaderNodeTexImage")
-                target.location = (-1400, 700)
+                target = self._new_bake_target(nt)
                 self._bake_targets[source_mat.name] = target
-                self._temp_nodes.append((nt, target))
 
             baked: dict[tuple[int, str], object] = {}
             for layer, channel in jobs:
@@ -626,6 +662,7 @@ class MaterialExporter:
         temp_emit = None
         saved_actives: list = []
         try:
+            self._bake_key = bake_cache.fingerprint(source_mat, obj, res)
             self._begin_bake_session()
             self._ensure_uv(obj)
 
@@ -655,10 +692,8 @@ class MaterialExporter:
 
             target = self._bake_targets.get(source_mat.name)
             if target is None or target.name not in nt.nodes:
-                target = nt.nodes.new("ShaderNodeTexImage")
-                target.location = (-1400, 700)
+                target = self._new_bake_target(nt)
                 self._bake_targets[source_mat.name] = target
-                self._temp_nodes.append((nt, target))
             nt.nodes.active = target
 
             img_base = img_norm = img_emit = img_mr = None
@@ -703,11 +738,9 @@ class MaterialExporter:
                 mr_px[1::4] = rough_px[0::4]   # G = roughness
                 mr_px[2::4] = metal_b          # B = metallic
                 mr_px[3::4] = 1.0
-                img_mr = bpy.data.images.new(f"{tag}_mr", res, res, alpha=False)
-                img_mr.colorspace_settings.name = "Non-Color"
+                img_mr = self._temp_image(f"{tag}_mr", res)
                 img_mr.pixels.foreach_set(mr_px)
                 img_mr.update()
-                self._temp_images.append(img_mr)
 
             # Output material: a copy of the source (so every image-backed channel
             # survives verbatim) with the procedural channels rewired to the bakes.
@@ -1364,6 +1397,7 @@ class MaterialExporter:
         image.alpha_mode = "CHANNEL_PACKED"
         image.pixels.foreach_set(pixels)
         image.update()
+        image[TEMP_IMAGE_PROP] = True
         self._temp_images.append(image)
         self._pbr_pack_cache[key] = image
         return image

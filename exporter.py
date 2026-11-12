@@ -233,6 +233,11 @@ class GltfExporter:
             if animation_exporter.animations:
                 self._animations = animation_exporter.animations
 
+        # Every pixel is read by now, so the export's temporary images and
+        # materials go before any KTX2 encode finishes: a save while those run
+        # must not find them.
+        self.material_exporter.cleanup()
+
     def build_finish(self) -> tuple[dict, bytes]:
         """Assemble the glTF from gathered state. Blocks until any still-
         running KTX2 encodes finish and lands them in the buffer first."""
@@ -342,8 +347,7 @@ class GltfExporter:
             files=self.scene_exporter.files or None,
         )
 
-        # Image bytes were captured eagerly during material gather, so any
-        # temporary baked images/materials/UVs can now be torn down.
+        # Normally a no-op: build_begin() already tore the temporaries down.
         self.material_exporter.cleanup()
 
         return gltf.to_dict(), binary

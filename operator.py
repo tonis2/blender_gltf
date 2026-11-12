@@ -9,7 +9,7 @@ from bpy.props import (
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 from . import ktx_lib
-from .export import navigation
+from .export import bake_cache, navigation
 from .exporter import ExportSettings, GltfExporter
 from .importer import ImportSettings, GltfImporter
 
@@ -420,6 +420,23 @@ class SCENE_OT_gltf_navigation_bake(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class WM_OT_gltf_clear_bakes(bpy.types.Operator):
+    """Delete the baked material textures kept in this file. The next export with Bake Materials bakes them again"""
+
+    bl_idname = "gltf_custom.clear_bakes"
+    bl_label = "Clear Baked Textures"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(bake_cache.kept_images())
+
+    def execute(self, context):
+        count = bake_cache.clear()
+        self.report({"INFO"}, f"Removed {count} baked texture(s)")
+        return {"FINISHED"}
+
+
 class SCENE_OT_gltf_navigation_clear(bpy.types.Operator):
     """Discard this scene's navigation bake and remove its preview"""
 
@@ -753,7 +770,9 @@ _EXPORT_PROP_DEFS: dict[str, tuple] = {
             "Automatically bake any material whose base color, roughness, "
             "normal or emission is driven by procedural nodes (Noise, Voronoi, "
             "bumps, ...) to images, so it survives in glTF. Materials already "
-            "made of plain image textures / constant factors are left untouched"
+            "made of plain image textures / constant factors are left untouched. "
+            "Bakes are packed into the .blend and reused until the material, "
+            "mesh or resolution changes"
         ),
         default=False,
     )),
@@ -836,6 +855,11 @@ def _draw_material_extras(body, owner):
     body.prop(owner, "pack_pbr_textures")
     body.prop(owner, "bake_materials")
     body.prop(owner, "bake_resolution")
+    kept = len(bake_cache.kept_images())
+    if kept:
+        row = body.row()
+        row.label(text=f"{kept} bake(s) kept in this file")
+        row.operator("gltf_custom.clear_bakes", text="", icon="TRASH")
 
 
 _EXPORT_PANELS = (
@@ -1014,7 +1038,12 @@ class EXPORT_SCENE_OT_gltf(bpy.types.Operator, ExportHelper):
         try:
             gltf_dict, binary = exporter.build_finish()
             exporter.write_output(gltf_dict, binary)
-            self.report({"INFO"}, f"Exported to {self.filepath}")
+            materials = exporter.material_exporter
+            bakes = ""
+            if materials.bakes_made or materials.bakes_reused:
+                bakes = (f" ({materials.bakes_made} texture(s) baked, "
+                         f"{materials.bakes_reused} reused)")
+            self.report({"INFO"}, f"Exported to {self.filepath}{bakes}")
         except Exception as e:
             self.report({"ERROR"}, str(e))
             return {"CANCELLED"}
@@ -1278,6 +1307,7 @@ def register():
     bpy.types.Scene.gltf_navigation = bpy.props.PointerProperty(type=GltfNavigationBake)
     bpy.utils.register_class(SCENE_OT_gltf_navigation_bake)
     bpy.utils.register_class(SCENE_OT_gltf_navigation_clear)
+    bpy.utils.register_class(WM_OT_gltf_clear_bakes)
     bpy.utils.register_class(SCENE_PT_gltf_navigation)
     bpy.utils.register_class(GltfExportSceneSettings)
     bpy.types.Scene.gltf_export_settings = bpy.props.PointerProperty(type=GltfExportSceneSettings)
@@ -1295,6 +1325,7 @@ def unregister():
     del bpy.types.Scene.gltf_export_settings
     bpy.utils.unregister_class(GltfExportSceneSettings)
     bpy.utils.unregister_class(SCENE_PT_gltf_navigation)
+    bpy.utils.unregister_class(WM_OT_gltf_clear_bakes)
     bpy.utils.unregister_class(SCENE_OT_gltf_navigation_clear)
     bpy.utils.unregister_class(SCENE_OT_gltf_navigation_bake)
     del bpy.types.Scene.gltf_navigation

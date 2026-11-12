@@ -14,6 +14,31 @@ if TYPE_CHECKING:
 
 EXT_TEXTURE_TRANSFORM = "KHR_texture_transform"
 EXT_TEXTURE_BASISU = "KHR_texture_basisu"
+# Set on images the export makes for itself (packed channels). They are removed
+# as soon as their pixels are read, before KTX2 encodes finish, so a failed
+# encode falls back to the pixels kept here rather than to the image.
+TEMP_IMAGE_PROP = "gltf_export_temp"
+
+
+def png_from_rgba(rgba: bytes, width: int, height: int) -> bytes:
+    """An RGBA8 PNG from top-down pixel rows."""
+    import struct
+    import zlib
+
+    stride = width * 4
+    raw = b"".join(
+        b"\x00" + rgba[row * stride:(row + 1) * stride] for row in range(height)
+    )
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b"")
+    )
 
 # KTX2 encoding is slow (seconds per texture), so it runs on this background
 # worker while the operator stays modal and Blender keeps responding. One
@@ -45,8 +70,10 @@ class TextureExporter:
         self._sampler_cache: dict[tuple, int] = {}
         self._texture_cache: dict[tuple[int, int], int] = {}  # (image, sampler) -> texture index
         self._ktx2_images: set[int] = set()  # image indices holding KTX2 payloads
-        # (image index, Future[bytes], blender image name) awaiting resolve.
-        self._pending_ktx: list[tuple[int, object, str]] = []
+        # (image index, Future[bytes], blender image name, fallback pixels)
+        # awaiting resolve; the pixels (rgba, w, h) are kept for temporary
+        # images only.
+        self._pending_ktx: list[tuple[int, object, str, tuple | None]] = []
         self.extensions_used: set[str] = set()
 
     def gather_texture_info(
@@ -335,7 +362,8 @@ class TextureExporter:
 
         index = len(self.images)
         self.images.append(Image(mime_type="image/ktx2", name=blender_image.name))
-        self._pending_ktx.append((index, future, blender_image.name))
+        fallback = (rgba, w, h) if blender_image.get(TEMP_IMAGE_PROP) else None
+        self._pending_ktx.append((index, future, blender_image.name, fallback))
         return index
 
     def add_ktx_blob(self, blob: bytes, name: str) -> int:
@@ -360,15 +388,15 @@ class TextureExporter:
 
     def ktx_progress(self) -> tuple[int, int]:
         """(finished, total) background KTX encodes for this export."""
-        done = sum(1 for _, f, _ in self._pending_ktx if f.done())
+        done = sum(1 for _, f, _, _ in self._pending_ktx if f.done())
         return done, len(self._pending_ktx)
 
     def ktx_pending_done(self) -> bool:
-        return all(f.done() for _, f, _ in self._pending_ktx)
+        return all(f.done() for _, f, _, _ in self._pending_ktx)
 
     def cancel_ktx(self) -> None:
         """Abandon queued encodes (an in-flight one finishes and is dropped)."""
-        for _, f, _ in self._pending_ktx:
+        for _, f, _, _ in self._pending_ktx:
             f.cancel()
         self._pending_ktx.clear()
 
@@ -382,13 +410,13 @@ class TextureExporter:
         KHR_texture_basisu back to a plain source.
         """
         pending, self._pending_ktx = self._pending_ktx, []
-        for index, future, image_name in pending:
+        for index, future, image_name, fallback in pending:
             try:
                 blob = future.result()
             except Exception as e:
                 print(f"[glTF export] KTX2 encode failed for "
                       f"'{image_name}', falling back to PNG/JPEG: {e}")
-                self._fallback_ktx_image(index, image_name)
+                self._fallback_ktx_image(index, image_name, fallback)
                 continue
 
             img = self.images[index]
@@ -409,8 +437,11 @@ class TextureExporter:
         if not any(EXT_TEXTURE_BASISU in (t.extensions or {}) for t in self.textures):
             self.extensions_used.discard(EXT_TEXTURE_BASISU)
 
-    def _fallback_ktx_image(self, index: int, image_name: str) -> None:
-        """Replace a failed KTX2 placeholder with PNG/JPEG bytes in place."""
+    def _fallback_ktx_image(
+        self, index: int, image_name: str, pixels: tuple | None = None,
+    ) -> None:
+        """Replace a failed KTX2 placeholder with PNG/JPEG bytes in place.
+        ``pixels`` (rgba, w, h) stands in for an image already removed."""
         import bpy
 
         img = self.images[index]
@@ -426,10 +457,13 @@ class TextureExporter:
                 tex.source = index
 
         blender_image = bpy.data.images.get(image_name)
-        if blender_image is None:
+        if pixels is not None:
+            image_data, mime_type = png_from_rgba(*pixels), "image/png"
+        elif blender_image is not None:
+            image_data, mime_type = self._get_image_bytes(blender_image)
+        else:
             print(f"[glTF export] image '{image_name}' vanished during export")
             return
-        image_data, mime_type = self._get_image_bytes(blender_image)
         img.mime_type = mime_type
         if self.settings.export_format == "GLB":
             img.buffer_view = self.buffer.add_image_data(image_data)

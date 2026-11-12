@@ -19,7 +19,7 @@ from . import ktx_lib
 from . import ktx_download
 from . import cutscene_tools
 from .gltf import constants, types, buffer, serialize
-from .export import converter, mesh, material, texture, scene, animation, skin, physics, navigation, particles, interactivity, quantize, audio, cutscene
+from .export import converter, bake_cache, mesh, material, texture, scene, animation, skin, physics, navigation, particles, interactivity, quantize, audio, cutscene
 from .import_ import (
     converter as import_converter,
     buffer_reader,
@@ -52,6 +52,7 @@ if _needs_reload:
     layer_node = importlib.reload(layer_node)
     # Export submodules
     converter = importlib.reload(converter)
+    bake_cache = importlib.reload(bake_cache)
     mesh = importlib.reload(mesh)
     material = importlib.reload(material)
     texture = importlib.reload(texture)
