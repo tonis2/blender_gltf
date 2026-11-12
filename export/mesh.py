@@ -39,6 +39,7 @@ class MeshExporter:
         material_map: dict[int, int] | None = None,
         skin_joint_map: dict[str, int] | None = None,
         correction_matrix=None,
+        bind_matrix=None,
     ) -> int | None:
         """Export mesh data from a Blender object. Returns mesh index or None.
 
@@ -46,6 +47,9 @@ class MeshExporter:
         ``converter.shear_correction``) baked into positions/normals so a
         TRS-only node can still reproduce a sheared placement. ``None`` (the
         common case) leaves geometry and the dedup cache untouched.
+
+        ``bind_matrix`` is an optional 4x4 placing a skinned mesh in its
+        armature's space, baked into the geometry the same way.
         """
         import bpy
 
@@ -139,6 +143,11 @@ class MeshExporter:
                 round(correction_matrix[i][j], 6)
                 for i in range(3) for j in range(3)
             ]))
+        if bind_matrix is not None:
+            key_parts.append("bind:" + repr([
+                round(bind_matrix[i][j], 6)
+                for i in range(3) for j in range(4)
+            ]))
         cache_key = "|".join(key_parts)
         if cache_key in self._cache:
             _release_mesh()
@@ -178,7 +187,7 @@ class MeshExporter:
         # Extract shape key deltas before evaluation (shape keys live on original data)
         shape_key_data = None
         if self.settings.export_morph_targets:
-            shape_key_data = self._extract_shape_keys(blender_object)
+            shape_key_data = self._extract_shape_keys(blender_object, bind_matrix)
             # Shape-key deltas are indexed by ORIGINAL-mesh vertex indices, but
             # the primitive's vertex_index field comes from the EVALUATED mesh.
             # Modifiers that change vertex count (Mirror, Subsurf, ...) make the
@@ -207,6 +216,7 @@ class MeshExporter:
                 blender_mesh, blender_object, material_map,
                 shape_key_data, joint_data, weight_data,
                 correction_matrix=correction_matrix,
+                bind_matrix=bind_matrix,
             )
         finally:
             _release_mesh()
@@ -222,10 +232,13 @@ class MeshExporter:
         return index
 
     def _extract_shape_keys(
-        self, blender_object: "bpy.types.Object",
+        self, blender_object: "bpy.types.Object", bind_matrix=None,
     ) -> list[tuple[str, np.ndarray]] | None:
         """Extract shape key position deltas from the original mesh data.
         Returns list of (name, delta_positions) or None."""
+        linear = None
+        if bind_matrix is not None:
+            linear = np.array(bind_matrix.to_3x3(), dtype=np.float32)
         if not hasattr(blender_object.data, "shape_keys") or blender_object.data.shape_keys is None:
             return None
 
@@ -246,6 +259,8 @@ class MeshExporter:
             kb.data.foreach_get("co", co)
             co = co.reshape(-1, 3)
             delta = co - basis_co
+            if linear is not None:
+                delta = np.ascontiguousarray(delta @ linear.T, dtype=np.float32)
             convert_positions(delta)
             results.append((kb.name, delta))
 
@@ -296,6 +311,7 @@ class MeshExporter:
         joint_data: np.ndarray | None = None,
         weight_data: np.ndarray | None = None,
         correction_matrix=None,
+        bind_matrix=None,
     ) -> Mesh | None:
         name = blender_object.name
 
@@ -307,6 +323,14 @@ class MeshExporter:
             inv_t_shear3 = np.array(
                 correction_matrix.inverted().transposed(), dtype=np.float32,
             )
+        # A skinned mesh's placement against its armature goes the same way,
+        # with a translation. The two never meet: skinned meshes bake no shear.
+        bind_offset = None
+        if bind_matrix is not None:
+            linear = bind_matrix.to_3x3()
+            shear3 = np.array(linear, dtype=np.float32)
+            inv_t_shear3 = np.array(linear.inverted_safe().transposed(), dtype=np.float32)
+            bind_offset = np.array(bind_matrix.translation, dtype=np.float32)
         blender_mesh.calc_loop_triangles()
         if len(blender_mesh.loop_triangles) == 0:
             return None
@@ -347,6 +371,8 @@ class MeshExporter:
         positions = positions.reshape(-1, 3)
         if shear3 is not None:
             positions = np.ascontiguousarray(positions @ shear3.T, dtype=np.float32)
+        if bind_offset is not None:
+            positions += bind_offset
         convert_positions(positions)
 
         # One AABB for the whole mesh so every primitive shares the same

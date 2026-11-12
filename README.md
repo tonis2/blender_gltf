@@ -8,7 +8,8 @@ A custom Blender addon for exporting and importing scenes in glTF 2.0 format.
 - **PBR Materials & Textures**
 - **Animations** — keyframe animations
 - **Shape Keys** — morph targets
-- **Armatures & Skinning** — skeletal animation with bone weights
+- **Armatures & Skinning** — skeletal animation with bone weights; an armature's clip list (sidebar
+  *glTF* tab › *Clips*) exports several actions as separate animations of one character file
 - **Physics** — rigid bodies and collision shapes (KHR extensions)
 - **GPU Instancing** — collection instances via `EXT_mesh_gpu_instancing`
 - **Export formats** — GLB (binary), glTF + .bin (separate), glTF embedded (base64)
@@ -26,6 +27,7 @@ A custom Blender addon for exporting and importing scenes in glTF 2.0 format.
 | `KHR_physics_rigid_bodies` | Rigid bodies, colliders, and joints |
 | `KHR_implicit_shapes` | Collision shapes for physics |
 | `CUSTOM_physics_navigation` | Optional root-level precomputed navigation profile, baked from the ground meshes you select in Scene Properties › glTF Navigation. Export only — see [`extensions/physics_navigation.md`](extensions/physics_navigation.md) |
+| `CUSTOM_cutscene` | A cutscene as its own small, mesh-less file: actors reuse clips from their own `.glb` by name and walk along paths drawn on the ground, plus camera shots, timed events and one-off clips. Authored with NLA strips in the 3D viewport sidebar › glTF tab. Export only — see [`extensions/cutscene.md`](extensions/cutscene.md) |
 | `EXT_mesh_gpu_instancing` | Efficient GPU instancing for repeated objects |
 | `KHR_texture_basisu` | KTX2 textures, written when Image Format is KTX2. UASTC and ETC1S are the Basis Universal payloads the spec means; the **BC7** codec option writes BC7 blocks through the same reference, which a desktop GPU uploads with no transcode but a strict reader will refuse |
 | `KHR_environment_map` | World environment as a KTX2 cubemap + irradiance SH. Export only, and the upstream spec is an unmerged draft — see [`extensions/environment_map.md`](extensions/environment_map.md) |

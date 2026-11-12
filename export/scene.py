@@ -46,6 +46,26 @@ _LIGHT_TYPE_MAP = {
 }
 
 
+def camera_yfov(cam: "bpy.types.Camera", render: "bpy.types.RenderSettings") -> tuple[float, float]:
+    """A perspective camera's (vertical FOV in radians, aspect ratio).
+
+    glTF wants the vertical FOV as the render frames it. cam.angle is the FOV
+    along the sensor_fit axis (AUTO fits the longer one), so on a landscape
+    render only VERTICAL fit is already vertical; the rest is narrowed by the
+    render's aspect. That number is only readable with aspectRatio beside it,
+    so callers write both."""
+    width = render.resolution_x * render.pixel_aspect_x
+    height = render.resolution_y * render.pixel_aspect_y
+    aspect = width / height if height else 1.0
+    if width >= height:
+        vertical_fit = cam.sensor_fit == "VERTICAL"
+    else:
+        vertical_fit = cam.sensor_fit != "HORIZONTAL"
+    if vertical_fit:
+        return cam.angle, aspect
+    return 2.0 * math.atan(math.tan(cam.angle / 2.0) / aspect), aspect
+
+
 class SceneExporter:
     def __init__(
         self,
@@ -359,6 +379,11 @@ class SceneExporter:
         if obj.get("gltf_navigation_preview"):
             return None
 
+        # Cutscene path sketches and walk paths are authoring aids; a cutscene
+        # export carries the paths, the scene never does.
+        if obj.get("gltf_cutscene_helper"):
+            return None
+
         # If this object was already exported (shared across scenes), reuse its node
         if obj.name in self.object_to_node_index:
             return self.object_to_node_index[obj.name]
@@ -414,6 +439,7 @@ class SceneExporter:
         if obj.type == "MESH":
             # Check for armature modifier (skinned mesh)
             joint_map = None
+            bind_matrix = None
             if self.skin_exporter and self.settings.export_skinning:
                 armature_mod = self._find_armature_modifier(obj)
                 if armature_mod and armature_mod.object:
@@ -421,6 +447,7 @@ class SceneExporter:
                     if arm_name in self.skin_exporter.armature_joint_maps:
                         joint_map = self.skin_exporter.armature_joint_maps[arm_name]
                         skin_index = self.skin_exporter.armature_skin_index[arm_name]
+                        bind_matrix = self._skin_bind_matrix(obj, armature_mod.object)
 
             # Skinned-mesh nodes ignore their TRS (the skin places vertices), so
             # there is no node decompose to compensate for — never bake shear.
@@ -430,6 +457,7 @@ class SceneExporter:
             material_map = self._gather_materials_for_object(obj)
             mesh_index = self.mesh_exporter.gather(
                 obj, material_map, joint_map, correction_matrix=mesh_correction,
+                bind_matrix=bind_matrix,
             )
         elif obj.type in {"CURVE", "SURFACE", "FONT", "META", "CURVES", "GREASEPENCIL"}:
             # Evaluate the modifier stack to a mesh (e.g., a curve or hair
@@ -617,6 +645,22 @@ class SceneExporter:
         return self._is_selected(owner)
 
     @staticmethod
+    def _skin_bind_matrix(obj: "bpy.types.Object", armature: "bpy.types.Object"):
+        """The mesh's placement in its armature's space, or None when it sits
+        exactly on the armature (the usual rig).
+
+        Skins are written in armature space, so a mesh that is offset, turned
+        or scaled against its armature has that baked into its vertices."""
+        if obj.parent == armature and obj.parent_type in {"OBJECT", "ARMATURE"}:
+            bind = obj.matrix_local
+        else:
+            bind = armature.matrix_world.inverted_safe() @ obj.matrix_world
+        identity = ((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+        if all(abs(bind[i][j] - identity[i][j]) <= 1e-5 for i in range(4) for j in range(4)):
+            return None
+        return bind.copy()
+
+    @staticmethod
     def _find_armature_modifier(obj: "bpy.types.Object"):
         """Find the first active Armature modifier on an object."""
         for mod in obj.modifiers:
@@ -635,6 +679,7 @@ class SceneExporter:
     _SKIP_KEYS = frozenset({
         "khr_physics", "cycles", "gltf_export_settings", "gltf_props",
         "gltf_uid",  # surfaced as Node.uid (glTF 2.1), not as an extra
+        "gltf_clips", "gltf_clips_index", "gltf_cutscene",
     })
 
     @classmethod
@@ -688,25 +733,9 @@ class SceneExporter:
             return self.camera_index_by_name[cam.name]
 
         if cam.type == "PERSP":
-            # glTF wants the vertical FOV as the render frames it. cam.angle is the
-            # FOV along the sensor_fit axis (AUTO fits the longer one), so on a
-            # landscape render only VERTICAL fit is already vertical; the rest is
-            # narrowed by the render's aspect. That number is only readable with
-            # aspectRatio beside it, so write both.
             import bpy
 
-            render = bpy.context.scene.render
-            width = render.resolution_x * render.pixel_aspect_x
-            height = render.resolution_y * render.pixel_aspect_y
-            aspect = width / height if height else 1.0
-            if width >= height:
-                vertical_fit = cam.sensor_fit == "VERTICAL"
-            else:
-                vertical_fit = cam.sensor_fit != "HORIZONTAL"
-            if vertical_fit:
-                yfov = cam.angle
-            else:
-                yfov = 2.0 * math.atan(math.tan(cam.angle / 2.0) / aspect)
+            yfov, aspect = camera_yfov(cam, bpy.context.scene.render)
             gltf_cam = Camera(
                 type="perspective",
                 name=cam.name,

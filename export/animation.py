@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from collections import defaultdict
 from typing import TYPE_CHECKING
@@ -76,37 +77,112 @@ _MAT_FCURVE_RE = re.compile(
 def _get_fcurves(
     action: "bpy.types.Action",
     anim_data: "bpy.types.AnimData | None" = None,
+    slot_handle: int | None = None,
 ) -> list["bpy.types.FCurve"]:
-    """Extract fcurves from an action, supporting both legacy and layered (Blender 5+) actions."""
-    # Legacy actions (Blender < 4.4): action.fcurves exists directly
-    if hasattr(action, "fcurves") and not callable(getattr(action, "fcurves", None)):
-        try:
-            return list(action.fcurves)
-        except TypeError:
-            pass
+    """Extract fcurves from an action, legacy or layered (Blender 4.4+).
 
-    # Layered actions (Blender 5+): fcurves in channelbags
-    if hasattr(action, "layers"):
-        # If we have animation_data, use its slot_handle to find the right channelbag
-        slot_handle = None
-        if anim_data and hasattr(anim_data, "action_slot_handle"):
-            slot_handle = anim_data.action_slot_handle
+    A layered action keeps one channelbag per slot. ``slot_handle`` picks the
+    slot explicitly and wins over ``anim_data``, whose assigned slot is the
+    fallback; with neither, every slot's fcurves are returned."""
+    # Layered first: 4.4/4.5 still expose action.fcurves, but only as a proxy
+    # for the first slot, which is the wrong one for any other user.
+    layers = getattr(action, "layers", None)
+    if layers is not None and len(layers):
+        if slot_handle is None and anim_data is not None:
+            slot_handle = getattr(anim_data, "action_slot_handle", None)
 
         fcurves: list["bpy.types.FCurve"] = []
-        for layer in action.layers:
-            if not hasattr(layer, "strips"):
-                continue
-            for strip in layer.strips:
-                if not hasattr(strip, "channelbags"):
-                    continue
-                for cb in strip.channelbags:
-                    # If we have a slot_handle, only use matching channelbag
+        for layer in layers:
+            for strip in getattr(layer, "strips", ()):
+                for cb in getattr(strip, "channelbags", ()):
                     if slot_handle is not None and cb.slot_handle != slot_handle:
                         continue
                     fcurves.extend(cb.fcurves)
         return fcurves
 
+    # Legacy actions (Blender < 4.4): action.fcurves exists directly
+    legacy = getattr(action, "fcurves", None)
+    if legacy is not None and not callable(legacy):
+        try:
+            return list(legacy)
+        except TypeError:
+            pass
     return []
+
+
+def slot_handle_for(action: "bpy.types.Action", obj: "bpy.types.Object") -> int | None:
+    """The slot of ``action`` that animates ``obj``, or None for a legacy
+    action (and for one with no object slot at all).
+
+    The object's assigned slot cannot stand in for this: every action numbers
+    its slots from the same seed, so another action's handle usually matches
+    the first slot here by accident and silently picks the wrong curves."""
+    slots = getattr(action, "slots", None)
+    if slots is None:
+        return None
+
+    anim_data = obj.animation_data
+    if anim_data is not None:
+        if anim_data.action == action and anim_data.action_slot_handle:
+            return anim_data.action_slot_handle
+        for track in anim_data.nla_tracks:
+            for strip in track.strips:
+                if strip.action == action and getattr(strip, "action_slot_handle", 0):
+                    return strip.action_slot_handle
+
+    candidates = [s for s in slots if s.target_id_type in {"OBJECT", "UNSPECIFIED"}]
+    if not candidates:
+        return None
+    for slot in candidates:
+        if slot.identifier == "OB" + obj.name:
+            return slot.handle
+    if len(candidates) == 1:
+        return candidates[0].handle
+
+    # Several object slots, none named for this object: take the one that
+    # animates the most of what this object actually has.
+    bones = set(obj.data.bones.keys()) if obj.type == "ARMATURE" else set()
+
+    def score(slot) -> int:
+        count = 0
+        for fcurve in _get_fcurves(action, None, slot.handle):
+            match = _BONE_FCURVE_RE.match(fcurve.data_path)
+            if match:
+                count += match.group(1) in bones
+            elif fcurve.data_path in _TRS_PATH_MAP:
+                count += 1
+        return count
+
+    return max(candidates, key=score).handle
+
+
+def action_first_frame(action: "bpy.types.Action", slot_handle: int | None = None) -> float:
+    """Earliest keyframe of the action (of one slot when given): the frame an
+    exported clip's t=0 is rebased to."""
+    first: float | None = None
+    for fcurve in _get_fcurves(action, None, slot_handle):
+        for kp in fcurve.keyframe_points:
+            if first is None or kp.co[0] < first:
+                first = kp.co[0]
+    return first if first is not None else 0.0
+
+
+def action_bone_names(action: "bpy.types.Action", slot_handle: int | None = None) -> list[str]:
+    """Names of the pose bones the action animates, in first-seen order."""
+    names: dict[str, None] = {}
+    for fcurve in _get_fcurves(action, None, slot_handle):
+        match = _BONE_FCURVE_RE.match(fcurve.data_path)
+        if match:
+            names.setdefault(match.group(1))
+    return list(names)
+
+
+def action_has_object_channels(action: "bpy.types.Action", slot_handle: int | None = None) -> bool:
+    """True when the action keys the object's own location/rotation/scale."""
+    return any(
+        fcurve.data_path in _TRS_PATH_MAP
+        for fcurve in _get_fcurves(action, None, slot_handle)
+    )
 
 
 class AnimationExporter:
@@ -182,29 +258,10 @@ class AnimationExporter:
         f_origin = self._earliest_keyframe(obj_action_pairs)
 
         for obj, action in obj_action_pairs:
-            node_index = self.object_to_node_index[obj.name]
-
-            # Group fcurves by data_path
-            fcurve_groups: dict[str, dict[int, "bpy.types.FCurve"]] = defaultdict(dict)
-            for fcurve in _get_fcurves(action, obj.animation_data):
-                fcurve_groups[fcurve.data_path][fcurve.array_index] = fcurve
-
-            # TRS channels
-            for data_path in ("location", "rotation_quaternion", "rotation_euler", "scale"):
-                if data_path not in fcurve_groups:
-                    continue
-                # Skip rotation_euler if quaternion curves also exist
-                if data_path == "rotation_euler" and "rotation_quaternion" in fcurve_groups:
-                    continue
-                result = self._gather_trs_channel(
-                    obj, node_index, fcurve_groups[data_path], data_path, fps, f_origin,
-                )
-                if result is not None:
-                    sampler, channel = result
-                    sampler_idx = len(samplers)
-                    samplers.append(sampler)
-                    channel.sampler = sampler_idx
-                    channels.append(channel)
+            self._gather_object_channels(
+                obj, self.object_to_node_index[obj.name], action, fps, f_origin,
+                None, channels, samplers,
+            )
 
         if not channels:
             return None
@@ -212,6 +269,81 @@ class AnimationExporter:
         return Animation(
             name=action_name, channels=channels, samplers=samplers,
             extensions=self._gather_events(obj_action_pairs[0][1], f_origin, fps),
+        )
+
+    def _gather_object_channels(
+        self,
+        obj: "bpy.types.Object",
+        node_index: int,
+        action: "bpy.types.Action",
+        fps: float,
+        f_origin: float,
+        slot_handle: int | None,
+        channels: list[AnimationChannel],
+        samplers: list[AnimationSampler],
+    ) -> None:
+        """Append the object's own TRS channels of ``action`` to the lists."""
+        # Group fcurves by data_path
+        fcurve_groups: dict[str, dict[int, "bpy.types.FCurve"]] = defaultdict(dict)
+        for fcurve in self._fcurves(obj, action, slot_handle):
+            fcurve_groups[fcurve.data_path][fcurve.array_index] = fcurve
+
+        for data_path in ("location", "rotation_quaternion", "rotation_euler", "scale"):
+            if data_path not in fcurve_groups:
+                continue
+            # Skip rotation_euler if quaternion curves also exist
+            if data_path == "rotation_euler" and "rotation_quaternion" in fcurve_groups:
+                continue
+            result = self._gather_trs_channel(
+                obj, node_index, fcurve_groups[data_path], data_path, fps, f_origin,
+            )
+            if result is not None:
+                sampler, channel = result
+                channel.sampler = len(samplers)
+                samplers.append(sampler)
+                channels.append(channel)
+
+    @staticmethod
+    def _fcurves(
+        owner, action: "bpy.types.Action", slot_handle: int | None,
+    ) -> list["bpy.types.FCurve"]:
+        """Fcurves of ``action`` for ``owner``: the given slot, or the one the
+        owner has assigned when the action is its active one."""
+        if slot_handle is not None:
+            return _get_fcurves(action, None, slot_handle)
+        return _get_fcurves(action, owner.animation_data)
+
+    def gather_clip(
+        self,
+        obj: "bpy.types.Object",
+        action: "bpy.types.Action",
+        fps: float,
+        slot_handle: int | None = None,
+        object_trs: bool = True,
+    ) -> Animation | None:
+        """One glTF Animation holding everything ``action`` does to ``obj``:
+        its own TRS (optional) and, for an armature, its pose bones. Unlike
+        gather(), the action need not be the object's active one."""
+        if slot_handle is None:
+            slot_handle = slot_handle_for(action, obj)
+        f_origin = self._earliest_keyframe([(obj, action)], slot_handle)
+
+        channels: list[AnimationChannel] = []
+        samplers: list[AnimationSampler] = []
+        if object_trs and obj.name in self.object_to_node_index:
+            self._gather_object_channels(
+                obj, self.object_to_node_index[obj.name], action, fps, f_origin,
+                slot_handle, channels, samplers,
+            )
+        if obj.type == "ARMATURE":
+            self._gather_bone_channels(
+                obj, action, fps, f_origin, slot_handle, channels, samplers,
+            )
+        if not channels:
+            return None
+        return Animation(
+            name=action.name, channels=channels, samplers=samplers,
+            extensions=self._gather_events(action, f_origin, fps),
         )
 
     def _gather_events(
@@ -232,13 +364,15 @@ class AnimationExporter:
         self.extensions_used.add(EXT_ANIMATION_EVENTS)
         return {EXT_ANIMATION_EVENTS: {"events": events}}
 
-    @staticmethod
+    @classmethod
     def _earliest_keyframe(
+        cls,
         obj_action_pairs: list[tuple["bpy.types.Object", "bpy.types.Action"]],
+        slot_handle: int | None = None,
     ) -> float:
         f_min: float | None = None
         for obj, action in obj_action_pairs:
-            for fc in _get_fcurves(action, obj.animation_data):
+            for fc in cls._fcurves(obj, action, slot_handle):
                 for kp in fc.keyframe_points:
                     if f_min is None or kp.co[0] < f_min:
                         f_min = kp.co[0]
@@ -271,6 +405,15 @@ class AnimationExporter:
             for f in range(int(f_min), int(f_max) + 1):
                 frames.add(float(f))
 
+        return sorted(frames)
+
+    @staticmethod
+    def _densify_frames(sorted_frames: list[float]) -> list[float]:
+        """The keyframes plus every whole frame between the first and last."""
+        frames = set(sorted_frames)
+        frames.update(
+            float(f) for f in range(int(math.ceil(sorted_frames[0])), int(sorted_frames[-1]) + 1)
+        )
         return sorted(frames)
 
     @staticmethod
@@ -483,7 +626,8 @@ class AnimationExporter:
     def _gather_bone_animations(
         self, scenes: "list[bpy.types.Scene]", fps: float,
     ) -> None:
-        """Gather bone/pose animations from armature objects."""
+        """Gather bone/pose animations from armature objects: the active
+        action, then every action in the armature's glTF clip list."""
         seen: set[str] = set()
         for scene in scenes:
             for obj in scene.objects:
@@ -492,35 +636,70 @@ class AnimationExporter:
                 seen.add(obj.name)
                 if obj.type != "ARMATURE":
                     continue
-                if obj.animation_data is None or obj.animation_data.action is None:
-                    continue
 
-                action = obj.animation_data.action
-                anim = self._gather_bone_action(obj, action, fps)
-                if anim is not None:
-                    self.animations.append(anim)
+                done: list["bpy.types.Action"] = []
+                active = obj.animation_data.action if obj.animation_data else None
+                if active is not None:
+                    done.append(active)
+                    anim = self._gather_bone_action(obj, active, fps)
+                    if anim is not None:
+                        self.animations.append(anim)
+
+                for clip in getattr(obj, "gltf_clips", ()):
+                    action = clip.action
+                    if action is None or action in done:
+                        continue
+                    done.append(action)
+                    anim = self._gather_bone_action(
+                        obj, action, fps, slot_handle_for(action, obj),
+                    )
+                    if anim is not None:
+                        self.animations.append(anim)
 
     def _gather_bone_action(
         self,
         armature_obj: "bpy.types.Object",
         action: "bpy.types.Action",
         fps: float,
+        slot_handle: int | None = None,
     ) -> "Animation | None":
         """Gather bone animation channels from an armature action."""
         channels: list[AnimationChannel] = []
         samplers: list[AnimationSampler] = []
 
+        # Action-wide t=0 origin so all bones stay in sync after rebasing.
+        f_origin = self._earliest_keyframe([(armature_obj, action)], slot_handle)
+        self._gather_bone_channels(
+            armature_obj, action, fps, f_origin, slot_handle, channels, samplers,
+        )
+
+        if not channels:
+            return None
+
+        return Animation(
+            name=action.name, channels=channels, samplers=samplers,
+            extensions=self._gather_events(action, f_origin, fps),
+        )
+
+    def _gather_bone_channels(
+        self,
+        armature_obj: "bpy.types.Object",
+        action: "bpy.types.Action",
+        fps: float,
+        f_origin: float,
+        slot_handle: int | None,
+        channels: list[AnimationChannel],
+        samplers: list[AnimationSampler],
+    ) -> None:
+        """Append the pose-bone TRS channels of ``action`` to the lists."""
         # Group fcurves by (bone_name, property)
         bone_fcurves: dict[tuple[str, str], dict[int, "bpy.types.FCurve"]] = defaultdict(dict)
-        for fcurve in _get_fcurves(action, armature_obj.animation_data):
+        for fcurve in self._fcurves(armature_obj, action, slot_handle):
             match = _BONE_FCURVE_RE.match(fcurve.data_path)
             if match:
                 bone_name = match.group(1)
                 data_path = match.group(2)
                 bone_fcurves[(bone_name, data_path)][fcurve.array_index] = fcurve
-
-        # Action-wide t=0 origin so all bones stay in sync after rebasing.
-        f_origin = self._earliest_keyframe([(armature_obj, action)])
 
         for (bone_name, data_path), fc_dict in bone_fcurves.items():
             if (armature_obj.name, bone_name) not in self.bone_to_node_index:
@@ -534,18 +713,9 @@ class AnimationExporter:
             )
             if result is not None:
                 sampler, channel = result
-                sampler_idx = len(samplers)
+                channel.sampler = len(samplers)
                 samplers.append(sampler)
-                channel.sampler = sampler_idx
                 channels.append(channel)
-
-        if not channels:
-            return None
-
-        return Animation(
-            name=action.name, channels=channels, samplers=samplers,
-            extensions=self._gather_events(action, f_origin, fps),
-        )
 
     def _gather_bone_trs_channel(
         self,
@@ -581,10 +751,17 @@ class AnimationExporter:
         if sorted_frames is None:
             return None
 
+        gltf_interp = self._detect_interpolation(fcurves, data_path)
+        if gltf_interp == "CUBICSPLINE":
+            # A pose value is a delta that gets composed with the rest pose
+            # below, so the fcurve handles are not tangents of the exported
+            # channel (and a cubic sampler needs 3 values per key, not 1).
+            # Sample the curve at whole frames and let the runtime lerp.
+            sorted_frames = self._densify_frames(sorted_frames)
+            gltf_interp = "LINEAR"
+
         # Rebase to action-shared t=0 origin.
         times = self._frames_to_times(sorted_frames, f_origin, fps)
-
-        gltf_interp = self._detect_interpolation(fcurves, data_path)
 
         # Rest values for pose bone deltas (identity)
         if data_path in ("location",):

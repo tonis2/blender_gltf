@@ -17,8 +17,9 @@ from . import layer_node
 from . import interactivity_nodes
 from . import ktx_lib
 from . import ktx_download
+from . import cutscene_tools
 from .gltf import constants, types, buffer, serialize
-from .export import converter, mesh, material, texture, scene, animation, skin, physics, navigation, particles, interactivity, quantize, audio
+from .export import converter, mesh, material, texture, scene, animation, skin, physics, navigation, particles, interactivity, quantize, audio, cutscene
 from .import_ import (
     converter as import_converter,
     buffer_reader,
@@ -63,6 +64,7 @@ if _needs_reload:
     interactivity = importlib.reload(interactivity)
     quantize = importlib.reload(quantize)
     audio = importlib.reload(audio)
+    cutscene = importlib.reload(cutscene)
     # Import submodules
     import_converter = importlib.reload(import_converter)
     buffer_reader = importlib.reload(buffer_reader)
@@ -81,11 +83,13 @@ if _needs_reload:
     exporter = importlib.reload(exporter)
     importer = importlib.reload(importer)
     operator = importlib.reload(operator)
+    cutscene_tools = importlib.reload(cutscene_tools)
 
 
 def register():
     ktx_download.register()
     operator.register()
+    cutscene_tools.register()
     layer_node.register()
     interactivity_nodes.register()
 
@@ -93,5 +97,6 @@ def register():
 def unregister():
     interactivity_nodes.unregister()
     layer_node.unregister()
+    cutscene_tools.unregister()
     operator.unregister()
     ktx_download.unregister()

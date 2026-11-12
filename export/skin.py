@@ -78,12 +78,12 @@ class SkinExporter:
         # Root bone indices
         root_indices = [bone_node_indices[b.name] for b in bones if b.parent is None]
 
-        # Compute inverse bind matrices
+        # Inverse bind matrices, in armature space. A skinned mesh's vertices
+        # are written in that space too (see SceneExporter._skin_bind_matrix),
+        # so the skin holds wherever the armature stands, turns or scales.
         ibm_data = np.empty((len(bones), 16), dtype=np.float32)
         for i, bone in enumerate(bones):
-            world_mat = armature_obj.matrix_world @ bone.matrix_local
-            ibm = convert_matrix(world_mat.inverted())
-            ibm_data[i] = ibm
+            ibm_data[i] = convert_matrix(bone.matrix_local.inverted())
 
         ibm_acc = self.buffer.add_accessor(
             ibm_data, ComponentType.FLOAT, DataType.MAT4,
