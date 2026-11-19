@@ -142,7 +142,7 @@ Roll is not represented: the camera's up is always world up.
 
 ## One-off clips
 
-A strip whose action is in the actor's clip list is exported by name alone; the clip is
+A strip whose action is in the actor's clip list is exported by its clip name alone; the clip is
 in the character's file. Any other action is written **into the cutscene file** as a
 normal glTF animation, and the strip gets `animation` beside `clip`.
 
@@ -162,7 +162,7 @@ The file has no buffer at all unless it has one-off clips.
 **Character setup (once per character).** Select the character (its armature or its
 mesh) and, in the 3D viewport sidebar's *glTF* tab › *Clips*, list the actions that
 belong in the character's `.glb`; *Add All Matching* fills the list with every action
-that animates the rig. The ordinary export then writes each as
+that animates the rig, one per name (`walk.001` counts as `walk`). The ordinary export then writes each as
 its own animation instead of only the active action. Give walk and run cycles a *Ground
 Speed* (m/s at normal playback) so walks can match their stride to the ground.
 

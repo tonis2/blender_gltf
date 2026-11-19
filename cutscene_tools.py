@@ -11,6 +11,7 @@ the Blender data it reads. See extensions/cutscene.md.
 """
 
 import math
+import re
 
 import bpy
 import numpy as np
@@ -30,6 +31,8 @@ PATHS_COLLECTION = "Cutscene Paths"
 _PLACEMENT_PROP = "_gltf_cutscene_placement"
 # Enum value of a LINEAR keyframe, for foreach_set.
 _LINEAR = 1
+# Blender's suffix on a repeated name, as in walk.001.
+_COPY_SUFFIX = re.compile(r"\.\d{3}$")
 
 EASE_ITEMS = [
     ("LINEAR", "Linear", "Even speed from start to end"),
@@ -67,6 +70,9 @@ class GltfClip(bpy.types.PropertyGroup):
         name="Action", type=bpy.types.Action,
         description="Exported as a glTF animation named after this action",
     )
+    name: StringProperty(
+        name="Name", description="Name in the file; empty uses the action's name",
+    )
     speed: FloatProperty(
         name="Ground Speed", min=0.0, default=0.0, unit="VELOCITY",
         description=(
@@ -81,6 +87,7 @@ class DATA_UL_gltf_clips(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
         row = layout.row(align=True)
         row.prop(item, "action", text="", icon="ACTION")
+        row.prop(item, "name", text="")
         row.prop(item, "speed", text="")
 
 
@@ -161,8 +168,13 @@ class OBJECT_OT_gltf_remove_clip(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def base_action_name(name: str) -> str:
+    """The name without Blender's copy suffix: walk.001 -> walk."""
+    return _COPY_SUFFIX.sub("", name)
+
+
 class OBJECT_OT_gltf_add_matching_clips(bpy.types.Operator):
-    """Add every action that animates this armature's bones to its glTF clip list"""
+    """Add every action that animates this armature's bones to its glTF clip list, once per name (walk.001 counts as walk)"""
 
     bl_idname = "gltf_custom.add_matching_clips"
     bl_label = "Add All Matching"
@@ -178,11 +190,26 @@ class OBJECT_OT_gltf_add_matching_clips(bpy.types.Operator):
         for index in reversed(range(len(obj.gltf_clips))):
             if obj.gltf_clips[index].action is None:
                 obj.gltf_clips.remove(index)
+        taken = set()
+        for clip in obj.gltf_clips:
+            taken.add(base_action_name(clip.action.name))
+            if clip.name:
+                taken.add(clip.name)
+        # Copies of one imported file hold the same data, so one per base name.
+        copies: dict[str, list] = {}
+        for action in matching_actions(obj):
+            copies.setdefault(base_action_name(action.name), []).append(action)
         added = 0
-        for action in sorted(matching_actions(obj), key=lambda item: item.name):
-            if cs.is_library_clip(obj, action):
+        for base in sorted(copies):
+            if base in taken:
                 continue
-            obj.gltf_clips.add().action = action
+            found = copies[base]
+            action = next((a for a in found if a.name == base), None) or min(found, key=lambda a: a.name)
+            clip = obj.gltf_clips.add()
+            clip.action = action
+            if action.name != base:
+                clip.name = base
+            taken.add(base)
             added += 1
         self.report({"INFO"}, f"Added {added} clip(s); the list holds {len(obj.gltf_clips)}")
         return {"FINISHED"}

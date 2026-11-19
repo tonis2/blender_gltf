@@ -156,6 +156,15 @@ def slot_handle_for(action: "bpy.types.Action", obj: "bpy.types.Object") -> int 
     return max(candidates, key=score).handle
 
 
+def clip_export_name(obj: "bpy.types.Object", action: "bpy.types.Action") -> str:
+    """The animation name ``action`` gets in ``obj``'s file: its clip-list name
+    when it has one, else the action's name."""
+    for clip in getattr(obj, "gltf_clips", ()):
+        if clip.action == action and clip.name:
+            return clip.name
+    return action.name
+
+
 def action_first_frame(action: "bpy.types.Action", slot_handle: int | None = None) -> float:
     """Earliest keyframe of the action (of one slot when given): the frame an
     exported clip's t=0 is rebased to."""
@@ -638,23 +647,40 @@ class AnimationExporter:
                     continue
 
                 done: list["bpy.types.Action"] = []
+                names: set[str] = set()
                 active = obj.animation_data.action if obj.animation_data else None
                 if active is not None:
                     done.append(active)
-                    anim = self._gather_bone_action(obj, active, fps)
-                    if anim is not None:
-                        self.animations.append(anim)
+                    self._append_bone_action(obj, active, fps, None, names)
 
                 for clip in getattr(obj, "gltf_clips", ()):
                     action = clip.action
                     if action is None or action in done:
                         continue
                     done.append(action)
-                    anim = self._gather_bone_action(
-                        obj, action, fps, slot_handle_for(action, obj),
-                    )
-                    if anim is not None:
-                        self.animations.append(anim)
+                    self._append_bone_action(obj, action, fps, slot_handle_for(action, obj), names)
+
+    def _append_bone_action(
+        self,
+        obj: "bpy.types.Object",
+        action: "bpy.types.Action",
+        fps: float,
+        slot_handle: int | None,
+        names: set[str],
+    ) -> None:
+        """Gather one action of the armature; a name it already used falls
+        back to the action's own name."""
+        name = clip_export_name(obj, action)
+        if name in names:
+            print(
+                f"[glTF export] '{obj.name}': clip name '{name}' is used twice; "
+                f"'{action.name}' is exported as '{action.name}'"
+            )
+            name = action.name
+        anim = self._gather_bone_action(obj, action, fps, slot_handle, name)
+        if anim is not None:
+            names.add(anim.name)
+            self.animations.append(anim)
 
     def _gather_bone_action(
         self,
@@ -662,8 +688,10 @@ class AnimationExporter:
         action: "bpy.types.Action",
         fps: float,
         slot_handle: int | None = None,
+        name: str | None = None,
     ) -> "Animation | None":
-        """Gather bone animation channels from an armature action."""
+        """Gather bone animation channels from an armature action, named by
+        ``name`` or else its clip-list name."""
         channels: list[AnimationChannel] = []
         samplers: list[AnimationSampler] = []
 
@@ -677,7 +705,8 @@ class AnimationExporter:
             return None
 
         return Animation(
-            name=action.name, channels=channels, samplers=samplers,
+            name=name or clip_export_name(armature_obj, action),
+            channels=channels, samplers=samplers,
             extensions=self._gather_events(action, f_origin, fps),
         )
 

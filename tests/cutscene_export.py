@@ -585,8 +585,33 @@ def main():
     check_active_action_covering(scene)
     check_buried_walk_track(scene, hero)
     check_walks_keep_the_lean(scene)
+    check_named_clip(scene)
 
     print("cutscene_export: OK")
+
+
+def check_named_clip(scene):
+    """A listed clip with a name of its own is referred to by that name, as
+    the character's file names it, for a play strip and a walk alike."""
+    rig = make_rig("named", location=(40, 0, 0))
+    arm_x = ('pose.bones["arm"].location', 0)
+    nod = make_action("nod.001", rig, {arm_x: [(1, 0.0), (10, 1.0)]})
+    stride = make_action("stride.002", rig, {arm_x: [(1, 0.0), (10, 0.5)]})
+    for action, name in ((nod, "nod"), (stride, "stride")):
+        clip = rig.gltf_clips.add()
+        clip.action = action
+        clip.name = name
+    path = tools.polyline_to_curve(bpy.context, [(40, 0, 0), (44, 0, 0)], "Named path")
+    tools.create_move(rig, path, 3001, 3049, scene, ease="LINEAR", turn=True, clip=stride)
+    add_strip(rig, "acting", nod, 3060)
+
+    item = scene.gltf_cutscenes.cutscenes.add()
+    item.name, item.frame_start, item.frame_end, item.camera_mode = "named", 3001, 3100, "NONE"
+    with tempfile.TemporaryDirectory() as folder:
+        document, _, _ = export(scene, folder, "named")
+    actor = next(a for a in payload(document)["actors"] if a["row"] == "named")
+    assert [s.get("clip") for s in actor["strips"]] == ["stride", "nod"], actor["strips"]
+    assert not any("animation" in s for s in actor["strips"]), actor["strips"]
 
 
 def check_walks_keep_the_lean(scene):

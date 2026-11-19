@@ -38,6 +38,8 @@ class AnimationImporter:
         # animation targeting the same datablock shares one action even when
         # Blender renames a new action on name collision ("Walk.001").
         self._action_cache: dict[tuple[int, str], "bpy.types.Action"] = {}
+        # Armature pointer -> (armature, [(action, glTF animation name)]) in file order.
+        self._armature_clips: dict[int, tuple["bpy.types.Object", list]] = {}
 
     def import_all(self, context: "bpy.types.Context") -> None:
         if self.gltf.animations is None:
@@ -46,6 +48,23 @@ class AnimationImporter:
 
         for gltf_anim in self.gltf.animations:
             self._import_animation(gltf_anim, fps)
+
+    def fill_clip_lists(self) -> None:
+        """Put each armature's imported actions on its glTF clip list, so all of
+        them export again, under the file's names rather than Blender's .001."""
+        import bpy
+
+        if not hasattr(bpy.types.Object, "gltf_clips"):
+            return
+        for armature_obj, entries in self._armature_clips.values():
+            listed = {clip.action.as_pointer() for clip in armature_obj.gltf_clips if clip.action}
+            for action, anim_name in entries:
+                if action.as_pointer() in listed:
+                    continue
+                clip = armature_obj.gltf_clips.add()
+                clip.action = action
+                clip.name = anim_name or ""
+                listed.add(action.as_pointer())
 
     def _import_animation(self, gltf_anim: "Animation", fps: float) -> None:
         self._anim_actions = set()
@@ -199,6 +218,9 @@ class AnimationImporter:
             pose_bone.rotation_mode = "QUATERNION"
 
         action = self._ensure_action(armature_obj, anim_name or "Action")
+        _, entries = self._armature_clips.setdefault(armature_obj.as_pointer(), (armature_obj, []))
+        if all(entry[0] != action for entry in entries):
+            entries.append((action, anim_name))
 
         if interp == "CUBICSPLINE":
             # CUBICSPLINE output stores (in-tangent, value, out-tangent) per

@@ -29,6 +29,7 @@ from .animation import (
     action_bone_names,
     action_first_frame,
     action_has_object_channels,
+    clip_export_name,
     slot_handle_for,
 )
 from .converter import convert_location
@@ -637,7 +638,7 @@ class CutsceneExporter:
         }
         clip = meta.clip
         if clip is not None:
-            move["clip"] = clip.name
+            move["clip"] = clip_export_name(obj, clip)
             move["loop"] = True
             move["speed"] = _round(walk_rate(length, end - start, clip_speed(obj, clip)))
             move["fade"] = _round(self.default_fade)
@@ -703,7 +704,7 @@ class CutsceneExporter:
             "start": self.window.time(strip.frame_start),
             "end": self.window.time(strip.frame_end),
             "priority": priority,
-            "clip": action.name,
+            "clip": clip_export_name(obj, action),
             "loop": strip.repeat > 1.0 + 1e-6,
             "speed": _round(1.0 / strip.scale if strip.scale else 1.0),
             "fade": _round(strip.blend_in / fps if strip.blend_in > 0.0 else self.default_fade),

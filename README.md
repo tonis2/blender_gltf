@@ -9,7 +9,11 @@ A custom Blender addon for exporting and importing scenes in glTF 2.0 format.
 - **Animations** — keyframe animations
 - **Shape Keys** — morph targets
 - **Armatures & Skinning** — skeletal animation with bone weights; an armature's clip list (sidebar
-  *glTF* tab › *Clips*) exports several actions as separate animations of one character file
+  *glTF* tab › *Clips*) exports several actions as separate animations of one character file. A
+  clip's *Name* is its name in the file (empty uses the action's). Importing a character fills its
+  list with the file's animations under their own names, so a character imported twice still
+  exports `walk`, not `walk.001`; for scenes built before that, *Add All Matching* adds one action
+  per name (`walk.001` counts as `walk`)
 - **Physics** — rigid bodies and collision shapes (KHR extensions)
 - **GPU Instancing** — collection instances via `EXT_mesh_gpu_instancing`
 - **Export formats** — GLB (binary), glTF + .bin (separate), glTF embedded (base64)

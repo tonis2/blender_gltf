@@ -288,6 +288,7 @@ class GltfImporter:
                 bone_node_to_armature=bone_mapping,
             )
             anim_importer.import_all(self.context)
+            anim_importer.fill_clip_lists()
 
         return node_to_blender
 
