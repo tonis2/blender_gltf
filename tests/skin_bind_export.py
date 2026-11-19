@@ -21,7 +21,7 @@ try:
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     import blender_gltf
-if not hasattr(bpy.types.Scene, "gltf_cutscenes"):
+if not hasattr(bpy.types.Object, "gltf_clips"):
     blender_gltf.register()
 
 from blender_gltf.exporter import ExportSettings, GltfExporter

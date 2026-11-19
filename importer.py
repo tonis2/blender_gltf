@@ -272,6 +272,10 @@ class GltfImporter:
         )
         node_to_blender = scene_importer.import_scene(self.context)
 
+        # 8a. Each armature remembers the file it came from; export copies its clips.
+        if skin_importer and external_depth == 0 and target_collection is None:
+            link_clip_source(skin_importer.bone_node_to_armature.values(), self.settings.filepath)
+
         # 8b. Physics joint fixup (needs node mapping)
         if physics_importer:
             physics_importer.fixup_joints(self.context, node_to_blender)
@@ -291,6 +295,24 @@ class GltfImporter:
             anim_importer.fill_clip_lists()
 
         return node_to_blender
+
+
+def link_clip_source(armature_bones, filepath: str) -> None:
+    """Set gltf_clip_source on each armature to ``filepath``, relative when
+    the .blend is saved."""
+    import os
+    import bpy
+
+    if not filepath or not hasattr(bpy.types.Object, "gltf_clip_source"):
+        return
+    path = os.path.abspath(filepath)
+    if bpy.data.filepath:
+        try:
+            path = bpy.path.relpath(path)
+        except ValueError:  # another drive
+            pass
+    for armature_obj, _bone in armature_bones:
+        armature_obj.gltf_clip_source = path
 
 
 # Max external-asset nesting depth — a backstop against malformed self-references.

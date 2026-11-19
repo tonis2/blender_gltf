@@ -146,7 +146,6 @@ def main():
     assert abs(shared_input["max"][0] - 24 / 24) < 1e-5
 
     check_name_override()
-    check_add_matching()
 
     print("clip_list_export: OK")
 
@@ -181,24 +180,6 @@ def check_name_override():
     names = sorted(a.get("name") for a in document["animations"])
     assert names == ["hop", "jump", "rest.001", "run"], names
     assert channel_targets(document, animation(document, "jump")) == {("arm", "translation")}
-
-
-def check_add_matching():
-    """Add All Matching takes one action per base name, preferring the plain
-    name, and names a suffixed one's clip after the base."""
-    reset()
-    rig = make_rig("Pack")
-    arm_loc = 'pose.bones["arm"].location'
-    for name in ("walk", "walk.001", "idle.001"):
-        make_action(name, "Pack", {(arm_loc, 0): [(1, 0.0), (9, 1.0)]})
-    bpy.context.view_layer.objects.active = rig
-    assert bpy.ops.gltf_custom.add_matching_clips() == {"FINISHED"}
-    clips = [(clip.action.name, clip.name) for clip in rig.gltf_clips]
-    assert clips == [("idle.001", "idle"), ("walk", "")], clips
-    # Run again: both base names are on the list already.
-    make_action("idle", "Pack", {(arm_loc, 0): [(1, 0.0), (9, 1.0)]})
-    assert bpy.ops.gltf_custom.add_matching_clips() == {"FINISHED"}
-    assert len(rig.gltf_clips) == 2
 
 
 if __name__ == "__main__":

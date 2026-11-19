@@ -3,18 +3,24 @@ from __future__ import annotations
 import math
 import re
 from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from ..gltf.buffer import BufferBuilder
 from ..gltf.constants import ComponentType, DataType
+from ..gltf.serialize import read_glb, read_gltf
 from ..gltf.types import (
     Animation,
     AnimationChannel,
     AnimationChannelTarget,
     AnimationSampler,
+    Gltf,
+    Node,
 )
+from ..import_.buffer_reader import BufferReader
 from .converter import (
     convert_location_array,
     convert_rotation_array,
@@ -165,33 +171,145 @@ def clip_export_name(obj: "bpy.types.Object", action: "bpy.types.Action") -> str
     return action.name
 
 
-def action_first_frame(action: "bpy.types.Action", slot_handle: int | None = None) -> float:
-    """Earliest keyframe of the action (of one slot when given): the frame an
-    exported clip's t=0 is rebased to."""
-    first: float | None = None
-    for fcurve in _get_fcurves(action, None, slot_handle):
-        for kp in fcurve.keyframe_points:
-            if first is None or kp.co[0] < first:
-                first = kp.co[0]
-    return first if first is not None else 0.0
+@dataclass
+class _SourceFile:
+    """A parsed character file whose animations are copied."""
+    path: Path
+    gltf: Gltf
+    reader: BufferReader
 
 
-def action_bone_names(action: "bpy.types.Action", slot_handle: int | None = None) -> list[str]:
-    """Names of the pose bones the action animates, in first-seen order."""
-    names: dict[str, None] = {}
-    for fcurve in _get_fcurves(action, None, slot_handle):
-        match = _BONE_FCURVE_RE.match(fcurve.data_path)
-        if match:
-            names.setdefault(match.group(1))
-    return list(names)
+@dataclass
+class _SourceSkin:
+    """The skin of a source file that matches one armature."""
+    source: _SourceFile
+    joints: dict[int, str]  # source joint node -> bone name
+    roots: set[int]  # joints whose parent is outside the skin
+    nodes: dict[int, int]  # source joint node -> exported bone node
+    fit: RestFit | None  # None: the rests match, keys copy as they are
 
 
-def action_has_object_channels(action: "bpy.types.Action", slot_handle: int | None = None) -> bool:
-    """True when the action keys the object's own location/rotation/scale."""
-    return any(
-        fcurve.data_path in _TRS_PATH_MAP
-        for fcurve in _get_fcurves(action, None, slot_handle)
-    )
+_COPIED_PATHS = {"translation": DataType.VEC3, "rotation": DataType.VEC4, "scale": DataType.VEC3}
+
+
+def _quat_matrix(q) -> np.ndarray:
+    """3x3 rotation of a glTF (x, y, z, w) quaternion."""
+    x, y, z, w = np.asarray(q, dtype=np.float64) / np.linalg.norm(q)
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def _matrix_quat(m: np.ndarray) -> np.ndarray:
+    """glTF (x, y, z, w) quaternion of a 3x3 rotation."""
+    trace = m[0, 0] + m[1, 1] + m[2, 2]
+    if trace > 0.0:
+        s = 2.0 * math.sqrt(1.0 + trace)
+        q = [(m[2, 1] - m[1, 2]) / s, (m[0, 2] - m[2, 0]) / s, (m[1, 0] - m[0, 1]) / s, 0.25 * s]
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = 2.0 * math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2])
+        q = [0.25 * s, (m[0, 1] + m[1, 0]) / s, (m[0, 2] + m[2, 0]) / s, (m[2, 1] - m[1, 2]) / s]
+    elif m[1, 1] > m[2, 2]:
+        s = 2.0 * math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2])
+        q = [(m[0, 1] + m[1, 0]) / s, 0.25 * s, (m[1, 2] + m[2, 1]) / s, (m[0, 2] - m[2, 0]) / s]
+    else:
+        s = 2.0 * math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1])
+        q = [(m[0, 2] + m[2, 0]) / s, (m[1, 2] + m[2, 1]) / s, 0.25 * s, (m[1, 0] - m[0, 1]) / s]
+    return np.array(q) / np.linalg.norm(q)
+
+
+def _quat_multiply(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """a ⊗ b for one (x, y, z, w) quaternion ``a`` and rows ``b``."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b.T
+    return np.stack([
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ], axis=1)
+
+
+def node_rest(node: Node) -> tuple[np.ndarray, np.ndarray]:
+    """Rest translation and (x, y, z, w) rotation of a glTF node."""
+    if node.matrix is not None:
+        m = np.array(node.matrix, dtype=np.float64).reshape(4, 4).T
+        return m[:3, 3].copy(), _matrix_quat(m[:3, :3] / np.linalg.norm(m[:3, :3], axis=0))
+    rotation = np.array(node.rotation or (0.0, 0.0, 0.0, 1.0), dtype=np.float64)
+    return np.array(node.translation or (0.0, 0.0, 0.0), dtype=np.float64), rotation / np.linalg.norm(rotation)
+
+
+@dataclass
+class RestFit:
+    """The level skeleton as the source's under one similarity at the root:
+    q and the rests per root joint, k for every translation."""
+    scale: float  # k
+    roots: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]  # joint -> (q, L_t, S_t)
+
+    def is_identity(self) -> bool:
+        if self.scale != 1.0:
+            return False
+        for q, level_t, source_t in self.roots.values():
+            turned = min(np.abs(q - (0, 0, 0, 1)).max(), np.abs(q + (0, 0, 0, 1)).max())
+            if turned > 1e-6 or np.abs(level_t - source_t).max() > 1e-6:
+                return False
+        return True
+
+
+def fit_rest(rests: dict[int, tuple[Node, Node]], roots: set[int]) -> tuple[RestFit, int | None, float]:
+    """Fit (level node, source node) rests per joint. Also returns the joint
+    furthest from the uniform scale and its error over tolerance (> 1 fails)."""
+    rest = {j: (node_rest(level), node_rest(source)) for j, (level, source) in rests.items()}
+    lengths = [
+        (np.linalg.norm(level[0]), np.linalg.norm(source[0]))
+        for j, (level, source) in rest.items()
+        if j not in roots and np.linalg.norm(source[0]) > 1e-6
+    ]
+    k = sum(a for a, _ in lengths) / sum(b for _, b in lengths) if lengths else 1.0
+    if abs(k - 1.0) <= 1e-6:
+        k = 1.0
+
+    worst, worst_error = None, 0.0
+    for j, ((level_t, _), (source_t, _)) in rest.items():
+        if j in roots:
+            continue
+        error = np.linalg.norm(level_t - k * source_t) / max(1e-4 * k * np.linalg.norm(source_t), 1e-6)
+        if error > worst_error:
+            worst, worst_error = j, float(error)
+
+    fitted = {}
+    for j in roots:
+        (level_t, level_r), (source_t, source_r) = rest[j]
+        q = _quat_multiply(level_r, (np.array([-1.0, -1.0, -1.0, 1.0]) * source_r)[None])[0]
+        fitted[j] = (q / np.linalg.norm(q), level_t, source_t)
+    return RestFit(scale=k, roots=fitted), worst, worst_error
+
+
+def refit_keys(
+    values: np.ndarray, path: str, cubic: bool, k: float,
+    root: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+) -> np.ndarray:
+    """Source keys under a rest fit: on a root T' = L_t + k·q·(T − S_t) and
+    R' = q·R, below it T' = k·T. Tangents get no offset; scale keys stay."""
+    values = np.array(values, dtype=np.float64)
+    if path == "rotation":
+        return values if root is None else _quat_multiply(root[0], values)
+    if path != "translation":
+        return values
+    if root is None:
+        return values * k
+    q, level_t, source_t = root
+    turn = _quat_matrix(q)
+    # Cubic rows are [in-tangent, value, out-tangent] per key.
+    is_value = np.ones(len(values), dtype=bool)
+    if cubic:
+        is_value[:] = False
+        is_value[1::3] = True
+    values[is_value] = level_t + k * (values[is_value] - source_t) @ turn.T
+    values[~is_value] = k * values[~is_value] @ turn.T
+    return values
 
 
 class AnimationExporter:
@@ -202,14 +320,22 @@ class AnimationExporter:
         object_to_node_index: dict[str, int],
         material_to_index: dict[str, int],
         bone_to_node_index: dict[tuple[str, str], int] | None = None,
+        nodes: "list[Node] | None" = None,
     ) -> None:
         self.buffer = buffer
         self.settings = settings
         self.object_to_node_index = object_to_node_index
         self.material_to_index = material_to_index
         self.bone_to_node_index = bone_to_node_index or {}
+        # The file's nodes so far: the rest pose a copied root key is fitted to.
+        self.nodes = nodes or []
         self.animations: list[Animation] = []
         self.extensions_used: set[str] = set()
+        # Clip sources: parsed files by path, and each armature's match.
+        self._source_files: dict[str, "_SourceFile | None"] = {}
+        self._clip_sources: dict[str, "_SourceSkin | None"] = {}
+        # (source path, accessor, is input) -> accessor written for it.
+        self._copied_accessors: dict[tuple[str, int, bool], int] = {}
 
     def gather(self, context: "bpy.types.Context", scenes: "list[bpy.types.Scene] | None" = None) -> None:
         """Gather all animations from the scene(s)."""
@@ -232,6 +358,8 @@ class AnimationExporter:
                 if obj.name not in self.object_to_node_index:
                     continue
                 action = obj.animation_data.action
+                if self._hides_active_action(obj):
+                    continue
                 action_objects[action.name].append((obj, action))
 
         for action_name, pairs in action_objects.items():
@@ -321,39 +449,6 @@ class AnimationExporter:
         if slot_handle is not None:
             return _get_fcurves(action, None, slot_handle)
         return _get_fcurves(action, owner.animation_data)
-
-    def gather_clip(
-        self,
-        obj: "bpy.types.Object",
-        action: "bpy.types.Action",
-        fps: float,
-        slot_handle: int | None = None,
-        object_trs: bool = True,
-    ) -> Animation | None:
-        """One glTF Animation holding everything ``action`` does to ``obj``:
-        its own TRS (optional) and, for an armature, its pose bones. Unlike
-        gather(), the action need not be the object's active one."""
-        if slot_handle is None:
-            slot_handle = slot_handle_for(action, obj)
-        f_origin = self._earliest_keyframe([(obj, action)], slot_handle)
-
-        channels: list[AnimationChannel] = []
-        samplers: list[AnimationSampler] = []
-        if object_trs and obj.name in self.object_to_node_index:
-            self._gather_object_channels(
-                obj, self.object_to_node_index[obj.name], action, fps, f_origin,
-                slot_handle, channels, samplers,
-            )
-        if obj.type == "ARMATURE":
-            self._gather_bone_channels(
-                obj, action, fps, f_origin, slot_handle, channels, samplers,
-            )
-        if not channels:
-            return None
-        return Animation(
-            name=action.name, channels=channels, samplers=samplers,
-            extensions=self._gather_events(action, f_origin, fps),
-        )
 
     def _gather_events(
         self, action: "bpy.types.Action", f_origin: float, fps: float,
@@ -635,8 +730,8 @@ class AnimationExporter:
     def _gather_bone_animations(
         self, scenes: "list[bpy.types.Scene]", fps: float,
     ) -> None:
-        """Gather bone/pose animations from armature objects: the active
-        action, then every action in the armature's glTF clip list."""
+        """Gather bone/pose animations: the active action, then the clip list;
+        with a clip source, that file's animations, then listed clips it lacks."""
         seen: set[str] = set()
         for scene in scenes:
             for obj in scene.objects:
@@ -644,6 +739,20 @@ class AnimationExporter:
                     continue
                 seen.add(obj.name)
                 if obj.type != "ARMATURE":
+                    continue
+
+                match = self._clip_source(obj)
+                if match is not None:
+                    copied = set(self._copy_source_clips(obj, match))
+                    names = set(copied)
+                    listed: list["bpy.types.Action"] = []
+                    for clip in getattr(obj, "gltf_clips", ()):
+                        action = clip.action
+                        if action is None or action in listed:
+                            continue
+                        listed.append(action)
+                        if clip_export_name(obj, action) not in copied:
+                            self._append_bone_action(obj, action, fps, slot_handle_for(action, obj), names)
                     continue
 
                 done: list["bpy.types.Action"] = []
@@ -659,6 +768,175 @@ class AnimationExporter:
                         continue
                     done.append(action)
                     self._append_bone_action(obj, action, fps, slot_handle_for(action, obj), names)
+
+    # --- Clip source: the character's own file ---
+
+    def _hides_active_action(self, obj: "bpy.types.Object") -> bool:
+        """With a clip source, an active action off the clip list stays out."""
+        if obj.type != "ARMATURE" or self._clip_source(obj) is None:
+            return False
+        action = obj.animation_data.action
+        return all(clip.action != action for clip in getattr(obj, "gltf_clips", ()))
+
+    def _clip_source(self, obj: "bpy.types.Object") -> "_SourceSkin | None":
+        """The skin of the armature's clip source file, or None (with a
+        warning when a set link does not work)."""
+        if obj.name in self._clip_sources:
+            return self._clip_sources[obj.name]
+        match = None
+        raw = getattr(obj, "gltf_clip_source", "")
+        exported = any((obj.name, bone.name) in self.bone_to_node_index for bone in obj.data.bones)
+        if raw and exported:
+            match = self._match_source(obj, raw)
+        self._clip_sources[obj.name] = match
+        return match
+
+    def _match_source(self, obj: "bpy.types.Object", raw: str) -> "_SourceSkin | None":
+        import bpy
+
+        path = Path(bpy.path.abspath(raw, library=obj.library))
+        if path.suffix.lower() not in {".glb", ".gltf"} or not path.is_file():
+            print(f"[glTF export] WARNING: '{obj.name}': clip source {raw} is not an existing "
+                  f".glb or .gltf; exporting its clip list")
+            return None
+        source = self._load_source(path)
+        if source is None:
+            return None
+
+        # A skin whose joints are all bones here: the exact set first, then the largest.
+        gltf = source.gltf
+        bones = set(obj.data.bones.keys())
+        best = None
+        for skin in gltf.skins or ():
+            joints = {j: gltf.nodes[j].name or f"Bone_{j}" for j in skin.joints}
+            names = set(joints.values())
+            if not names or not names <= bones:
+                continue
+            rank = (names == bones, len(names))
+            if best is None or rank > best[0]:
+                best = (rank, joints)
+        if best is None:
+            print(f"[glTF export] WARNING: '{obj.name}': no skin in {path.name} matches its "
+                  f"bones; exporting its clip list")
+            return None
+
+        joints = best[1]
+        parent = {child: i for i, node in enumerate(gltf.nodes) for child in node.children or ()}
+        roots = {j for j in joints if parent.get(j) not in joints}
+        nodes = {j: self.bone_to_node_index.get((obj.name, name)) for j, name in joints.items()}
+        nodes = {j: index for j, index in nodes.items() if index is not None}
+
+        # Applied rotation and scale: one similarity at the root, or the rig changed.
+        fit = None
+        if nodes and max(nodes.values()) < len(self.nodes):
+            fit, worst, error = fit_rest(
+                {j: (self.nodes[index], gltf.nodes[j]) for j, index in nodes.items()}, roots,
+            )
+            if error > 1.0:
+                print(f"[glTF export] WARNING: '{obj.name}': the rest of joint '{joints[worst]}' is "
+                      f"not {path.name}'s scaled by {fit.scale:.4f}; exporting its clip list")
+                return None
+            if fit.is_identity():
+                fit = None
+        return _SourceSkin(source=source, joints=joints, roots=roots, nodes=nodes, fit=fit)
+
+    def _load_source(self, path: Path) -> "_SourceFile | None":
+        key = str(path.resolve())
+        if key not in self._source_files:
+            source = None
+            try:
+                with open(path, "rb") as handle:
+                    magic = handle.read(4)
+                document, binary = read_glb(path) if magic == b"glTF" else read_gltf(path)
+                gltf = Gltf.from_dict(document)
+                source = _SourceFile(path=path, gltf=gltf, reader=BufferReader(gltf, binary or b"", path.parent))
+            except Exception as error:  # a broken file falls back to the clip list
+                print(f"[glTF export] WARNING: cannot read clip source {path}: {error}")
+            self._source_files[key] = source
+        return self._source_files[key]
+
+    def _copy_source_clips(self, obj: "bpy.types.Object", match: "_SourceSkin") -> list[str]:
+        """Append the source file's animations of the matched skin, in file
+        order, retargeted to this armature's bone nodes. Returns their names."""
+        names: list[str] = []
+        for anim in match.source.gltf.animations or ():
+            copied = self._copy_animation(anim, match)
+            if copied is not None:
+                self.animations.append(copied)
+                names.append(copied.name)
+        print(f"[glTF export] {obj.name}: {len(names)} clips from {match.source.path.name}")
+        return names
+
+    def _copy_animation(self, anim: Animation, match: "_SourceSkin") -> Animation | None:
+        node_of, fit = match.nodes, match.fit
+        channels: list[AnimationChannel] = []
+        samplers: list[AnimationSampler] = []
+        made: dict[tuple[int, int | None], int] = {}
+        for channel in anim.channels:
+            target = channel.target
+            if target.node not in node_of or target.path not in _COPIED_PATHS:
+                continue
+            root = fit.roots.get(target.node) if fit else None
+            refit = fit is not None and target.path != "scale" and (
+                root is not None or (target.path == "translation" and fit.scale != 1.0)
+            )
+            key = (channel.sampler, target.node if refit else None)
+            if key not in made:
+                made[key] = len(samplers)
+                samplers.append(self._copy_sampler(
+                    anim.samplers[channel.sampler], match.source, target.path,
+                    (fit.scale, root) if refit else None,
+                ))
+            channels.append(AnimationChannel(
+                sampler=made[key],
+                target=AnimationChannelTarget(node=node_of[target.node], path=target.path),
+            ))
+        if not channels:
+            return None
+
+        extensions = dict(anim.extensions or {})
+        if not self.settings.export_animation_events:
+            extensions.pop(EXT_ANIMATION_EVENTS, None)
+        self.extensions_used.update(extensions)
+        return Animation(
+            name=anim.name, channels=channels, samplers=samplers,
+            extensions=extensions or None,
+            extras=anim.extras if self.settings.export_extras else None,
+        )
+
+    def _copy_sampler(
+        self,
+        sampler: AnimationSampler,
+        source: "_SourceFile",
+        path: str,
+        refit: "tuple[float, tuple | None] | None",
+    ) -> AnimationSampler:
+        """The sampler's keys as new accessors: as they are, or refitted by
+        ``refit`` (k and the root's fit, if a root)."""
+        data_type = _COPIED_PATHS[path]
+        if refit is None:
+            output = self._copy_accessor(source, sampler.output, False, data_type)
+        else:
+            values = source.reader.read_accessor(sampler.output)
+            values = refit_keys(values, path, sampler.interpolation == "CUBICSPLINE", *refit)
+            output = self.buffer.add_accessor(values, ComponentType.FLOAT, data_type)
+        return AnimationSampler(
+            input=self._copy_accessor(source, sampler.input, True, DataType.SCALAR),
+            output=output,
+            interpolation=sampler.interpolation,
+        )
+
+    def _copy_accessor(
+        self, source: "_SourceFile", index: int, is_input: bool, data_type: DataType,
+    ) -> int:
+        """One accessor per source accessor, shared by every copy of it."""
+        key = (str(source.path), index, is_input)
+        if key not in self._copied_accessors:
+            values = source.reader.read_accessor(index)
+            self._copied_accessors[key] = self.buffer.add_accessor(
+                values, ComponentType.FLOAT, data_type, include_bounds=is_input,
+            )
+        return self._copied_accessors[key]
 
     def _append_bone_action(
         self,

@@ -379,8 +379,8 @@ class SceneExporter:
         if obj.get("gltf_navigation_preview"):
             return None
 
-        # Cutscene path sketches and walk paths are authoring aids; a cutscene
-        # export carries the paths, the scene never does.
+        # Scenes made before cutscenes were removed may still hold their path
+        # sketches and walk paths: authoring aids, never exported.
         if obj.get("gltf_cutscene_helper"):
             return None
 
@@ -679,7 +679,8 @@ class SceneExporter:
     _SKIP_KEYS = frozenset({
         "khr_physics", "cycles", "gltf_export_settings", "gltf_props",
         "gltf_uid",  # surfaced as Node.uid (glTF 2.1), not as an extra
-        "gltf_clips", "gltf_clips_index", "gltf_cutscene",
+        "gltf_clips", "gltf_clips_index", "gltf_clip_source",
+        "gltf_cutscene",  # left on objects by scenes made before cutscenes were removed
     })
 
     @classmethod

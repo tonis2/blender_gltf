@@ -222,6 +222,7 @@ class GltfExporter:
                 self.scene_exporter.object_to_node_index,
                 self.material_exporter.material_index_by_name,
                 bone_to_node_index=self.skin_exporter.bone_to_node_index if self.skin_exporter else None,
+                nodes=self.scene_exporter.nodes,
             )
             if self.settings.export_all_scenes:
                 import bpy
