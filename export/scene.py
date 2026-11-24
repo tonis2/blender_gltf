@@ -904,8 +904,8 @@ class SceneExporter:
 
         # Group source meshes that share the *exact* same set of instance
         # transforms (e.g., Trunk and Foliage from one collection instanced
-        # together land on identical transforms and should share a single
-        # instancing node with multiple mesh children). Keying on the full
+        # together land on identical transforms and should share one set of
+        # instance accessors, under one group node). Keying on the full
         # rounded transform list — rather than a count + first-location
         # heuristic — avoids accidentally merging two distinct meshes that
         # happen to share an instance count and starting position (e.g. a
@@ -1132,10 +1132,20 @@ class SceneExporter:
             self._wrap_dequant(node)
             return idx
 
-        # Multiple meshes: parent node with instancing + child nodes
+        # Multiple meshes: a plain group node, and the instancing on each mesh
+        # node. EXT_mesh_gpu_instancing instances only its node's own mesh, so
+        # on a node without one readers ignore it and draw the children once
+        # (three.c3 and Blender's importer both do). The mesh nodes share the
+        # same accessors, so this costs no extra data.
         children: list[int] = []
         for mesh_name, mesh_index in gathered:
-            child_node = Node(name=mesh_name, mesh=mesh_index)
+            child_node = Node(
+                name=mesh_name,
+                mesh=mesh_index,
+                extensions={EXT_GPU_INSTANCING: {
+                    "attributes": dict(instancing_ext[EXT_GPU_INSTANCING]["attributes"]),
+                }},
+            )
             child_idx = len(self.nodes)
             self.nodes.append(child_node)
             self._wrap_dequant(child_node)
@@ -1144,7 +1154,6 @@ class SceneExporter:
         node = Node(
             name=f"{mesh_names[0]}_instances",
             children=children,
-            extensions=instancing_ext,
         )
         idx = len(self.nodes)
         self.nodes.append(node)
