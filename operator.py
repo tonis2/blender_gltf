@@ -590,6 +590,16 @@ _EXPORT_PROP_DEFS: dict[str, tuple] = {
         description="Export collection instances using EXT_mesh_gpu_instancing",
         default=True,
     )),
+    "export_instance_markers": (BoolProperty, dict(
+        name="Instance Markers",
+        description=(
+            "Also write each placed collection instance as an empty node at "
+            "its transform. Its extras are the collection's custom properties "
+            "under the object's own, plus \"piece\": the collection's name. "
+            "Needs GPU Instancing"
+        ),
+        default=False,
+    )),
     "export_lods": (BoolProperty, dict(
         name="LODs (MSFT_lod)",
         description=(
@@ -879,7 +889,9 @@ _EXPORT_PANELS = (
         "export_morph_targets",
     )),
     ("GLTF_export_skinning", "Skinning", ("export_skinning",)),
-    ("GLTF_export_instancing", "Instancing", ("export_gpu_instancing",)),
+    ("GLTF_export_instancing", "Instancing", (
+        "export_gpu_instancing", "export_instance_markers",
+    )),
     ("GLTF_export_lod", "LOD", ("export_lods",)),
     ("GLTF_export_cameras", "Cameras", ("export_camera_y_up",)),
     ("GLTF_export_physics", "Physics", ("export_physics", "export_navigation")),

@@ -90,6 +90,7 @@ class SceneExporter:
         self.audio_exporter = audio_exporter
         self._fps: float = 24.0
         self.nodes: list[Node] = []
+        # Keyed by Object.name_full: local and linked objects can share a name.
         self.object_to_node_index: dict[str, int] = {}
         self.extensions_used: set[str] = set()
         self.cameras: list[Camera] = []
@@ -106,6 +107,9 @@ class SceneExporter:
         self.file_index_by_collection: dict[str, int] = {}
         self.external_asset_builder = None  # Callable[[Collection], File | None]
         self._external_empty_names: set[str] = set()
+        # Top-level collection instances written as placement markers
+        # (export_instance_markers); set per scene by the instancing pre-pass.
+        self._marker_names: set[str] = set()
 
     def gather(self, context: "bpy.types.Context") -> tuple[list[Scene], int]:
         """Traverse scene(s) and return (scenes, active_scene_index)."""
@@ -154,29 +158,37 @@ class SceneExporter:
         if self.settings.export_external_assets:
             self._external_empty_names = self._collect_external_empty_names(scene.objects)
 
-        # Pre-pass: detect instances via depsgraph (GN, collection instances, particles)
+        # Pre-pass: detect instances via depsgraph (GN, collection instances, particles).
+        # Objects are keyed by name_full here and below: a local object and a
+        # linked one can share a name (an empty "pine_edge" placing the linked
+        # "pine_edge [kit.blend]"), and a bare-name key confuses the two.
         skip_objects: set[str] = set()
+        self._marker_names = set()
         if self.settings.export_gpu_instancing:
             self._instancer_names = set()
             self._instanced_source_names = set()
             instancing_nodes = self._instancing_pre_pass(scene)
             for idx in instancing_nodes:
                 root_nodes.append(idx)
+            # Placement markers: top-level collection instances stay in the
+            # traversal below, where _gather_node writes each as an empty
+            # node beside its copies.
+            if self.settings.export_instance_markers:
+                self._marker_names = self._collect_marker_names(scene.objects)
             # Only skip objects that are purely instancers (empties with collection instances)
             # or source objects that aren't real scene objects. Geometry-bearing types
             # (mesh/curve/curves/grease pencil) often emit instances *and* their own
             # mesh (e.g., a curve with a vine GN modifier produces stem mesh + leaf
             # instances) — those must still be exported.
             geometry_bearing = {"MESH", "CURVE", "SURFACE", "FONT", "META", "CURVES", "GREASEPENCIL"}
-            for name in self._instancer_names:
-                obj = scene.objects.get(name)
-                if obj and obj.type not in geometry_bearing:
-                    skip_objects.add(name)
-            # Skip source meshes that only exist as instance sources
-            for name in self._instanced_source_names:
-                obj = scene.objects.get(name)
-                if obj:
-                    skip_objects.add(name)
+            for obj in scene.objects:
+                key = obj.name_full
+                if (key in self._instancer_names and obj.type not in geometry_bearing
+                        and key not in self._marker_names):
+                    skip_objects.add(key)
+                # Skip source meshes that only exist as instance sources
+                if key in self._instanced_source_names:
+                    skip_objects.add(key)
 
         # LOD pre-pass: group Base_LODn siblings; LOD1+ leave the scene graph
         lod_groups: dict[tuple[str | None, str], dict[int, "bpy.types.Object"]] = {}
@@ -187,12 +199,12 @@ class SceneExporter:
         selected_names: set[str] | None = None
         if self.settings.export_selected:
             selected_names = {
-                obj.name for obj in scene.objects if self._is_selected(obj)
+                obj.name_full for obj in scene.objects if self._is_selected(obj)
             }
         if selected_names is None:
             root_objects = [
                 obj for obj in scene.objects
-                if obj.parent is None and obj.name not in skip_objects
+                if obj.parent is None and obj.name_full not in skip_objects
             ]
         else:
             # A selected object whose parent is not selected is re-rooted here:
@@ -200,9 +212,9 @@ class SceneExporter:
             # the parent's node will not exist in the export.
             root_objects = [
                 obj for obj in scene.objects
-                if obj.name in selected_names
-                and obj.name not in skip_objects
-                and (obj.parent is None or obj.parent.name not in selected_names)
+                if obj.name_full in selected_names
+                and obj.name_full not in skip_objects
+                and (obj.parent is None or obj.parent.name_full not in selected_names)
             ]
         root_objects.sort(key=lambda o: (0 if o.type == "ARMATURE" else 1))
 
@@ -225,9 +237,9 @@ class SceneExporter:
 
     @staticmethod
     def _collect_external_empty_names(objects) -> set[str]:
-        """Names of empties that instance a collection (-> external asset refs)."""
+        """Full names of empties that instance a collection (-> external asset refs)."""
         return {
-            obj.name for obj in objects
+            obj.name_full for obj in objects
             if obj.type == "EMPTY"
             and obj.instance_type == "COLLECTION"
             and obj.instance_collection is not None
@@ -282,13 +294,13 @@ class SceneExporter:
         groups: dict[tuple[str | None, str], dict[int, "bpy.types.Object"]] = defaultdict(dict)
         selected: set[str] | None = None
         if self.settings.export_selected:
-            selected = {obj.name for obj in scene.objects if self._is_selected(obj)}
+            selected = {obj.name_full for obj in scene.objects if self._is_selected(obj)}
         for obj in scene.objects:
             match = _LOD_RE.match(obj.name)
             if match:
-                if selected is not None and obj.name not in selected:
+                if selected is not None and obj.name_full not in selected:
                     continue
-                parent_name = obj.parent.name if obj.parent else None
+                parent_name = obj.parent.name_full if obj.parent else None
                 groups[(parent_name, match.group(1))][int(match.group(2))] = obj
 
         valid: dict[tuple[str | None, str], dict[int, "bpy.types.Object"]] = {}
@@ -298,14 +310,14 @@ class SceneExporter:
         for key, members in groups.items():
             if 0 not in members or len(members) < 2:
                 continue
-            in_instancing = [obj.name for obj in members.values() if obj.name in instanced]
+            in_instancing = [obj.name for obj in members.values() if obj.name_full in instanced]
             if in_instancing:
                 print(f"glTF export: LOD group '{key[1]}' overlaps instancing ({in_instancing}), skipping group")
                 continue
             valid[key] = members
             for level, obj in members.items():
                 if level > 0:
-                    self._lod_skip_names.add(obj.name)
+                    self._lod_skip_names.add(obj.name_full)
                     if obj.children:
                         print(f"glTF export: children of LOD object '{obj.name}' are not exported")
         return valid
@@ -315,7 +327,7 @@ class SceneExporter:
         LOD0 node via MSFT_lod (nodes outside the scene graph are reachable
         only through the extension — standard for MSFT_lod)."""
         lod0 = members[0]
-        node_index = self.object_to_node_index.get(lod0.name)
+        node_index = self.object_to_node_index.get(lod0.name_full)
         if node_index is None:
             return
         lod0_node = self.nodes[node_index]
@@ -333,7 +345,7 @@ class SceneExporter:
             lod_index = len(self.nodes)
             self.nodes.append(lod_node)
             self._wrap_dequant(lod_node)
-            self.object_to_node_index[obj.name] = lod_index
+            self.object_to_node_index[obj.name_full] = lod_index
             ids.append(lod_index)
 
         if not ids:
@@ -372,7 +384,7 @@ class SceneExporter:
         is not part of the export.
         """
         # LOD1+ objects only exist through their LOD0 node's MSFT_lod extension
-        if obj.name in self._lod_skip_names:
+        if obj.name_full in self._lod_skip_names:
             return None
 
         # The navigation bake preview is scene furniture, never geometry.
@@ -385,8 +397,8 @@ class SceneExporter:
             return None
 
         # If this object was already exported (shared across scenes), reuse its node
-        if obj.name in self.object_to_node_index:
-            return self.object_to_node_index[obj.name]
+        if obj.name_full in self.object_to_node_index:
+            return self.object_to_node_index[obj.name_full]
 
         # visible_get()/select_get() are view-layer based and meaningless for a
         # scoped sub-asset export (the collection isn't in any view layer), so
@@ -418,7 +430,7 @@ class SceneExporter:
         file_index = None
         if (self.settings.export_external_assets
                 and obj.type == "EMPTY"
-                and obj.name in self._external_empty_names
+                and obj.name_full in self._external_empty_names
                 and obj.instance_collection is not None):
             file_index = self._ensure_external_file(obj.instance_collection)
 
@@ -494,7 +506,7 @@ class SceneExporter:
             )
             index = len(self.nodes)
             self.nodes.append(node)
-            self.object_to_node_index[obj.name] = index
+            self.object_to_node_index[obj.name_full] = index
 
             # Armatures get the same extension/extras decoration as other nodes
             self._decorate_node(node, obj, None)
@@ -558,12 +570,14 @@ class SceneExporter:
         )
 
         self._decorate_node(node, obj, mesh_index)
+        if obj.name_full in self._marker_names:
+            node.extras = self._marker_extras(obj)
 
         self._wrap_dequant(node)
 
         index = len(self.nodes)
         self.nodes.append(node)
-        self.object_to_node_index[obj.name] = index
+        self.object_to_node_index[obj.name_full] = index
         return index
 
     def _decorate_node(
@@ -571,13 +585,7 @@ class SceneExporter:
     ) -> None:
         """Attach physics / particle / interactivity / audio extensions and
         custom-property extras to a node. Shared by regular and armature nodes."""
-        # Physics extension (rigid body / collider)
-        if self.physics_exporter:
-            physics_ext = self.physics_exporter.gather_node(obj, mesh_index)
-            if physics_ext:
-                if node.extensions is None:
-                    node.extensions = {}
-                node.extensions.update(physics_ext)
+        self._decorate_physics(node, obj, mesh_index)
 
         # Particle systems
         if self.particle_exporter:
@@ -603,7 +611,31 @@ class SceneExporter:
                     node.extensions = {}
                 node.extensions.update(audio_ext)
 
-        # Custom properties as extras
+        self._decorate_extras(node, obj)
+
+    def _decorate_copy(
+        self, node: Node, obj: "bpy.types.Object", mesh_index: int,
+    ) -> None:
+        """Give a node the instancing path writes for a source mesh object
+        that object's world data: its rigid-body collider and its extras, as
+        a plain node gets them. Readers hand both to every copy. Behaviour,
+        particles, sound and uids stay off: the copies share one object."""
+        self._decorate_physics(node, obj, mesh_index)
+        self._decorate_extras(node, obj)
+
+    def _decorate_physics(
+        self, node: Node, obj: "bpy.types.Object", mesh_index: int | None,
+    ) -> None:
+        """Rigid body / collider (KHR_physics_rigid_bodies)."""
+        if self.physics_exporter:
+            physics_ext = self.physics_exporter.gather_node(obj, mesh_index)
+            if physics_ext:
+                if node.extensions is None:
+                    node.extensions = {}
+                node.extensions.update(physics_ext)
+
+    def _decorate_extras(self, node: Node, obj: "bpy.types.Object") -> None:
+        """Custom properties as extras."""
         if self.settings.export_extras:
             extras = self._gather_extras(obj)
             if extras:
@@ -684,8 +716,9 @@ class SceneExporter:
     })
 
     @classmethod
-    def _gather_extras(cls, obj: "bpy.types.Object") -> dict | None:
-        """Collect custom properties from a Blender object as a JSON-serializable dict."""
+    def _gather_extras(cls, obj: "bpy.types.ID") -> dict | None:
+        """Collect custom properties from a Blender object (or any ID, such as
+        a collection) as a JSON-serializable dict."""
         extras: dict = {}
         for key in obj.keys():
             if key.startswith("_") or key in cls._SKIP_KEYS:
@@ -839,6 +872,38 @@ class SceneExporter:
 
     # --- EXT_mesh_gpu_instancing (depsgraph-based) ---
 
+    def _collect_marker_names(self, objects) -> set[str]:
+        """Names of the top-level collection instances, the placed pieces that
+        get a marker. An instancer inside an instanced collection belongs to
+        its outer piece, and an external-asset reference is its own node."""
+        instancers = [
+            obj for obj in objects
+            if obj.instance_type == "COLLECTION" and obj.instance_collection is not None
+        ]
+        nested = {
+            member.name_full
+            for obj in instancers
+            for member in obj.instance_collection.all_objects
+        }
+        return {
+            obj.name_full for obj in instancers
+            if obj.name_full not in nested
+            and obj.name_full not in self._external_empty_names
+        }
+
+    def _marker_extras(self, obj: "bpy.types.Object") -> dict:
+        """A placement marker's extras: the instanced collection's custom
+        properties, the object's own on top, and "piece" naming the
+        collection. The properties follow export_extras; "piece" is always
+        written, as it is what makes the node a marker."""
+        collection = obj.instance_collection
+        extras: dict = {}
+        if self.settings.export_extras:
+            extras.update(self._gather_extras(collection) or {})
+            extras.update(self._gather_extras(obj) or {})
+        extras["piece"] = collection.name
+        return extras
+
     def _instancing_pre_pass(self, scene: "bpy.types.Scene") -> list[int]:
         """Detect instances via depsgraph (handles collection instances, GN, particles).
         Returns list of root node indices for instanced nodes."""
@@ -846,7 +911,7 @@ class SceneExporter:
 
         depsgraph = bpy.context.evaluated_depsgraph_get()
 
-        # Collect all instances grouped by source mesh name.
+        # Collect all instances grouped by source object (keyed by name_full).
         # Each entry: list of (translation, rotation_wxyz, scale) tuples.
         # We also track which source objects we've seen so we can export their mesh once.
         instance_groups: dict[str, list[tuple[list[float], list[float], list[float]]]] = defaultdict(list)
@@ -863,7 +928,7 @@ class SceneExporter:
             # array are emitted as references; don't flatten their contents into
             # the host buffer.
             if (inst.parent is not None
-                    and inst.parent.original.name in self._external_empty_names):
+                    and inst.parent.original.name_full in self._external_empty_names):
                 continue
             obj = inst.object.original
             if obj.type != "MESH":
@@ -878,7 +943,7 @@ class SceneExporter:
 
             # Track the parent (instancer) so we can skip it in normal traversal
             if inst.parent:
-                instancer_names.add(inst.parent.original.name)
+                instancer_names.add(inst.parent.original.name_full)
 
             matrix_world = inst.matrix_world
             shear = shear_correction(matrix_world)
@@ -888,12 +953,15 @@ class SceneExporter:
                 [rot.w, rot.x, rot.y, rot.z],
                 [scl.x, scl.y, scl.z],
             )
-            if obj.name not in source_objects:
-                source_objects[obj.name] = obj
+            # Keyed by name_full: a local and a linked part can share a name.
+            # Nodes are still named after obj.name.
+            key = obj.name_full
+            if key not in source_objects:
+                source_objects[key] = obj
             if shear is not None:
-                sheared_instances.append((obj.name, matrix_world.copy()))
+                sheared_instances.append((key, matrix_world.copy()))
                 continue
-            instance_groups[obj.name].append(trs)
+            instance_groups[key].append(trs)
 
         # Store instancer names so gather() can skip them
         self._instancer_names = instancer_names
@@ -925,18 +993,18 @@ class SceneExporter:
                 for loc, rot, scl in transforms
             )
 
-        for mesh_name, transforms in instance_groups.items():
+        for source_key, transforms in instance_groups.items():
             key = _transform_key(transforms)
             if key in transform_groups:
-                transform_groups[key].append(mesh_name)
+                transform_groups[key].append(source_key)
             else:
-                transform_groups[key] = [mesh_name]
-            mesh_to_key[mesh_name] = key
+                transform_groups[key] = [source_key]
+            mesh_to_key[source_key] = key
 
         # Process each transform group
         processed_keys: set[tuple] = set()
-        for mesh_name in instance_groups:
-            key = mesh_to_key[mesh_name]
+        for source_key in instance_groups:
+            key = mesh_to_key[source_key]
             if key in processed_keys:
                 continue
             processed_keys.add(key)
@@ -959,9 +1027,9 @@ class SceneExporter:
                 if node_idx is not None:
                     result_nodes.append(node_idx)
 
-        for mesh_name, matrix_world in sheared_instances:
+        for source_key, matrix_world in sheared_instances:
             node_idx = self._gather_sheared_instance(
-                mesh_name, source_objects, matrix_world,
+                source_key, source_objects, matrix_world,
             )
             if node_idx is not None:
                 result_nodes.append(node_idx)
@@ -970,12 +1038,13 @@ class SceneExporter:
 
     def _gather_single_instance(
         self,
-        mesh_names: list[str],
+        source_keys: list[str],
         source_objects: dict[str, "bpy.types.Object"],
         transform: tuple[list[float], list[float], list[float]],
         correction_matrix=None,
     ) -> int | None:
-        """Export a single instance as a regular node.
+        """Export a single instance as a regular node. ``source_keys`` are
+        name_full keys into ``source_objects``; nodes take the bare name.
 
         ``correction_matrix`` is an optional 3x3 shear matrix baked into the
         mesh geometry so a TRS-only node can reproduce a sheared instance
@@ -987,14 +1056,15 @@ class SceneExporter:
         gltf_scale = convert_scale(scl)
 
         children: list[int] = []
-        for mesh_name in mesh_names:
-            obj = source_objects[mesh_name]
+        for key in source_keys:
+            obj = source_objects[key]
             material_map = self._gather_materials_for_object(obj)
             mesh_index = self.mesh_exporter.gather(
                 obj, material_map, correction_matrix=correction_matrix,
             )
             if mesh_index is not None:
-                child_node = Node(name=mesh_name, mesh=mesh_index)
+                child_node = Node(name=obj.name, mesh=mesh_index)
+                self._decorate_copy(child_node, obj, mesh_index)
                 child_idx = len(self.nodes)
                 self.nodes.append(child_node)
                 self._wrap_dequant(child_node)
@@ -1003,7 +1073,7 @@ class SceneExporter:
         if not children:
             return None
 
-        if len(children) == 1 and len(mesh_names) == 1:
+        if len(children) == 1 and len(source_keys) == 1:
             # Single mesh: set transform directly on the mesh node
             self.nodes[children[0]].translation = translation
             self.nodes[children[0]].rotation = rotation
@@ -1011,7 +1081,7 @@ class SceneExporter:
             return children[0]
 
         node = Node(
-            name=f"{mesh_names[0]}_instance",
+            name=f"{source_objects[source_keys[0]].name}_instance",
             children=children,
             translation=translation,
             rotation=rotation,
@@ -1023,12 +1093,13 @@ class SceneExporter:
 
     def _gather_sheared_instance(
         self,
-        mesh_name: str,
+        source_key: str,
         source_objects: dict[str, "bpy.types.Object"],
         matrix_world,
     ) -> int | None:
-        """Emit an exact sheared transform as two TRS nodes sharing a mesh."""
-        obj = source_objects[mesh_name]
+        """Emit an exact sheared transform as two TRS nodes sharing a mesh.
+        The part's extras and collider go on the inner mesh node, the copy."""
+        obj = source_objects[source_key]
         material_map = self._gather_materials_for_object(obj)
         mesh_index = self.mesh_exporter.gather(obj, material_map)
         if mesh_index is None:
@@ -1037,19 +1108,20 @@ class SceneExporter:
         outer, inner = split_affine_to_trs(matrix_world)
         inner_translation, inner_rotation, inner_scale = trs_to_node_fields(inner)
         mesh_node = Node(
-            name=mesh_name,
+            name=obj.name,
             mesh=mesh_index,
             translation=inner_translation,
             rotation=inner_rotation,
             scale=inner_scale,
         )
+        self._decorate_copy(mesh_node, obj, mesh_index)
         mesh_node_index = len(self.nodes)
         self.nodes.append(mesh_node)
         self._wrap_dequant(mesh_node)
 
         translation, rotation, scale = trs_to_node_fields(outer)
         node = Node(
-            name=f"{mesh_name}_shear",
+            name=f"{obj.name}_shear",
             children=[mesh_node_index],
             translation=translation,
             rotation=rotation,
@@ -1061,23 +1133,25 @@ class SceneExporter:
 
     def _gather_gpu_instancing(
         self,
-        mesh_names: list[str],
+        source_keys: list[str],
         source_objects: dict[str, "bpy.types.Object"],
         transforms: list[tuple[list[float], list[float], list[float]]],
     ) -> int | None:
-        """Create instanced node(s) with EXT_mesh_gpu_instancing."""
+        """Create instanced node(s) with EXT_mesh_gpu_instancing.
+        ``source_keys`` are name_full keys into ``source_objects``; nodes take
+        the bare name."""
         # Gather the source mesh(es) FIRST. If none produce geometry we must
         # not write instance-transform accessors into the buffer or register
         # EXT_mesh_gpu_instancing — that would leave orphaned buffer data and a
-        # spurious extensionsUsed entry. Collect (mesh_name, mesh_index) so the
+        # spurious extensionsUsed entry. Collect (object, mesh_index) so the
         # single-mesh fast path can still attach instancing directly.
-        gathered: list[tuple[str, int]] = []
-        for mesh_name in mesh_names:
-            obj = source_objects[mesh_name]
+        gathered: list[tuple["bpy.types.Object", int]] = []
+        for key in source_keys:
+            obj = source_objects[key]
             material_map = self._gather_materials_for_object(obj)
             mesh_index = self.mesh_exporter.gather(obj, material_map)
             if mesh_index is not None:
-                gathered.append((mesh_name, mesh_index))
+                gathered.append((obj, mesh_index))
 
         if not gathered:
             return None
@@ -1121,12 +1195,13 @@ class SceneExporter:
 
         # Single mesh: put instancing directly on the mesh node
         if len(gathered) == 1:
-            mesh_name, mesh_index = gathered[0]
+            obj, mesh_index = gathered[0]
             node = Node(
-                name=f"{mesh_name}_instances",
+                name=f"{obj.name}_instances",
                 mesh=mesh_index,
                 extensions=instancing_ext,
             )
+            self._decorate_copy(node, obj, mesh_index)
             idx = len(self.nodes)
             self.nodes.append(node)
             self._wrap_dequant(node)
@@ -1138,21 +1213,22 @@ class SceneExporter:
         # (three.c3 and Blender's importer both do). The mesh nodes share the
         # same accessors, so this costs no extra data.
         children: list[int] = []
-        for mesh_name, mesh_index in gathered:
+        for obj, mesh_index in gathered:
             child_node = Node(
-                name=mesh_name,
+                name=obj.name,
                 mesh=mesh_index,
                 extensions={EXT_GPU_INSTANCING: {
                     "attributes": dict(instancing_ext[EXT_GPU_INSTANCING]["attributes"]),
                 }},
             )
+            self._decorate_copy(child_node, obj, mesh_index)
             child_idx = len(self.nodes)
             self.nodes.append(child_node)
             self._wrap_dequant(child_node)
             children.append(child_idx)
 
         node = Node(
-            name=f"{mesh_names[0]}_instances",
+            name=f"{source_objects[source_keys[0]].name}_instances",
             children=children,
         )
         idx = len(self.nodes)

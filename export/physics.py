@@ -89,7 +89,7 @@ class PhysicsExporter:
 
     def gather_joints(
         self,
-        object_to_node_index: dict[str, int],
+        object_to_node_index: dict[str, int],  # keyed by Object.name_full
         nodes: list["Node"],
     ) -> None:
         """Post-pass: export rigid body constraints as joints."""
@@ -103,8 +103,8 @@ class PhysicsExporter:
             if body_a is None or body_b is None:
                 continue
 
-            a_name = body_a.name
-            b_name = body_b.name
+            a_name = body_a.name_full
+            b_name = body_b.name_full
             if a_name not in object_to_node_index or b_name not in object_to_node_index:
                 continue
 

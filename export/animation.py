@@ -317,7 +317,7 @@ class AnimationExporter:
         self,
         buffer: BufferBuilder,
         settings: "ExportSettings",
-        object_to_node_index: dict[str, int],
+        object_to_node_index: dict[str, int],  # keyed by Object.name_full
         material_to_index: dict[str, int],
         bone_to_node_index: dict[tuple[str, str], int] | None = None,
         nodes: "list[Node] | None" = None,
@@ -350,12 +350,12 @@ class AnimationExporter:
 
         for scene in scenes:
             for obj in scene.objects:
-                if obj.name in seen:
+                if obj.name_full in seen:
                     continue
-                seen.add(obj.name)
+                seen.add(obj.name_full)
                 if obj.animation_data is None or obj.animation_data.action is None:
                     continue
-                if obj.name not in self.object_to_node_index:
+                if obj.name_full not in self.object_to_node_index:
                     continue
                 action = obj.animation_data.action
                 if self._hides_active_action(obj):
@@ -396,7 +396,7 @@ class AnimationExporter:
 
         for obj, action in obj_action_pairs:
             self._gather_object_channels(
-                obj, self.object_to_node_index[obj.name], action, fps, f_origin,
+                obj, self.object_to_node_index[obj.name_full], action, fps, f_origin,
                 None, channels, samplers,
             )
 
@@ -1155,10 +1155,10 @@ class AnimationExporter:
         seen: set[str] = set()
         for scene in scenes:
             for obj in scene.objects:
-                if obj.name in seen:
+                if obj.name_full in seen:
                     continue
-                seen.add(obj.name)
-                if obj.type != "MESH" or obj.name not in self.object_to_node_index:
+                seen.add(obj.name_full)
+                if obj.type != "MESH" or obj.name_full not in self.object_to_node_index:
                     continue
                 if not obj.data or not obj.data.shape_keys:
                     continue
@@ -1169,7 +1169,7 @@ class AnimationExporter:
                 if len(shape_keys.key_blocks) < 2:
                     continue
 
-                node_index = self.object_to_node_index[obj.name]
+                node_index = self.object_to_node_index[obj.name_full]
                 action = shape_keys.animation_data.action
                 result = self._gather_weight_animation(
                     obj, node_index, shape_keys, action, fps,

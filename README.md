@@ -16,7 +16,11 @@ A custom Blender addon for exporting and importing scenes in glTF 2.0 format.
   it, or pick the file in *glTF* › *Clips*; the export then writes that file's animations as they
   are, plus clips added to the list
 - **Physics** — rigid bodies and collision shapes (KHR extensions)
-- **GPU Instancing** — collection instances via `EXT_mesh_gpu_instancing`
+- **GPU Instancing** — collection instances via `EXT_mesh_gpu_instancing`. Each instanced copy keeps
+  its part's custom properties as `extras` and its rigid-body collider, as a plain object would.
+  *Instance Markers* (off by default) also writes each placed collection instance as an empty node at
+  its transform, with the collection's custom properties under the object's own plus `"piece"`: the
+  collection's name
 - **Export formats** — GLB (binary), glTF + .bin (separate), glTF embedded (base64)
 - **glTF 2.1 [DRAFT] features** — 64-bit GLB, expanded accessor component types, unique IDs,
   and external assets + packaging (see [`extensions/gltf_2_1_draft.md`](extensions/gltf_2_1_draft.md))

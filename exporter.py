@@ -40,6 +40,7 @@ class ExportSettings:
     export_animation_events: bool = True
     export_morph_targets: bool = True
     export_gpu_instancing: bool = True
+    export_instance_markers: bool = False
     export_lods: bool = True
     export_skinning: bool = True
     export_physics: bool = True
@@ -134,12 +135,15 @@ class GltfExporter:
         # Names share the uid identifier namespace per the draft spec.
         reserved = {n.name for n in nodes if n.name}
         used_uids: set[str] = set()
+        # object_to_node_index is keyed by name_full: a bare-name lookup could
+        # land on a linked object that shares a local one's name.
+        objects = {obj.name_full: obj for obj in bpy.data.objects}
 
         for obj_name, idx in self.scene_exporter.object_to_node_index.items():
             if idx is None or idx >= len(nodes):
                 continue
             node = nodes[idx]
-            obj = bpy.data.objects.get(obj_name)
+            obj = objects.get(obj_name)
             if obj is None:
                 continue
 

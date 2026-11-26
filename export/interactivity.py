@@ -179,7 +179,7 @@ class InteractivityExporter:
     def _resolve_object_pointer(self, n) -> str | None:
         if self.scene_exporter is None or n.target_object is None:
             return None
-        idx = self.scene_exporter.object_to_node_index.get(n.target_object.name)
+        idx = self.scene_exporter.object_to_node_index.get(n.target_object.name_full)
         if idx is None:
             return None
         prop = n.object_property
